@@ -8,7 +8,7 @@
 
 > [!WARNING]
 >
-> 由于上下文包含了插件的帮助信息，导致消耗的tokens会随着插件的数量增加而增加
+> 由于上下文包含了插件的帮助信息，导致消耗的 tokens 会随着插件的数量增加而增加
 
 ## ✨ 特性
 
@@ -17,8 +17,9 @@
 - 💬 **自然对话** - 支持多轮对话，保持上下文连贯性
 - 🖼️ **多模态支持** - 支持图片识别和理解
 - 🧠 **聊天记忆** - 持久化存储对话历史，支持语境构建
-- 🎯 **好感度系统** - 集成签到好感度，让对话更有温度
-- 🛡️ **安全防护** - 死循环检测、消息去重、超时保护
+- 🔧 **Agent 框架** - 支持 Tool Calling 和 MCP 工具集成
+- 📚 **知识库 RAG** - 支持知识检索增强生成
+- 🛡️ **安全沙箱** - 提供安全的表达式求值和 Shell 命令执行
 
 ## 📦 插件结构
 
@@ -27,11 +28,20 @@ chatinter/
 ├── __init__.py              # 插件入口，定义响应器和元数据
 ├── config.py                # 配置项定义和获取
 ├── memory.py                # 聊天记忆管理（ChatMemory 类）
-├── intent_analyzer.py       # 意图分析器（LLM 调用）
+├── agent_runner.py          # Agent 运行器（Tool Calling 循环）
+├── agent_tools.py           # Agent 工具集（安全执行、插件查询）
 ├── chat_handler.py          # 聊天响应处理
 ├── handler.py               # 主处理器（handle_fallback）
 ├── plugin_registry.py       # 插件信息注册表
-├── prompt_templates.py      # Prompt 模板构建
+├── tool_registry.py         # 工具注册表
+├── skill_registry.py        # 技能注册表
+├── route_engine.py          # 路由引擎
+├── knowledge_rag.py         # 知识库 RAG 检索
+├── retrieval.py             # 向量检索
+├── sandbox.py               # 沙箱执行环境
+├── runtime.py               # 运行时调度
+├── lifecycle.py             # 生命周期钩子
+├── trace.py                 # 追踪模块
 ├── data_source.py           # 导出模块（整合各子模块）
 ├── models/
 │   ├── __init__.py          # 模型导出
@@ -39,7 +49,7 @@ chatinter/
 │   └── pydantic_models.py   # Pydantic 结构化模型
 └── utils/
     ├── __init__.py          # 工具函数导出
-    ├── cache.py             # 缓存工具（好感度缓存）
+    ├── cache.py             # 缓存工具
     ├── multimodal.py        # 多模态处理（图片提取）
     └── unimsg_utils.py      # UniMessage 工具函数
 ```
@@ -50,30 +60,28 @@ chatinter/
 
 | 配置键 | 说明 | 默认值 | 类型 |
 |--------|------|--------|------|
-| `ENABLE_FALLBACK` | 是否启用 ChatInter 功能 | `True` | bool |
-| `INTENT_MODEL` | AI 意图识别使用的模型，具体参考 AI 模块 | `None` | str |
-| `INTENT_TIMEOUT` | 意图识别超时时间（秒） | `30` | int |
-| `CONFIDENCE_THRESHOLD` | 插件调用置信度阈值，低于此值按普通聊天处理 | `0.7` | float |
-| `CHAT_STYLE` | 聊天回复风格（为空时使用默认风格） | `""` | str |
-| `USE_SIGN_IN_IMPRESSION` | 是否使用签到好感度 | `True` | bool |
-| `CONTEXT_PREFIX_SIZE` | 语境前缀消息数（从数据库加载的最近 N 条群消息） | `5` | int |
-| `SESSION_CONTEXT_LIMIT` | 单会话上下文上限（对话历史的最大消息数） | `20` | int |
-| `MAX_REPLY_LAYERS` | 回复链追溯最大层数（递归获取被回复消息） | `3` | int |
+| `ENABLE_FALLBACK` | 是否启用 ChatInter 兜底对话能力 | `True` | bool |
+| `INTENT_MODEL` | ChatInter 使用的模型名称 (格式: ProviderName/ModelName)，留空时复用 AI.DEFAULT_MODEL_NAME | `""` | str |
+| `INTENT_TIMEOUT` | ChatInter 推理超时时间（秒），<=0 时复用 AI.CLIENT_SETTINGS.timeout | `20` | int |
+| `CONFIDENCE_THRESHOLD` | 插件意图置信度阈值，低于该值时降级为普通聊天 | `0.72` | float |
+| `CHAT_STYLE` | ChatInter 对话风格补充设定，留空使用默认风格 | `""` | str |
+| `CUSTOM_PROMPT` | ChatInter 自定义系统提示词补充，会追加到系统提示词末尾 | `""` | str |
+| `MCP_ENDPOINTS` | MCP 工具服务地址列表，使用英文逗号分隔 | `""` | str |
+| `REASONING_EFFORT` | 强制推理强度，可选 MEDIUM 或 HIGH，留空表示不强制设置 | `"MEDIUM"` | str |
 
 ### 配置示例
 
-```python
+```yaml
 # configs.yml
 chatinter:
   ENABLE_FALLBACK: true
-  INTENT_MODEL: "Gemini/gemini-3-flash-preview"
-  INTENT_TIMEOUT: 30
-  CONFIDENCE_THRESHOLD: 0.7
+  INTENT_MODEL: "Gemini/gemini-2.0-flash"
+  INTENT_TIMEOUT: 20
+  CONFIDENCE_THRESHOLD: 0.72
   CHAT_STYLE: "活泼可爱"
-  USE_SIGN_IN_IMPRESSION: true
-  CONTEXT_PREFIX_SIZE: 5
-  SESSION_CONTEXT_LIMIT: 20
-  MAX_REPLY_LAYERS: 3
+  CUSTOM_PROMPT: ""
+  MCP_ENDPOINTS: "http://127.0.0.1:9001,http://127.0.0.1:9002"
+  REASONING_EFFORT: "MEDIUM"
 ```
 
 ## 📖 使用方法
@@ -96,21 +104,27 @@ chatinter:
 ```
 用户消息 → 意图分析 → 判断意图类型
                      ├── 插件调用 → 重路由到对应插件 → 执行命令 → 保存记忆 → 返回结果
-                     └── 普通聊天 → 构建上下文 → LLM 对话 → 保存记忆 → 返回回复
+                     └── 普通聊天 → 构建上下文 → Agent 对话 → Tool Calling → 保存记忆 → 返回回复
 ```
 
-### 意图识别流程
+### Agent 能力
 
-1. **消息预处理** - 提取文本和图片，构建上下文
-2. **LLM 分析** - 调用大语言模型分析用户意图
-3. **意图分类** - 判断是插件调用还是普通聊天
-4. **执行响应** - 根据意图类型执行相应操作
+ChatInter 1.1.0 引入了 Agent 框架，支持：
+
+- **Tool Calling** - LLM 可调用工具获取实时信息
+- **插件查询** - 动态检索可用插件和命令
+- **安全执行** - 在沙箱中执行数学表达式和只读 Shell 命令
+- **MCP 集成** - 支持外部 MCP 工具服务
 
 ### 多模态支持
 
 - 支持识别消息中的图片
 - 支持识别回复链中的图片
 - 图片会作为多模态输入传递给 LLM
+
+### 待补全机制
+
+当用户发送的消息缺少必要信息时（如需要图片但未提供），ChatInter 会提示用户补充并等待后续消息。
 
 ## 🗄️ 数据库
 
@@ -133,6 +147,25 @@ class ChatInterChatHistory(Model):
 
 ![example](docs_image/1.png)
 
+## 🚀 更新日志
+
+### v1.1.0
+
+- 新增 Agent 框架，支持 Tool Calling
+- 新增 MCP 工具服务集成
+- 新增知识库 RAG 检索
+- 新增安全沙箱执行环境
+- 新增待补全机制（图片、@目标）
+- 优化路由引擎，提升意图识别准确率
+- 配置项重构，简化配置流程
+
+### v1.0.0
+
+- 初始版本
+- 基础意图识别和重路由
+- 多轮对话支持
+- 多模态支持
+
 ## 📄 许可证
 
 本项目采用 [AGPL-3.0](./LICENSE) 许可证。
@@ -141,6 +174,7 @@ class ChatInterChatHistory(Model):
 
 - [绪山真寻 Bot](https://github.com/zhenxun-org/zhenxun_bot)
 - [BYM AI 插件](https://github.com/zhenxun-org/zhenxun_bot_plugins/tree/main/plugins/bym_ai)
+- Copaan - Agent 框架贡献
 - 万能的 AI sama
 
 ## 📧 联系方式
