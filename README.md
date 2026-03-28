@@ -61,13 +61,31 @@ chatinter/
 | 配置键 | 说明 | 默认值 | 类型 |
 |--------|------|--------|------|
 | `ENABLE_FALLBACK` | 是否启用 ChatInter 兜底对话能力 | `True` | bool |
+| `ENABLE_AGENT_MODE` | 是否启用 ChatInter Agent（工具调用）模式 | `True` | bool |
 | `INTENT_MODEL` | ChatInter 使用的模型名称 (格式: ProviderName/ModelName)，留空时复用 AI.DEFAULT_MODEL_NAME | `""` | str |
 | `INTENT_TIMEOUT` | ChatInter 推理超时时间（秒），<=0 时复用 AI.CLIENT_SETTINGS.timeout | `20` | int |
+| `AGENT_MAX_TOOL_STEPS` | Agent 工具调用最大迭代步数 | `4` | int |
+| `AGENT_TOTAL_TIMEOUT` | Agent 全链路预算秒数（0=自动跟随 INTENT_TIMEOUT） | `0` | int |
+| `AGENT_EXPAND_TOOLS_STEP` | Agent 第 N 轮后扩展到完整工具池 | `2` | int |
+| `AGENT_TOOL_FAILURE_LIMIT` | 单工具连续失败达到阈值后自动熔断 | `2` | int |
+| `AGENT_FAILED_ROUND_LIMIT` | 连续失败回合阈值，达到后直接总结 | `2` | int |
+| `AGENT_STRICT_TOOL_SELECT` | 严格工具选择（无匹配时不回退全量工具） | `True` | bool |
 | `CONFIDENCE_THRESHOLD` | 插件意图置信度阈值，低于该值时降级为普通聊天 | `0.72` | float |
 | `CHAT_STYLE` | ChatInter 对话风格补充设定，留空使用默认风格 | `""` | str |
-| `CUSTOM_PROMPT` | ChatInter 自定义系统提示词补充，会追加到系统提示词末尾 | `""` | str |
+| `CUSTOM_PROMPT` | ChatInter 自定义系统提示词补充 | `""` | str |
 | `MCP_ENDPOINTS` | MCP 工具服务地址列表，使用英文逗号分隔 | `""` | str |
-| `REASONING_EFFORT` | 强制推理强度，可选 MEDIUM 或 HIGH，留空表示不强制设置 | `"MEDIUM"` | str |
+| `REASONING_EFFORT` | 强制推理强度，可选 MEDIUM 或 HIGH | `"MEDIUM"` | str |
+| `HISTORY_RECALL_LIMIT` | 上下文中额外召回的历史相关对话片段数量 | `4` | int |
+| `HISTORY_RECALL_MIN_SCORE` | 历史片段召回最低相关度阈值（0-1） | `0.18` | float |
+| `HISTORY_RECALL_CANDIDATE_LIMIT` | 历史片段召回候选池大小 | `60` | int |
+| `GROUP_BACKGROUND_FETCH_MULTIPLIER` | 群聊背景候选抓取倍数 | `3` | int |
+| `GROUP_BACKGROUND_RELEVANT_LIMIT` | 群聊背景中按相关度补充的消息上限 | `3` | int |
+| `GROUP_BACKGROUND_MIN_SCORE` | 群聊背景相关补充的最低相关度阈值 | `0.16` | float |
+| `CHAT_ALLOW_LONG_RESPONSE_FOR_COMPLEX` | 复杂问题自动放宽对话长度限制 | `True` | bool |
+| `ENABLE_CONTEXT_RELEVANCE_GATE` | 新话题与历史低关联时按单轮对话处理 | `True` | bool |
+| `CONTEXT_RELEVANCE_THRESHOLD` | 上下文关联阈值（0-1） | `0.11` | float |
+| `CONTEXT_RELEVANCE_SAMPLE_LIMIT` | 上下文关联评估采样条数 | `18` | int |
+| `CONTEXT_RELEVANCE_MIN_QUERY_TOKENS` | 触发上下文关联评估所需的最少查询关键词数量 | `1` | int |
 
 ### 配置示例
 
@@ -148,6 +166,16 @@ class ChatInterChatHistory(Model):
 ![example](docs_image/1.png)
 
 ## 🚀 更新日志
+
+### v1.2.0
+
+- 新增向量化历史记忆召回，智能检索相关对话片段
+- 新增上下文关联门控，新话题自动隔离历史上下文
+- 新增群聊背景相关度补充，提升群聊响应准确性
+- 新增 Agent 框架精细化配置（工具步数、超时、熔断机制）
+- 新增复杂问题自动放宽对话长度限制
+- 优化路由引擎，减小路由污染
+- 修复意图分析失败时的 pydantic 验证错误，优雅降级
 
 ### v1.1.0
 
