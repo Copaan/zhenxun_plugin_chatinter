@@ -17,6 +17,7 @@ from .route_text import (
     is_usage_question,
     normalize_message_text,
 )
+from .schema_policy import schema_allows_at
 from .skill_registry import (
     SkillRouteDecision,
     get_skill_registry,
@@ -330,7 +331,6 @@ def _normalize_placeholder_tokens(command: str) -> tuple[list[str], list[str]]:
                 image_tokens.append(normalized)
     return at_tokens, image_tokens
 
-
 def _sanitize_command_with_schema(
     plugin: PluginInfo,
     *,
@@ -358,8 +358,8 @@ def _sanitize_command_with_schema(
             continue
         text_tokens.append(token_text)
 
-    allow_at = getattr(schema, "allow_at", None)
-    if allow_at is False:
+    allow_at = schema_allows_at(schema)
+    if not allow_at:
         at_tokens = []
 
     image_max = getattr(schema, "image_max", None)

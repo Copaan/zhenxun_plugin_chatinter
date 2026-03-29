@@ -55,6 +55,11 @@ from .route_text import (
     should_force_knowledge_refresh,
     strip_invoke_prefix,
 )
+from .schema_policy import (
+    resolve_command_target_policy,
+    schema_allows_at,
+    schema_is_self_only,
+)
 from .trace import StageTrace
 from .utils.multimodal import extract_images_from_message
 from .utils.unimsg_utils import remove_reply_segment, uni_to_text_with_tags
@@ -1211,7 +1216,8 @@ def _collect_target_capable_command_heads(knowledge_base) -> set[str]:
     plugins = getattr(knowledge_base, "plugins", None) or []
     for plugin in plugins:
         for meta in getattr(plugin, "command_meta", None) or []:
-            allow_at = bool(getattr(meta, "allow_at", False))
+            policy = resolve_command_target_policy(meta)
+            allow_at = policy.allow_at
             image_min = int(getattr(meta, "image_min", 0) or 0)
             target_requirement = normalize_message_text(
                 str(getattr(meta, "target_requirement", "") or "")
@@ -1312,8 +1318,7 @@ def _find_route_command_schema(route_result: RouteResolveResult, knowledge_plugi
 
 
 def _is_schema_self_only(schema) -> bool:
-    actor_scope = normalize_message_text(str(getattr(schema, "actor_scope", "") or "")).lower()
-    return actor_scope == "self_only"
+    return schema_is_self_only(schema)
 
 
 def _should_block_self_only_action(
@@ -1755,6 +1760,25 @@ def _append_unique_tokens(command: str, tokens: list[str]) -> str:
     return normalize_message_text(f"{normalized_command} {' '.join(merged)}")
 
 
+def _remove_tokens_from_command(command: str, tokens: list[str]) -> str:
+    normalized_command = normalize_message_text(command or "")
+    if not normalized_command or not tokens:
+        return normalized_command
+    parts = normalized_command.split(" ")
+    head = normalize_message_text(parts[0] if parts else "")
+    if not head:
+        return ""
+    token_set = {normalize_message_text(token) for token in tokens if token}
+    payload = [
+        token_text
+        for token in parts[1:]
+        if (token_text := normalize_message_text(token)) and token_text not in token_set
+    ]
+    if payload:
+        return normalize_message_text(f"{head} {' '.join(payload)}")
+    return head
+
+
 def _clamp_command_text_tokens(command: str, text_max_raw) -> str:
     normalized_command = normalize_message_text(command or "")
     if not normalized_command:
@@ -1803,6 +1827,11 @@ def _prepare_route_execution_plan(
 
     schema = _find_route_command_schema(route_result, knowledge_plugins)
     if schema is None:
+        if _is_self_only_action_message(command):
+            at_tokens = _extract_at_tokens(command)
+            if at_tokens:
+                command = _remove_tokens_from_command(command, at_tokens)
+            return RouteExecutionPlan(command=command)
         if not _is_image_related_route(route_result):
             return RouteExecutionPlan(command=command)
         merged_at = _extract_at_tokens(current_message)
@@ -1822,18 +1851,23 @@ def _prepare_route_execution_plan(
         normalize_message_text(str(getattr(schema, "target_requirement", "") or "")).lower()
         or "none"
     )
-    allow_at_raw = getattr(schema, "allow_at", None)
-    allow_at = allow_at_raw is True or allow_at_raw is None
-
-    command_at = _extract_at_tokens(command)
+    allow_at = schema_allows_at(schema)
+    if allow_at:
+        command_at = _extract_at_tokens(command)
+    else:
+        command_at = []
+        disallowed_at = _extract_at_tokens(command)
+        if disallowed_at:
+            command = _remove_tokens_from_command(command, disallowed_at)
     command_images = _extract_image_tokens(command)
-    message_at = _extract_at_tokens(current_message)
     message_images = _extract_image_tokens(current_message)
 
-    merged_at = command_at[:]
-    for token in message_at:
-        if token not in merged_at:
-            merged_at.append(token)
+    merged_at: list[str] = []
+    if allow_at:
+        merged_at = command_at[:]
+        for token in _extract_at_tokens(current_message):
+            if token not in merged_at:
+                merged_at.append(token)
     merged_images = command_images[:]
     for token in message_images:
         if token not in merged_images:
