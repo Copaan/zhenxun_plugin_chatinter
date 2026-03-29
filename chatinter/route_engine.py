@@ -17,6 +17,7 @@ from .route_text import (
     is_usage_question,
     normalize_message_text,
 )
+from .schema_policy import schema_allows_at
 from .skill_registry import (
     SkillRouteDecision,
     get_skill_registry,
@@ -330,23 +331,6 @@ def _normalize_placeholder_tokens(command: str) -> tuple[list[str], list[str]]:
                 image_tokens.append(normalized)
     return at_tokens, image_tokens
 
-
-def _schema_allows_at(schema) -> bool:
-    actor_scope = normalize_message_text(str(getattr(schema, "actor_scope", "") or "")).lower()
-    if actor_scope == "self_only":
-        return False
-    allow_at = getattr(schema, "allow_at", None)
-    if allow_at is True:
-        return True
-    if allow_at is False:
-        return False
-    target_sources = {
-        normalize_message_text(str(item or "")).lower()
-        for item in (getattr(schema, "target_sources", None) or [])
-    }
-    return "at" in target_sources
-
-
 def _sanitize_command_with_schema(
     plugin: PluginInfo,
     *,
@@ -374,7 +358,7 @@ def _sanitize_command_with_schema(
             continue
         text_tokens.append(token_text)
 
-    allow_at = _schema_allows_at(schema)
+    allow_at = schema_allows_at(schema)
     if not allow_at:
         at_tokens = []
 

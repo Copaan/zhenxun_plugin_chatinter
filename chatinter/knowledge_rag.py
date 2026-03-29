@@ -14,6 +14,7 @@ from zhenxun.services.log import logger
 
 from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
 from .route_text import contains_any, normalize_message_text
+from .schema_policy import resolve_command_target_policy
 
 _TOKEN_PATTERN = re.compile(r"[\w\u4e00-\u9fff]+")
 _RAG_STOPWORDS = {
@@ -158,13 +159,8 @@ def _build_doc_metadata(plugin: PluginInfo) -> dict[str, bool]:
     image_capable = False
     self_only = False
     for meta in plugin.command_meta:
-        if bool(getattr(meta, "allow_at", False)):
-            target_capable = True
-        target_sources = getattr(meta, "target_sources", None) or []
-        if any(
-            str(source or "").strip().lower() in {"at", "reply", "nickname"}
-            for source in target_sources
-        ):
+        policy = resolve_command_target_policy(meta)
+        if policy.allow_at or bool(policy.target_sources & {"at", "reply", "nickname"}):
             target_capable = True
         image_min = getattr(meta, "image_min", None)
         image_max = getattr(meta, "image_max", None)
@@ -172,8 +168,7 @@ def _build_doc_metadata(plugin: PluginInfo) -> dict[str, bool]:
             image_max is not None and int(image_max) > 0
         ):
             image_capable = True
-        actor_scope = str(getattr(meta, "actor_scope", "") or "").strip().lower()
-        if actor_scope == "self_only":
+        if policy.actor_scope == "self_only":
             self_only = True
 
     if not image_capable:

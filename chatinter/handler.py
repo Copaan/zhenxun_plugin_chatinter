@@ -55,6 +55,11 @@ from .route_text import (
     should_force_knowledge_refresh,
     strip_invoke_prefix,
 )
+from .schema_policy import (
+    resolve_command_target_policy,
+    schema_allows_at,
+    schema_is_self_only,
+)
 from .trace import StageTrace
 from .utils.multimodal import extract_images_from_message
 from .utils.unimsg_utils import remove_reply_segment, uni_to_text_with_tags
@@ -1211,19 +1216,8 @@ def _collect_target_capable_command_heads(knowledge_base) -> set[str]:
     plugins = getattr(knowledge_base, "plugins", None) or []
     for plugin in plugins:
         for meta in getattr(plugin, "command_meta", None) or []:
-            actor_scope = normalize_message_text(
-                str(getattr(meta, "actor_scope", "") or "")
-            ).lower()
-            target_sources = {
-                normalize_message_text(str(item or "")).lower()
-                for item in (getattr(meta, "target_sources", None) or [])
-            }
-            allow_at_raw = getattr(meta, "allow_at", None)
-            allow_at = allow_at_raw is True or (
-                allow_at_raw is not False and "at" in target_sources
-            )
-            if actor_scope == "self_only":
-                allow_at = False
+            policy = resolve_command_target_policy(meta)
+            allow_at = policy.allow_at
             image_min = int(getattr(meta, "image_min", 0) or 0)
             target_requirement = normalize_message_text(
                 str(getattr(meta, "target_requirement", "") or "")
@@ -1324,8 +1318,7 @@ def _find_route_command_schema(route_result: RouteResolveResult, knowledge_plugi
 
 
 def _is_schema_self_only(schema) -> bool:
-    actor_scope = normalize_message_text(str(getattr(schema, "actor_scope", "") or "")).lower()
-    return actor_scope == "self_only"
+    return schema_is_self_only(schema)
 
 
 def _should_block_self_only_action(
@@ -1858,31 +1851,23 @@ def _prepare_route_execution_plan(
         normalize_message_text(str(getattr(schema, "target_requirement", "") or "")).lower()
         or "none"
     )
-    actor_scope = normalize_message_text(str(getattr(schema, "actor_scope", "") or "")).lower()
-    target_sources = {
-        normalize_message_text(str(item or "")).lower()
-        for item in (getattr(schema, "target_sources", None) or [])
-    }
-    allow_at_raw = getattr(schema, "allow_at", None)
-    allow_at = allow_at_raw is True or (allow_at_raw is not False and "at" in target_sources)
-    if actor_scope == "self_only":
-        allow_at = False
-
-    command_at = _extract_at_tokens(command)
-    if not allow_at and command_at:
-        command = _remove_tokens_from_command(command, command_at)
+    allow_at = schema_allows_at(schema)
+    if allow_at:
+        command_at = _extract_at_tokens(command)
+    else:
         command_at = []
+        disallowed_at = _extract_at_tokens(command)
+        if disallowed_at:
+            command = _remove_tokens_from_command(command, disallowed_at)
     command_images = _extract_image_tokens(command)
-    message_at = _extract_at_tokens(current_message)
     message_images = _extract_image_tokens(current_message)
 
+    merged_at: list[str] = []
     if allow_at:
         merged_at = command_at[:]
-        for token in message_at:
+        for token in _extract_at_tokens(current_message):
             if token not in merged_at:
                 merged_at.append(token)
-    else:
-        merged_at = []
     merged_images = command_images[:]
     for token in message_images:
         if token not in merged_images:
