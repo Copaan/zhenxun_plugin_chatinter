@@ -8,7 +8,7 @@ from typing import Any
 from zhenxun.services import logger
 
 from .config import ROUTE_OBSERVER_MAX_RECORDS
-from .route_engine import RouteAttemptReport
+from .native_route import NativeRouteReport
 from .route_text import normalize_message_text
 from .trace import StageTrace
 from .turn_runtime import TurnBudgetController
@@ -27,17 +27,6 @@ class TurnMetricsSnapshot:
     route_tool_candidates: int
     route_tool_choices: int
     route_prompt_full_candidates: int
-    route_prompt_compact_candidates: int
-    route_prompt_name_only_candidates: int
-    query_expansion_attempts: int = 0
-    query_expansion_success: int = 0
-    query_expansion_query: str = ""
-    query_expansion_reason: str = ""
-    rerank_attempts: int = 0
-    rerank_success: int = 0
-    rerank_no_available: int = 0
-    rerank_stage: str = ""
-    rerank_reason: str = ""
     runtime_budget: dict[str, object] | None = None
 
     def to_dict(self) -> dict:
@@ -48,7 +37,7 @@ def build_turn_metrics_snapshot(
     *,
     trace: StageTrace,
     total_seconds: float,
-    route_report: RouteAttemptReport | None = None,
+    route_report: NativeRouteReport | None = None,
     budget_controller: TurnBudgetController | None = None,
 ) -> TurnMetricsSnapshot:
     runtime_budget = (
@@ -70,29 +59,6 @@ def build_turn_metrics_snapshot(
         route_prompt_full_candidates=(
             route_report.prompt_full_candidates if route_report else 0
         ),
-        route_prompt_compact_candidates=(
-            route_report.prompt_compact_candidates if route_report else 0
-        ),
-        route_prompt_name_only_candidates=(
-            route_report.prompt_name_only_candidates if route_report else 0
-        ),
-        query_expansion_attempts=(
-            route_report.query_expansion_attempts if route_report else 0
-        ),
-        query_expansion_success=(
-            route_report.query_expansion_success if route_report else 0
-        ),
-        query_expansion_query=(
-            route_report.query_expansion_query if route_report else ""
-        ),
-        query_expansion_reason=(
-            route_report.query_expansion_reason if route_report else ""
-        ),
-        rerank_attempts=(route_report.rerank_attempts if route_report else 0),
-        rerank_success=(route_report.rerank_success if route_report else 0),
-        rerank_no_available=(route_report.rerank_no_available if route_report else 0),
-        rerank_stage=(route_report.rerank_stage if route_report else ""),
-        rerank_reason=(route_report.rerank_reason if route_report else ""),
         runtime_budget=runtime_budget,
     )
 
@@ -122,18 +88,9 @@ class RouteObservation:
     tool_attempts: int
     tool_choice_count: int
     prompt_full_candidates: int
-    prompt_compact_candidates: int
-    prompt_name_only_candidates: int
-    query_expansion_attempts: int
-    query_expansion_success: int
-    query_expansion_query: str
-    query_expansion_reason: str
-    rerank_attempts: int
-    rerank_success: int
-    rerank_no_available: int
-    rerank_stage: str
-    rerank_reason: str
     final_reason: str
+    response_quality: str = ""
+    response_quality_action: str = ""
 
 
 class _RouteObserver:
@@ -156,18 +113,13 @@ class _RouteObserver:
                 "path_counts": {},
                 "outcome_counts": {},
                 "stage_counts": {},
+                "quality_counts": {},
+                "quality_action_counts": {},
                 "top_plugins": {},
                 "avg_candidate_total": 0.0,
                 "avg_tool_candidates": 0.0,
                 "avg_prompt_full_candidates": 0.0,
-                "avg_prompt_compact_candidates": 0.0,
-                "avg_prompt_name_only_candidates": 0.0,
                 "recent_failures": [],
-                "query_expansion_attempts": 0,
-                "query_expansion_success": 0,
-                "rerank_attempts": 0,
-                "rerank_success": 0,
-                "rerank_no_available": 0,
             }
 
         path_counts = Counter(row.path for row in rows if row.path)
@@ -183,39 +135,35 @@ class _RouteObserver:
         avg_prompt_full_candidates = sum(
             row.prompt_full_candidates for row in rows
         ) / len(rows)
-        avg_prompt_compact_candidates = sum(
-            row.prompt_compact_candidates for row in rows
-        ) / len(rows)
-        avg_prompt_name_only_candidates = sum(
-            row.prompt_name_only_candidates for row in rows
-        ) / len(rows)
         recent_failures = [
             asdict(row)
             for row in rows
-            if row.outcome not in {"plugin_reroute", "chat_fallback"}
+            if row.outcome
+            not in {
+                "plugin_reroute",
+                "chat_fallback",
+                "tool_completed",
+                "chat_completed",
+            }
         ][-8:]
+        quality_counts = Counter(
+            row.response_quality for row in rows if row.response_quality
+        )
+        quality_action_counts = Counter(
+            row.response_quality_action for row in rows if row.response_quality_action
+        )
         return {
             "total": len(rows),
             "path_counts": dict(path_counts),
             "outcome_counts": dict(outcome_counts),
             "stage_counts": dict(stage_counts),
+            "quality_counts": dict(quality_counts),
+            "quality_action_counts": dict(quality_action_counts),
             "top_plugins": dict(top_plugins.most_common(8)),
             "avg_candidate_total": round(avg_candidate_total, 2),
             "avg_tool_candidates": round(avg_tool_candidates, 2),
             "avg_prompt_full_candidates": round(avg_prompt_full_candidates, 2),
-            "avg_prompt_compact_candidates": round(avg_prompt_compact_candidates, 2),
-            "avg_prompt_name_only_candidates": round(
-                avg_prompt_name_only_candidates,
-                2,
-            ),
             "recent_failures": recent_failures,
-            "query_expansion_attempts": sum(
-                row.query_expansion_attempts for row in rows
-            ),
-            "query_expansion_success": sum(row.query_expansion_success for row in rows),
-            "rerank_attempts": sum(row.rerank_attempts for row in rows),
-            "rerank_success": sum(row.rerank_success for row in rows),
-            "rerank_no_available": sum(row.rerank_no_available for row in rows),
         }
 
 
@@ -234,6 +182,8 @@ def record_route_observation(
     route_plugin = str(trace_tags.get("route_plugin", "") or "")
     route_module = str(trace_tags.get("route_module", "") or "")
     route_head = str(trace_tags.get("route_head", "") or "")
+    response_quality = str(trace_tags.get("response_quality", "") or "")
+    response_quality_action = str(trace_tags.get("response_quality_action", "") or "")
     final_reason = ""
     candidate_total = 0
     lexical_candidates = 0
@@ -244,17 +194,6 @@ def record_route_observation(
     tool_attempts = 0
     tool_choice_count = 0
     prompt_full_candidates = 0
-    prompt_compact_candidates = 0
-    prompt_name_only_candidates = 0
-    query_expansion_attempts = 0
-    query_expansion_success = 0
-    query_expansion_query = ""
-    query_expansion_reason = ""
-    rerank_attempts = 0
-    rerank_success = 0
-    rerank_no_available = 0
-    rerank_stage = ""
-    rerank_reason = ""
     if route_report is not None:
         route_stage = route_stage or str(
             getattr(route_report, "selected_stage", "") or ""
@@ -284,29 +223,6 @@ def record_route_observation(
         prompt_full_candidates = int(
             getattr(route_report, "prompt_full_candidates", 0) or 0
         )
-        prompt_compact_candidates = int(
-            getattr(route_report, "prompt_compact_candidates", 0) or 0
-        )
-        prompt_name_only_candidates = int(
-            getattr(route_report, "prompt_name_only_candidates", 0) or 0
-        )
-        query_expansion_attempts = int(
-            getattr(route_report, "query_expansion_attempts", 0) or 0
-        )
-        query_expansion_success = int(
-            getattr(route_report, "query_expansion_success", 0) or 0
-        )
-        query_expansion_query = str(
-            getattr(route_report, "query_expansion_query", "") or ""
-        )
-        query_expansion_reason = str(
-            getattr(route_report, "query_expansion_reason", "") or ""
-        )
-        rerank_attempts = int(getattr(route_report, "rerank_attempts", 0) or 0)
-        rerank_success = int(getattr(route_report, "rerank_success", 0) or 0)
-        rerank_no_available = int(getattr(route_report, "rerank_no_available", 0) or 0)
-        rerank_stage = str(getattr(route_report, "rerank_stage", "") or "")
-        rerank_reason = str(getattr(route_report, "rerank_reason", "") or "")
 
     _OBSERVER.record(
         RouteObservation(
@@ -329,18 +245,9 @@ def record_route_observation(
             tool_attempts=tool_attempts,
             tool_choice_count=tool_choice_count,
             prompt_full_candidates=prompt_full_candidates,
-            prompt_compact_candidates=prompt_compact_candidates,
-            prompt_name_only_candidates=prompt_name_only_candidates,
-            query_expansion_attempts=query_expansion_attempts,
-            query_expansion_success=query_expansion_success,
-            query_expansion_query=query_expansion_query,
-            query_expansion_reason=query_expansion_reason,
-            rerank_attempts=rerank_attempts,
-            rerank_success=rerank_success,
-            rerank_no_available=rerank_no_available,
-            rerank_stage=rerank_stage,
-            rerank_reason=rerank_reason,
             final_reason=final_reason,
+            response_quality=response_quality,
+            response_quality_action=response_quality_action,
         )
     )
 
@@ -361,20 +268,13 @@ def render_route_observer_summary(limit: int = 200) -> str:
         + ", ".join(f"{k}={v}" for k, v in sorted(payload["outcome_counts"].items())),
         "stage: "
         + ", ".join(f"{k}={v}" for k, v in sorted(payload["stage_counts"].items())),
+        "quality: "
+        + ", ".join(f"{k}={v}" for k, v in sorted(payload["quality_counts"].items())),
         (
             f"avg_candidates={payload['avg_candidate_total']}, "
             f"avg_tool_candidates={payload['avg_tool_candidates']}"
         ),
-        (
-            f"avg_prompt_levels=full:{payload['avg_prompt_full_candidates']}, "
-            f"compact:{payload['avg_prompt_compact_candidates']}, "
-            f"name:{payload['avg_prompt_name_only_candidates']}"
-        ),
-        (
-            f"rerank={payload.get('rerank_success', 0)}/"
-            f"{payload.get('rerank_attempts', 0)}, "
-            f"no_tool={payload.get('rerank_no_available', 0)}"
-        ),
+        (f"avg_prompt_full_schema={payload['avg_prompt_full_candidates']}"),
     ]
     top_plugins = payload.get("top_plugins") or {}
     if top_plugins:

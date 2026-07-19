@@ -5,8 +5,11 @@ ChatInter - 聊天响应处理
 """
 
 import asyncio
+from dataclasses import dataclass, field
 import re
+import time
 from typing import Any, cast
+import uuid
 
 from nonebot.adapters import Bot, Event
 from nonebot.adapters.onebot.v11 import (
@@ -16,25 +19,17 @@ from nonebot.adapters.onebot.v11 import (
     PrivateMessageEvent,
 )
 from nonebot.plugin import get_loaded_plugins
-from nonebot_plugin_alconna.uniseg import UniMessage
 
-from zhenxun.configs.config import BotConfig
-from zhenxun.services import chat, logger
-from zhenxun.utils.message import MessageUtils
-
-from .chat_dialogue_planner import ChatDialoguePlan
-from .chat_strategy import build_chat_strategy_prompt
-from .config import (
-    CHAT_ALLOW_LONG_RESPONSE_FOR_COMPLEX,
-    USE_SIGN_IN_IMPRESSION,
-    build_reasoning_generation_config,
-    get_config_value,
-    get_model_name,
+from zhenxun.services import logger
+from zhenxun.services.send_queue import (
+    SendObservation,
+    observe_send_trace,
+    pop_send_observations,
 )
-from .memory import _chat_memory
-from .prompt_guard import guard_prompt_sections
-from .prompt_text import build_chat_base_prompt, build_user_attitude_prompt
-from .turn_runtime import TurnBudgetController
+
+from .artifact_store import get_artifact_store
+from .event_signals import set_event_signal
+from .route_text import normalize_message_text
 
 _REROUTE_TASKS: set[asyncio.Task] = set()
 _REROUTE_TOKEN_PATTERN = re.compile(
@@ -61,138 +56,204 @@ _UNRESOLVED_IMAGE_PLACEHOLDER_PATTERN = re.compile(
     r"\[image(?:#\d+)?\]",
     re.IGNORECASE,
 )
-_COMPLEX_QUERY_HINTS = (
-    "代码",
-    "插件",
-    "报错",
-    "错误",
-    "异常",
-    "调试",
-    "排查",
-    "怎么",
-    "如何",
-    "实现",
-    "步骤",
-    "配置",
-    "脚本",
-    "方案",
-    "traceback",
-    "exception",
-    "nonebot",
-    "python",
-    "api",
+_OBSERVED_IMAGE_OUTPUT_PATTERN = re.compile(
+    r"(?:\[image\b|\[CQ:image\b|type=['\"]?image)",
+    re.IGNORECASE,
 )
 
 
-def _is_complex_query(message_text: str) -> bool:
-    normalized = str(message_text or "").strip().lower()
-    if not normalized:
-        return False
-    if "```" in normalized or "\n" in normalized:
-        return True
-    if len(normalized) >= 36:
-        return True
-    return any(hint in normalized for hint in _COMPLEX_QUERY_HINTS)
+@dataclass(frozen=True)
+class RerouteExecutionResult:
+    success: bool
+    command: str
+    trace_id: str
+    outputs: list[SendObservation] = field(default_factory=list)
+    error: str = ""
+    timed_out: bool = False
+
+    @property
+    def observed_text(self) -> str:
+        return "\n".join(item.text for item in self.outputs if item.text).strip()
 
 
-async def handle_chat_message(
-    message: str,
-    user_id: str,
-    group_id: str | None = None,
-    nickname: str = "用户",
-    mention_name_map: dict[str, str] | None = None,
-    session_key: str | None = None,
-    budget_controller: TurnBudgetController | None = None,
-    dialogue_plan: ChatDialoguePlan | None = None,
-    context_xml: str = "",
-) -> str | UniMessage:
-    chat_style = str(get_config_value("CHAT_STYLE", "") or "")
+def _captured_send_count(bot: Bot) -> int | None:
+    records = getattr(bot, "sent_messages", None)
+    return len(records) if isinstance(records, list) else None
 
-    system_prompt = await build_chat_system_prompt(
-        user_id=user_id,
-        nickname=nickname,
-        group_id=group_id,
-        chat_style=chat_style,
-        message_text=message,
-        dialogue_plan=dialogue_plan,
-    )
 
-    logger.debug(f"系统提示词：{system_prompt[:500]}...")
-
-    try:
-        guarded = guard_prompt_sections(
-            session_key=session_key or str(group_id or user_id),
-            stage="chat_reply",
-            system_prompt=system_prompt,
-            context_text=context_xml,
-            user_text=message,
-            controller=budget_controller,
-        )
-        user_text = guarded.user_text
-        if guarded.context_text:
-            user_text = (
-                f"{guarded.context_text}\n\n"
-                f"<current_user_message>{guarded.user_text}</current_user_message>"
+def _captured_send_observations(
+    bot: Bot,
+    *,
+    trace_id: str,
+    start_index: int | None,
+) -> list[SendObservation]:
+    records = getattr(bot, "sent_messages", None)
+    if start_index is None or not isinstance(records, list):
+        return []
+    outputs: list[SendObservation] = []
+    for item in records[start_index : start_index + 12]:
+        if isinstance(item, tuple) and len(item) >= 2:
+            api, data = item[0], item[1]
+        else:
+            api, data = "captured_send", item
+        payload = data if isinstance(data, dict) else {"message": data}
+        raw = _message_payload_to_text(payload.get("message"))
+        if not raw and isinstance(payload, dict):
+            for key in ("messages", "message", "raw_message"):
+                raw = _message_payload_to_text(payload.get(key))
+                if raw:
+                    break
+        if (
+            not raw
+            and isinstance(payload, dict)
+            and str(api or "")
+            in {
+                "send_msg",
+                "send_group_msg",
+                "send_private_msg",
+            }
+        ):
+            raw = "[plugin visible send]"
+        outputs.append(
+            SendObservation(
+                trace_id=trace_id,
+                api=str(api or "captured_send"),
+                text=normalize_message_text(raw)[:900],
+                raw_message=raw[:900],
+                result={},
+                timestamp=time.time(),
             )
-        response = await chat(
-            message=user_text,
-            instruction=guarded.system_prompt,
-            model=get_model_name(),
-            config=build_reasoning_generation_config(),
         )
-
-        reply_text = normalize_ai_reply_text(
-            response.text if response else "抱歉，我现在有点累，稍后再聊吧~"
-        )
-        reply_text = replace_mention_ids_with_names(reply_text, mention_name_map)
-        return reply_text
-
-    except Exception as e:
-        logger.error(f"聊天处理失败：{e}")
-        return MessageUtils.build_failure_message()
+    return outputs
 
 
-async def build_chat_system_prompt(
-    user_id: str,
-    nickname: str,
-    group_id: str | None = None,
-    chat_style: str = "",
-    message_text: str = "",
-    dialogue_plan: ChatDialoguePlan | None = None,
-) -> str:
-    if USE_SIGN_IN_IMPRESSION:
-        impression, attitude = await _chat_memory.get_user_impression(user_id)
-    else:
-        impression, attitude = 0.0, "一般"
+def _message_payload_to_text(message: Any) -> str:
+    if message is None:
+        return ""
+    if hasattr(message, "extract_plain_text"):
+        try:
+            plain = str(message.extract_plain_text())
+            if plain.strip():
+                return plain
+        except Exception:
+            pass
+    if isinstance(message, list | tuple):
+        parts = [_message_payload_to_text(item) for item in message]
+        return " ".join(part for part in parts if part).strip()
+    if isinstance(message, dict):
+        segment_type = str(message.get("type", "") or "")
+        data = message.get("data")
+        if segment_type:
+            if segment_type == "text" and isinstance(data, dict):
+                return str(data.get("text", "") or "")
+            if segment_type == "image":
+                return "[plugin image output]"
+            if segment_type == "music":
+                source = ""
+                music_id = ""
+                if isinstance(data, dict):
+                    source = str(data.get("type", "") or "")
+                    music_id = str(data.get("id", "") or "")
+                suffix = " ".join(item for item in (source, music_id) if item)
+                return f"[plugin music output{': ' + suffix if suffix else ''}]"
+            if segment_type in {"record", "voice"}:
+                return "[plugin voice output]"
+            if segment_type == "video":
+                return "[plugin video output]"
+            if segment_type in {"node", "forward"}:
+                return "[plugin forward message]"
+            return f"[plugin {segment_type} output]"
+        for key in ("message", "messages", "raw_message", "content"):
+            raw = _message_payload_to_text(message.get(key))
+            if raw:
+                return raw
+    try:
+        return str(message)
+    except Exception:
+        return ""
 
-    is_complex_query = _is_complex_query(message_text) or bool(
-        dialogue_plan and dialogue_plan.is_complex
+
+def _merge_captured_outputs_if_empty(
+    outputs: list[SendObservation],
+    *,
+    bot: Bot,
+    trace_id: str,
+    start_index: int | None,
+) -> list[SendObservation]:
+    if outputs:
+        return outputs
+    return _captured_send_observations(
+        bot,
+        trace_id=trace_id,
+        start_index=start_index,
     )
-    if CHAT_ALLOW_LONG_RESPONSE_FOR_COMPLEX and is_complex_query:
-        length_rule = (
-            "当前问题偏复杂（如代码/排错/实现类），允许使用分点和步骤化说明，"
-            "优先给出可执行结论，不受80字限制。"
-        )
-    else:
-        length_rule = "默认控制在80字以内，除非用户明确要求详细步骤。"
 
-    base_prompt = build_chat_base_prompt(
-        BotConfig.self_nickname,
-        chat_style,
-        length_rule,
-        strategy_prompt=build_chat_strategy_prompt(dialogue_plan),
-    )
-    group_prompt = f"\n群组 ID：{group_id}" if group_id else ""
-    impression_prompt = (
-        build_user_attitude_prompt(nickname, impression, attitude)
-        if USE_SIGN_IN_IMPRESSION
-        else ""
-    )
 
-    custom_prompt = get_config_value("CUSTOM_PROMPT", "")
-    custom_prompt_text = f"\n额外设定：{custom_prompt}" if custom_prompt else ""
+def artifacts_from_send_observations(
+    outputs: list[SendObservation],
+    *,
+    trace_id: str,
+) -> list[dict[str, Any]]:
+    """Convert plugin sends into compact artifact refs for model observations."""
 
-    return base_prompt + impression_prompt + group_prompt + custom_prompt_text
+    store = get_artifact_store()
+    artifacts: list[dict[str, Any]] = []
+    for index, output in enumerate(outputs, 1):
+        raw = str(output.raw_message or "")
+        text = str(output.text or "")
+        if _OBSERVED_IMAGE_OUTPUT_PATTERN.search(raw):
+            artifacts.append(
+                store.store_reference(
+                    artifact_type="image",
+                    summary=f"plugin image output #{index}",
+                    trace_id=trace_id,
+                    source=output.api,
+                    size=len(raw),
+                ).to_dict()
+            )
+            if raw and raw != text:
+                ref = store.store_text(
+                    raw,
+                    artifact_type="plugin_output",
+                    trace_id=trace_id,
+                    source=f"{output.api}:raw_message",
+                    force_file=len(raw) > 240,
+                )
+                if ref is not None:
+                    artifacts.append(ref.to_dict())
+            continue
+
+        if raw and raw != text and len(raw) > len(text):
+            ref = store.store_text(
+                raw,
+                artifact_type="plugin_output",
+                trace_id=trace_id,
+                source=f"{output.api}:raw_message",
+                force_file=len(raw) > 240,
+            )
+            if ref is not None:
+                artifacts.append(ref.to_dict())
+            continue
+
+    return artifacts
+
+
+def messages_summary_from_send_observations(
+    outputs: list[SendObservation],
+) -> list[str]:
+    """Summarize real plugin sends; image-only sends still count as visible."""
+
+    summaries: list[str] = []
+    for index, output in enumerate(outputs, 1):
+        text = normalize_message_text(str(output.text or ""))
+        raw = str(output.raw_message or "")
+        if text:
+            summaries.append(text[:260])
+        elif _OBSERVED_IMAGE_OUTPUT_PATTERN.search(raw):
+            summaries.append(f"[plugin image output #{index}]")
+        elif raw:
+            summaries.append(normalize_message_text(raw)[:260])
+    return summaries[:8]
 
 
 async def reroute_to_plugin(
@@ -202,11 +263,35 @@ async def reroute_to_plugin(
     target_modules: set[str] | None = None,
     extra_image_segments: list[MessageSegment] | None = None,
 ) -> bool:
+    result = await reroute_to_plugin_with_result(
+        bot,
+        event,
+        command,
+        target_modules=target_modules,
+        extra_image_segments=extra_image_segments,
+        wait=False,
+    )
+    return result.success
+
+
+async def reroute_to_plugin_with_result(
+    bot: Bot,
+    event: Event,
+    command: str,
+    target_modules: set[str] | None = None,
+    extra_image_segments: list[MessageSegment] | None = None,
+    *,
+    trace_id: str | None = None,
+    wait: bool = True,
+    timeout: float = 10.0,
+) -> RerouteExecutionResult:
+    trace_key = trace_id or uuid.uuid4().hex
+    command_text = command.strip()
     try:
         import time
 
+        captured_send_start = _captured_send_count(bot)
         event_data = event.model_dump()
-        command_text = command.strip()
         bot_self_id = str(getattr(bot, "self_id", "")) or None
         new_message = _build_reroute_message(
             command_text,
@@ -229,7 +314,12 @@ async def reroute_to_plugin(
                 "重路由消息仍包含未解析的 [image] 占位符，"
                 f"取消重投以避免下游插件解析失败：{command_text}"
             )
-            return False
+            return RerouteExecutionResult(
+                success=False,
+                command=command_text,
+                trace_id=trace_key,
+                error="unresolved image placeholder",
+            )
 
         rendered_plain_text = new_message.extract_plain_text()
         event_data["message"] = new_message
@@ -257,26 +347,95 @@ async def reroute_to_plugin(
             new_event = PrivateMessageEvent(**event_data)
         else:
             logger.warning(f"不支持的事件类型：{type(event)}")
-            return False
+            return RerouteExecutionResult(
+                success=False,
+                command=command_text,
+                trace_id=trace_key,
+                error=f"unsupported event type: {type(event)}",
+            )
 
-        setattr(new_event, "_ai_triggered", True)
+        set_event_signal(new_event, "_ai_triggered", True)
+        set_event_signal(new_event, "_ai_trace_id", trace_key)
         expanded_target_modules = _expand_reroute_target_modules(target_modules)
         if expanded_target_modules:
-            setattr(new_event, "_ai_route_modules", frozenset(expanded_target_modules))
+            set_event_signal(
+                new_event, "_ai_route_modules", frozenset(expanded_target_modules)
+            )
         route_heads = _extract_reroute_heads(command_text)
         if route_heads:
-            setattr(new_event, "_ai_route_heads", frozenset(route_heads))
+            set_event_signal(new_event, "_ai_route_heads", frozenset(route_heads))
 
         handle_event = cast(Any, bot.handle_event)
-        task = asyncio.create_task(handle_event(new_event))
+        if wait:
+            with observe_send_trace(trace_key):
+                task = asyncio.create_task(handle_event(new_event))
+        else:
+            task = asyncio.create_task(handle_event(new_event))
         _REROUTE_TASKS.add(task)
         task.add_done_callback(lambda done_task: _REROUTE_TASKS.discard(done_task))
+        if wait:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=max(float(timeout), 0.5),
+                )
+            except asyncio.TimeoutError:
+                outputs = _merge_captured_outputs_if_empty(
+                    pop_send_observations(trace_key),
+                    bot=bot,
+                    trace_id=trace_key,
+                    start_index=captured_send_start,
+                )
+                task.add_done_callback(
+                    lambda _done_task: pop_send_observations(trace_key)
+                )
+                logger.warning(f"消息重路由等待超时：{command_text}")
+                return RerouteExecutionResult(
+                    success=False,
+                    command=command_text,
+                    trace_id=trace_key,
+                    outputs=outputs,
+                    error="reroute timeout",
+                    timed_out=True,
+                )
+            except Exception as exc:
+                outputs = _merge_captured_outputs_if_empty(
+                    pop_send_observations(trace_key),
+                    bot=bot,
+                    trace_id=trace_key,
+                    start_index=captured_send_start,
+                )
+                logger.warning(f"消息重路由执行异常：{command_text}, error={exc}")
+                return RerouteExecutionResult(
+                    success=False,
+                    command=command_text,
+                    trace_id=trace_key,
+                    outputs=outputs,
+                    error=str(exc),
+                )
+        outputs = _merge_captured_outputs_if_empty(
+            pop_send_observations(trace_key),
+            bot=bot,
+            trace_id=trace_key,
+            start_index=captured_send_start,
+        )
         logger.info(f"消息重路由成功：{command_text}")
-        return True
+        return RerouteExecutionResult(
+            success=True,
+            command=command_text,
+            trace_id=trace_key,
+            outputs=outputs,
+        )
 
     except Exception as e:
         logger.error(f"消息重路由失败：{e}")
-        return False
+        return RerouteExecutionResult(
+            success=False,
+            command=command_text,
+            trace_id=trace_key,
+            outputs=pop_send_observations(trace_key),
+            error=str(e),
+        )
 
 
 def _parse_at_target(token: str) -> str | None:
@@ -462,7 +621,7 @@ def normalize_ai_reply_text(text: str) -> str:
     normalized = (text or "").strip()
     if not normalized:
         return normalized
-    # 代码回复保留 Markdown，避免代码块/语言标记被剥离。
+
     if _has_code_markdown(normalized):
         return normalized
     if not _looks_like_markdown(normalized):
@@ -514,9 +673,11 @@ def replace_mention_ids_with_names(
 
 
 __all__ = [
-    "build_chat_system_prompt",
-    "handle_chat_message",
+    "RerouteExecutionResult",
+    "artifacts_from_send_observations",
+    "messages_summary_from_send_observations",
     "normalize_ai_reply_text",
     "replace_mention_ids_with_names",
     "reroute_to_plugin",
+    "reroute_to_plugin_with_result",
 ]

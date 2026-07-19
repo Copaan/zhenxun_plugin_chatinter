@@ -1,14 +1,48 @@
-from tortoise import fields
-from tortoise.expressions import F
+import json
 
-from zhenxun.services.db_context import Model
+from tortoise import fields
+from tortoise.expressions import F, Q
+
+from zhenxun.services.db_context import Model, with_db_timeout
+from zhenxun.services.message_load import is_db_unhealthy
+
+_CHATINTER_DB_TIMEOUT = 2.5
+_MEMORY_RECALL_CANDIDATE_LIMIT = 64
+_GLOBAL_USER_MEMORY_TYPES = (
+    "nickname",
+    "correction",
+    "preference",
+    "relationship",
+    "person_profile_summary",
+)
+_THREAD_TO_USER_MEMORY_TYPES = {
+    "thread_nickname": "nickname",
+    "thread_correction": "correction",
+    "thread_preference": "preference",
+    "thread_relationship": "relationship",
+    "thread_person_profile_summary": "person_profile_summary",
+}
+
+
+async def _db_or_default(coro, *, operation: str, default):
+    try:
+        return await with_db_timeout(
+            coro,
+            timeout=_CHATINTER_DB_TIMEOUT,
+            operation=operation,
+            source="chatinter",
+        )
+    except TimeoutError:
+        return default
+    except Exception:
+        return default
 
 
 class ChatInterChatHistory(Model):
     """ChatInter 聊天历史表
 
-    采用一问一答格式，每条记录包含用户消息和 AI 回复
-    参考：bym_ai.models.bym_chat
+    每条记录保存一次 ChatInter turn 的完整 message timeline。
+    user_message / ai_response 仅作为兼容摘要字段，历史重放优先读取 timeline。
     """
 
     id = fields.IntField(pk=True, generated=True, auto_increment=True)
@@ -24,7 +58,9 @@ class ChatInterChatHistory(Model):
     user_message = fields.TextField()
     """用户消息"""
     ai_response = fields.TextField(null=True)
-    """AI 回复内容"""
+    """AI 回复摘要（兼容旧读取）"""
+    timeline = fields.TextField(default="")
+    """完整 message timeline，JSON 数组"""
     bot_id = fields.CharField(255, null=True)
     """Bot ID"""
     create_time = fields.DatetimeField(auto_now_add=True, index=True)
@@ -37,8 +73,18 @@ class ChatInterChatHistory(Model):
         table_description = "ChatInter 聊天历史表"
 
     @classmethod
+    async def _run_script(cls):
+        return [
+            "ALTER TABLE chatinter_chat_history ADD COLUMN timeline TEXT DEFAULT '';",
+        ]
+
+    @classmethod
     async def get_recent_dialogs(
-        cls, session_id: str, limit: int = 5
+        cls,
+        session_id: str,
+        limit: int = 5,
+        *,
+        user_id: str | None = None,
     ) -> list["ChatInterChatHistory"]:
         """
         获取指定会话最近的 N 轮对话（用于语境前缀）
@@ -46,17 +92,40 @@ class ChatInterChatHistory(Model):
         参数:
             session_id: 会话标识
             limit: 获取数量（对话轮次）
+            user_id: 可选的用户过滤
 
         返回:
             list[ChatInterChatHistory]: 按时间正序排列的对话列表
         """
-        dialogs = (
-            await cls.filter(session_id=session_id, reset=False)
-            .order_by("-create_time", "-id")
-            .limit(limit)
+        if is_db_unhealthy():
+            return []
+        query = cls.filter(session_id=session_id, reset=False)
+        if user_id:
+            query = query.filter(user_id=user_id)
+        dialogs = await _db_or_default(
+            query.order_by("-create_time", "-id").limit(limit),
+            operation="ChatInterChatHistory.get_recent_dialogs",
+            default=[],
         )
-        # 反转为正序（从旧到新）
+
         return list(reversed(dialogs))
+
+    @classmethod
+    async def migrate_session_id(cls, old_session_id: str, new_session_id: str) -> int:
+        """Move ambiguous legacy rows on first use of the scoped session key."""
+
+        old = str(old_session_id or "").strip()
+        new = str(new_session_id or "").strip()
+        if not old or not new or old == new or is_db_unhealthy():
+            return 0
+        return int(
+            await _db_or_default(
+                cls.filter(session_id=old).update(session_id=new),
+                operation="ChatInterChatHistory.migrate_session_id",
+                default=0,
+            )
+            or 0
+        )
 
     @classmethod
     async def get_conversation_history(
@@ -72,106 +141,97 @@ class ChatInterChatHistory(Model):
         返回:
             list[ChatInterChatHistory]: 按时间正序排列的对话列表
         """
-        dialogs = (
-            await cls.filter(session_id=session_id, reset=False)
+        if is_db_unhealthy():
+            return []
+        dialogs = await _db_or_default(
+            cls.filter(session_id=session_id, reset=False)
             .order_by("create_time", "id")
-            .limit(limit)
+            .limit(limit),
+            operation="ChatInterChatHistory.get_conversation_history",
+            default=[],
         )
         return list(dialogs)
 
     @classmethod
-    async def add_dialog(
+    async def add_timeline(
         cls,
+        *,
         session_id: str,
         user_id: str,
         nickname: str,
         user_message: str,
-        ai_response: str,
+        timeline: list[dict] | tuple[dict, ...],
+        ai_response: str = "",
         group_id: str | None = None,
         bot_id: str | None = None,
-    ) -> "ChatInterChatHistory":
-        """
-        添加一轮对话到数据库（一问一答）
-
-        参数:
-            session_id: 会话标识
-            user_id: 用户 id
-            nickname: 用户昵称
-            user_message: 用户消息
-            ai_response: AI 回复内容
-            group_id: 群组 id（可选）
-            bot_id: Bot ID（可选）
-
-        返回:
-            ChatInterChatHistory: 创建的对话记录
-        """
-        return await cls.create(
-            session_id=session_id,
-            user_id=user_id,
-            group_id=group_id,
-            nickname=nickname,
-            user_message=user_message,
-            ai_response=ai_response,
-            bot_id=bot_id,
+    ) -> "ChatInterChatHistory | None":
+        """添加一次完整 ChatInter message timeline。"""
+        if is_db_unhealthy():
+            return None
+        dialog = await _db_or_default(
+            cls.create(
+                session_id=session_id,
+                user_id=user_id,
+                group_id=group_id,
+                nickname=nickname,
+                user_message=user_message,
+                ai_response=ai_response,
+                timeline=json.dumps(list(timeline), ensure_ascii=False, default=str),
+                bot_id=bot_id,
+            ),
+            operation="ChatInterChatHistory.add_timeline",
+            default=None,
         )
+        if dialog is None:
+            return None
+        try:
+            from ..session_search import upsert_session_search_dialog
+
+            await _db_or_default(
+                upsert_session_search_dialog(dialog),
+                operation="ChatInterChatHistory.upsert_session_search_dialog",
+                default=None,
+            )
+        except Exception:
+            pass
+        return dialog
+
+    def get_timeline(self) -> list[dict]:
+        raw = str(self.timeline or "").strip()
+        if raw:
+            try:
+                value = json.loads(raw)
+            except Exception:
+                value = []
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        fallback: list[dict] = []
+        if self.user_message:
+            fallback.append(
+                {
+                    "role": "user",
+                    "kind": "current_user",
+                    "content": str(self.user_message or ""),
+                }
+            )
+        if self.ai_response:
+            fallback.append(
+                {
+                    "role": "assistant",
+                    "kind": "final_output",
+                    "content": str(self.ai_response or ""),
+                }
+            )
+        return fallback
 
     @classmethod
-    async def add_user_message(
+    async def prune_old_dialogs(
         cls,
         session_id: str,
-        user_id: str,
-        nickname: str,
-        user_message: str,
-        group_id: str | None = None,
-        bot_id: str | None = None,
-    ) -> "ChatInterChatHistory":
-        """
-        仅添加用户消息（暂时存储，等待 AI 回复后更新）
-
-        参数:
-            session_id: 会话标识
-            user_id: 用户 id
-            nickname: 用户昵称
-            user_message: 用户消息
-            group_id: 群组 id（可选）
-            bot_id: Bot ID（可选）
-
-        返回:
-            ChatInterChatHistory: 创建的消息记录
-        """
-        return await cls.create(
-            session_id=session_id,
-            user_id=user_id,
-            group_id=group_id,
-            nickname=nickname,
-            user_message=user_message,
-            ai_response=None,
-            bot_id=bot_id,
-        )
-
-    @classmethod
-    async def update_ai_response(
-        cls, dialog_id: int, ai_response: str, bot_id: str | None = None
-    ) -> bool:
-        """
-        更新 AI 回复内容
-
-        参数:
-            dialog_id: 对话记录 ID
-            ai_response: AI 回复内容
-            bot_id: Bot ID（可选）
-
-        返回:
-            bool: 是否更新成功
-        """
-        updated = await cls.filter(id=dialog_id).update(
-            ai_response=ai_response,
-            bot_id=bot_id,
-        )
-        return updated > 0
-
-    @classmethod
-    async def prune_old_dialogs(cls, session_id: str, max_limit: int):
+        max_limit: int,
+        *,
+        reset_limit: int = 32,
+    ):
         """
         删除超出上限的旧对话（保留最近的 N 轮）
 
@@ -179,15 +239,41 @@ class ChatInterChatHistory(Model):
             session_id: 会话标识
             max_limit: 最大保留数量
         """
-        total = await cls.filter(session_id=session_id, reset=False).count()
+        if is_db_unhealthy():
+            return
+        total = await _db_or_default(
+            cls.filter(session_id=session_id, reset=False).count(),
+            operation="ChatInterChatHistory.prune_old_dialogs.count",
+            default=0,
+        )
         if total > max_limit:
             to_delete_count = total - max_limit
-            to_delete = (
-                await cls.filter(session_id=session_id, reset=False)
+            to_delete = await _db_or_default(
+                cls.filter(session_id=session_id, reset=False)
                 .order_by("create_time", "id")
-                .limit(to_delete_count)
+                .limit(to_delete_count),
+                operation="ChatInterChatHistory.prune_old_dialogs.list",
+                default=[],
             )
-            await cls.filter(id__in=[dlg.id for dlg in to_delete]).delete()
+            if to_delete:
+                await _db_or_default(
+                    cls.filter(id__in=[dlg.id for dlg in to_delete]).delete(),
+                    operation="ChatInterChatHistory.prune_old_dialogs.delete",
+                    default=0,
+                )
+        reset_rows = await _db_or_default(
+            cls.filter(session_id=session_id, reset=True)
+            .order_by("-create_time", "-id")
+            .offset(max(int(reset_limit or 0), 0)),
+            operation="ChatInterChatHistory.prune_old_dialogs.reset_list",
+            default=[],
+        )
+        if reset_rows:
+            await _db_or_default(
+                cls.filter(id__in=[dialog.id for dialog in reset_rows]).delete(),
+                operation="ChatInterChatHistory.prune_old_dialogs.reset_delete",
+                default=0,
+            )
 
     @classmethod
     async def reset_session(cls, session_id: str) -> int:
@@ -200,8 +286,12 @@ class ChatInterChatHistory(Model):
         返回:
             int: 被重置的对话数量
         """
-        updated = await cls.filter(session_id=session_id, reset=False).update(
-            reset=True
+        if is_db_unhealthy():
+            return 0
+        updated = await _db_or_default(
+            cls.filter(session_id=session_id, reset=False).update(reset=True),
+            operation="ChatInterChatHistory.reset_session",
+            default=0,
         )
         return updated or 0
 
@@ -213,7 +303,13 @@ class ChatInterChatHistory(Model):
         参数:
             session_id: 会话标识
         """
-        await cls.filter(session_id=session_id).delete()
+        if is_db_unhealthy():
+            return
+        await _db_or_default(
+            cls.filter(session_id=session_id).delete(),
+            operation="ChatInterChatHistory.clear_session",
+            default=0,
+        )
 
 
 class ChatInterMemory(Model):
@@ -245,7 +341,7 @@ class ChatInterMemory(Model):
 
     @classmethod
     async def _run_script(cls):
-        return [
+        scripts = [
             "ALTER TABLE chatinter_memory ADD COLUMN scope VARCHAR(32) DEFAULT 'user';",
             "ALTER TABLE chatinter_memory ADD COLUMN thread_id VARCHAR(64);",
             "ALTER TABLE chatinter_memory ADD COLUMN topic_key "
@@ -253,6 +349,27 @@ class ChatInterMemory(Model):
             "ALTER TABLE chatinter_memory ADD COLUMN participants TEXT DEFAULT '';",
             "ALTER TABLE chatinter_memory ADD COLUMN recall_count INT DEFAULT 0;",
         ]
+        global_types = ", ".join(f"'{item}'" for item in _GLOBAL_USER_MEMORY_TYPES)
+        scripts.append(
+            "UPDATE chatinter_memory "
+            "SET session_id = user_id, group_id = NULL, scope = 'user', "
+            "thread_id = NULL, topic_key = '', participants = '' "
+            f"WHERE memory_type IN ({global_types});"
+        )
+        for old_type, new_type in _THREAD_TO_USER_MEMORY_TYPES.items():
+            scripts.append(
+                "UPDATE chatinter_memory "
+                f"SET memory_type = '{new_type}', session_id = user_id, "
+                "group_id = NULL, scope = 'user', thread_id = NULL, "
+                "topic_key = '', participants = '' "
+                f"WHERE memory_type = '{old_type}';"
+            )
+        scripts.append(
+            "UPDATE chatinter_memory "
+            "SET session_id = group_id, scope = 'thread' "
+            "WHERE memory_type = 'thread_digest' AND group_id IS NOT NULL;"
+        )
+        return scripts
 
     @classmethod
     async def upsert_memory(
@@ -271,16 +388,27 @@ class ChatInterMemory(Model):
         participants: str = "",
         source_dialog_id: int | None = None,
         source_message: str | None = None,
-    ) -> "ChatInterMemory":
-        existing = await cls.filter(
-            session_id=session_id,
-            user_id=user_id,
-            memory_type=memory_type,
-            key=key,
-            expired=False,
-        ).first()
+        replace_existing: bool = False,
+    ) -> "ChatInterMemory | None":
+        if is_db_unhealthy():
+            return None
+        existing = await _db_or_default(
+            cls.filter(
+                session_id=session_id,
+                user_id=user_id,
+                memory_type=memory_type,
+                key=key,
+                expired=False,
+            ).first(),
+            operation="ChatInterMemory.upsert_memory.find",
+            default=None,
+        )
+        if is_db_unhealthy():
+            return None
         if existing is not None:
-            if float(existing.confidence or 0.0) <= float(confidence or 0.0):
+            if replace_existing or float(existing.confidence or 0.0) <= float(
+                confidence or 0.0
+            ):
                 existing.value = value
                 existing.confidence = float(confidence or 0.0)
                 existing.group_id = group_id
@@ -290,31 +418,47 @@ class ChatInterMemory(Model):
                 existing.participants = participants
                 existing.source_dialog_id = source_dialog_id
                 existing.source_message = source_message
-                await existing.save()
+                await _db_or_default(
+                    existing.save(),
+                    operation="ChatInterMemory.upsert_memory.save",
+                    default=None,
+                )
+                if is_db_unhealthy():
+                    return None
             return existing
-        return await cls.create(
-            session_id=session_id,
-            user_id=user_id,
-            group_id=group_id,
-            memory_type=memory_type,
-            key=key,
-            value=value,
-            confidence=float(confidence or 0.0),
-            scope=scope,
-            thread_id=thread_id,
-            topic_key=topic_key,
-            participants=participants,
-            source_dialog_id=source_dialog_id,
-            source_message=source_message,
+        return await _db_or_default(
+            cls.create(
+                session_id=session_id,
+                user_id=user_id,
+                group_id=group_id,
+                memory_type=memory_type,
+                key=key,
+                value=value,
+                confidence=float(confidence or 0.0),
+                scope=scope,
+                thread_id=thread_id,
+                topic_key=topic_key,
+                participants=participants,
+                source_dialog_id=source_dialog_id,
+                source_message=source_message,
+            ),
+            operation="ChatInterMemory.upsert_memory.create",
+            default=None,
         )
 
     @classmethod
     async def mark_recalled(cls, memory_ids: list[int]) -> None:
         if not memory_ids:
             return
+        if is_db_unhealthy():
+            return
         try:
-            await cls.filter(id__in=memory_ids).update(
-                recall_count=F("recall_count") + 1
+            await _db_or_default(
+                cls.filter(id__in=memory_ids).update(
+                    recall_count=F("recall_count") + 1
+                ),
+                operation="ChatInterMemory.mark_recalled",
+                default=0,
             )
         except Exception:
             return
@@ -333,6 +477,8 @@ class ChatInterMemory(Model):
         participants: tuple[str, ...] = (),
         addressee_user_id: str | None = None,
     ) -> list["ChatInterMemory"]:
+        if is_db_unhealthy():
+            return []
         query_text = str(query or "")
         query_tokens = {
             token
@@ -340,11 +486,31 @@ class ChatInterMemory(Model):
             if token
         }
         participant_set = {str(item) for item in participants if str(item)}
-        structured_limit = max(int(limit or 0) * 8, int(limit or 0), 1)
-        rows = (
-            await cls.filter(expired=False)
+        candidate_limit = min(
+            max(int(limit or 0) * 8, int(limit or 0), 1),
+            _MEMORY_RECALL_CANDIDATE_LIMIT,
+        )
+        scope_q = Q(user_id=user_id, scope="user", group_id__isnull=True)
+        if group_id:
+            scope_q |= Q(group_id=group_id) & (
+                Q(scope__in=["group", "thread"]) | Q(memory_type="group_digest")
+            )
+        thread_q = Q()
+        if thread_id:
+            thread_q = (
+                ~Q(scope="thread")
+                | Q(thread_id=thread_id)
+                | Q(thread_id__isnull=True)
+                | Q(thread_id="")
+            )
+        rows = await _db_or_default(
+            cls.filter(expired=False)
+            .filter(scope_q)
+            .filter(thread_q)
             .order_by("-confidence", "-update_time", "-id")
-            .limit(structured_limit)
+            .limit(candidate_limit),
+            operation="ChatInterMemory.recall_memories",
+            default=[],
         )
         scoped: list[ChatInterMemory] = []
         for row in rows:
@@ -356,6 +522,13 @@ class ChatInterMemory(Model):
             row_participants = {
                 item for item in str(row.participants or "").split(",") if item
             }
+            if row_scope == "user":
+                if row_user_id != user_id or row_group_id is not None:
+                    continue
+                if str(row.session_id or "") != row_user_id:
+                    continue
+            elif not (group_id and row_group_id == group_id):
+                continue
             if row_user_id != user_id:
                 if not (
                     (
@@ -366,8 +539,6 @@ class ChatInterMemory(Model):
                     and row_group_id == group_id
                 ):
                     continue
-            if row.session_id != session_id and row_group_id not in {group_id, None}:
-                continue
             value_text = str(row.value or "")
             key_text = f"{row.memory_type} {row.key} {value_text}"
             score = float(row.confidence or 0.0)

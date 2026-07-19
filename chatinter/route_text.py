@@ -4,6 +4,13 @@ import re
 from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
 
 _WHITESPACE_PATTERN = re.compile(r"\s+")
+_EXCESSIVE_LINE_BREAKS_PATTERN = re.compile(r"\n{3,}")
+_INTERNAL_REPLY_BLOCK_PATTERN = re.compile(
+    r"<(response_guidance|persona|event_context|context_layers|"
+    r"current_message_layers|chatroom_history|long_term_memory)\b[^>]*>"
+    r".*?</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
 _PLACEHOLDER_PATTERN = re.compile(
     r"\[@(?:[^\]\s]+|所有人)\]|\[image(?:#\d+)?\]|(?<![0-9A-Za-z_])@\d{5,20}(?=(?:\s|$|[的，,。.!！？?]))",
     re.IGNORECASE,
@@ -330,30 +337,6 @@ TEMPLATE_ROUTE_HINT_WORDS = (
     "[@",
 )
 
-MEME_TRIGGER_WORDS = (
-    "表情包",
-    "表情",
-    "梗图",
-    "meme",
-    "做一张",
-    "生成一张",
-    "来一张",
-    "来一个",
-    "再来一张",
-    "再来一个",
-    "制作一张",
-    "做个",
-    "做一个",
-    "做张",
-    "制作一个",
-    "来个",
-    "再来个",
-    "做图",
-    "生成图",
-    "制作",
-    "启动",
-)
-
 KNOWLEDGE_REFRESH_WORDS = (
     "表情",
     "梗图",
@@ -369,8 +352,8 @@ KNOWLEDGE_REFRESH_WORDS = (
     "开关",
 )
 
-# 不在全局把自然语言短语改写成具体插件命令，避免插件未安装时污染
-# speech-act / 候选召回。具体命令的自然别名由已安装插件的 schema 派生。
+
+
 ACTION_REWRITES: tuple[tuple[str, str], ...] = ()
 
 _TEMPLATE_TAIL_NOISE_WORDS = (
@@ -426,20 +409,17 @@ _ROUTE_INLINE_NOISE_WORDS = (
 )
 
 _ROUTE_CONTEXT_HINT_WORDS = (
-    ROUTE_ACTION_WORDS
-    + MEME_TRIGGER_WORDS
-    + (
-        "给",
-        "对",
-        "向",
-        "让",
-        "替",
-        "去",
-        "发送",
-        "先",
-        "再",
-        "一下",
-    )
+    *ROUTE_ACTION_WORDS,
+    "给",
+    "对",
+    "向",
+    "让",
+    "替",
+    "去",
+    "发送",
+    "先",
+    "再",
+    "一下",
 )
 
 
@@ -456,6 +436,19 @@ class RouteCommandMatch:
 
 def normalize_message_text(text: str) -> str:
     return _WHITESPACE_PATTERN.sub(" ", (text or "").strip())
+
+
+def normalize_reply_text(text: str) -> str:
+    """Clean model-visible reply text without flattening useful paragraphs."""
+
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    normalized = _INTERNAL_REPLY_BLOCK_PATTERN.sub("", normalized)
+    paragraphs: list[str] = []
+    for paragraph in re.split(r"\n\s*\n", normalized):
+        cleaned = "\n".join(line.rstrip() for line in paragraph.splitlines()).strip()
+        if cleaned and (not paragraphs or cleaned != paragraphs[-1]):
+            paragraphs.append(cleaned)
+    return _EXCESSIVE_LINE_BREAKS_PATTERN.sub("\n\n", "\n\n".join(paragraphs))
 
 
 def contains_any(text: str, keywords: tuple[str, ...]) -> bool:
@@ -602,8 +595,8 @@ def _find_short_noise_head_boundary(text: str, command: str) -> int | None:
     if not compact_command or len(compact_command) > 4:
         return None
 
-    # 对于 1-2 字符的命令，编辑距离 ≤1 的模糊匹配没有意义
-    # （任意两个单字符之间编辑距离都是 1），必须要求精确前缀匹配
+
+
     if len(compact_command) <= 2:
         return None
 
@@ -660,50 +653,11 @@ def _is_single_edit_distance_match(left: str, right: str) -> bool:
     return edits <= 1
 
 
-def match_command_head_canonical(text: str, command: str) -> bool:
-    strict_text = _clean_route_command_head_text(text, compact=False)
-    strict_command = _clean_route_command_head_text(command, compact=False)
-    if (
-        strict_text
-        and strict_command
-        and match_command_head(strict_text, strict_command)
-    ):
-        return True
-
-    compact_text = _clean_route_command_head_text(text, compact=True)
-    compact_command = _clean_route_command_head_text(command, compact=True)
-    if not compact_text or not compact_command:
-        ascii_text = _compact_ascii_head_text(text)
-        ascii_command = _compact_ascii_head_text(command)
-        if not ascii_text or not ascii_command:
-            return False
-        if ascii_text == ascii_command:
-            return True
-        return match_command_head_or_sticky(
-            ascii_text,
-            ascii_command,
-            allow_sticky=True,
-        )
-    if compact_text == compact_command:
-        return True
-    if not _has_ascii_alnum(strict_command):
-        if match_command_head_or_sticky(
-            compact_text,
-            compact_command,
-            allow_sticky=True,
-        ):
-            return True
-        ascii_text = _compact_ascii_head_text(text)
-        ascii_command = _compact_ascii_head_text(command)
-        if ascii_text and ascii_command and ascii_text == ascii_command:
-            return True
-        return _find_short_noise_head_boundary(text, command) is not None
-    return False
-
-
-def strip_invoke_prefix(text: str) -> str:
+def invoke_prefix_variants(text: str) -> tuple[str, ...]:
     stripped = normalize_message_text(text)
+    variants: list[str] = []
     while stripped:
+        variants.append(stripped)
         matched = next(
             (
                 prefix
@@ -713,9 +667,15 @@ def strip_invoke_prefix(text: str) -> str:
             None,
         )
         if matched is None:
-            return stripped
+            break
         stripped = normalize_message_text(stripped[len(matched) :])
-    return stripped
+    variants.append(stripped)
+    return tuple(dict.fromkeys(variants))
+
+
+def strip_invoke_prefix(text: str) -> str:
+    variants = invoke_prefix_variants(text)
+    return variants[-1] if variants else ""
 
 
 def _strip_route_leading_noise(text: str) -> str:
@@ -1020,22 +980,7 @@ def has_chat_context_hint(text: str) -> bool:
     return contains_any(text, CHAT_CONTEXT_HINT_WORDS)
 
 
-def _is_meme_plugin(plugin: PluginInfo) -> bool:
-    module_l = plugin.module.lower()
-    name_l = plugin.name.lower()
-    if "meme" in module_l:
-        return True
-    if "表情" in name_l:
-        return True
-    command_text = " ".join(str(command).lower() for command in plugin.commands)
-    if "表情搜索" in command_text and "表情详情" in command_text:
-        return True
-    return False
-
-
 def _is_template_like_plugin(plugin: PluginInfo) -> bool:
-    if _is_meme_plugin(plugin):
-        return True
     command_text = " ".join(
         normalize_message_text(command) for command in plugin.commands
     )
@@ -1075,7 +1020,6 @@ def has_template_route_context(
     has_template_hint = contains_any(normalized, TEMPLATE_ROUTE_HINT_WORDS)
     has_placeholder = "[image" in normalized or "[@" in normalized
     has_route_action = contains_any(normalized, ROUTE_ACTION_WORDS)
-    has_meme_trigger = contains_any(normalized, MEME_TRIGGER_WORDS)
     matched_template = False
     matched_non_template = False
 
@@ -1099,16 +1043,12 @@ def has_template_route_context(
                 else:
                     matched_non_template = True
 
-    if not (
-        has_template_hint or has_placeholder or has_meme_trigger or matched_template
-    ):
+    if not (has_template_hint or has_placeholder or matched_template):
         return False
-    if matched_non_template and not (
-        has_template_hint or has_placeholder or has_meme_trigger
-    ):
+    if matched_non_template and not (has_template_hint or has_placeholder):
         return False
 
-    if has_template_hint or has_placeholder or has_meme_trigger:
+    if has_template_hint or has_placeholder:
         return has_route_action or has_placeholder or matched_template
     return matched_template
 
@@ -1181,11 +1121,6 @@ def should_force_knowledge_refresh(
     if plugin_count <= 2 and contains_any(normalized_message, KNOWLEDGE_REFRESH_WORDS):
         return True
 
-    if contains_any(normalized_message, MEME_TRIGGER_WORDS) and not any(
-        _is_template_like_plugin(plugin) for plugin in knowledge_base.plugins
-    ):
-        return True
-
     if plugin_count <= 8 and contains_any(normalized_message, STRONG_EXECUTE_WORDS):
         all_commands = [
             cmd.strip()
@@ -1212,11 +1147,11 @@ __all__ = [
     "has_template_route_context",
     "is_usage_question",
     "match_command_head",
-    "match_command_head_canonical",
     "match_command_head_fuzzy",
     "match_command_head_or_sticky",
     "normalize_action_phrases",
     "normalize_message_text",
+    "normalize_reply_text",
     "parse_command_with_head",
     "rewrite_command_with_head",
     "sanitize_template_tail",

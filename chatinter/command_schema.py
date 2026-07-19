@@ -6,60 +6,32 @@ command_id + slots，再确定性渲染回原命令文本。
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
 import re
 from typing import Any
 
 from .models.pydantic_models import (
     CommandCapability,
+    CommandRequirement,
     CommandSlotSpec,
     PluginCommandSchema,
 )
-from .plugin_adapters import (
-    build_adapter_schemas,
-    derive_adapter_semantic_aliases,
-    extract_adapter_slots,
-)
-from .route_text import normalize_message_text, parse_command_with_head
+from .route_text import normalize_message_text
 
-_TEXT_PLACEHOLDER_PATTERN = re.compile(r"\{(?P<name>[A-Za-z_][0-9A-Za-z_]*)\}")
-_TOKEN_PATTERN = re.compile(r"[0-9A-Za-z_]+|[\u4e00-\u9fff]+")
-_URL_PAYLOAD_PATTERN = re.compile(
-    r"https?://\S+|(?:BV|AV|av)[0-9A-Za-z]+",
+_COMMAND_PARAM_TOKEN_PATTERN = re.compile(r"\s*[?*+]?\[[^\]]+\]")
+_COMMAND_PARAM_BRACKET_PATTERN = re.compile(r"\s*[?*+]?[<(｟][^>)｠]+[>)｠]")
+_PLACEHOLDER_NAME_PATTERN = re.compile(r"[\[\(<｟{]([^\]\)>｠}]+)[\]\)>｠}]")
+_USAGE_LINE_PREFIX_PATTERN = re.compile(
+    r"^[\-\*\d\.\)、)\s]*(?:命令|用法|示例|格式|usage|example)?\s*[:：]?\s*",
     re.IGNORECASE,
 )
-_TEXT_TAIL_PREFIX_PATTERN = re.compile(
-    r"^(?:这句话|这段话|这句|内容|文本|参数|链接|地址|是|为|叫|名称|名字|"
-    r"：|:|-|，|,|。)+"
-)
-_EMPTY_TEXT_PAYLOAD_WORDS = {
-    "一下",
-    "一下子",
-    "一下下",
-    "看看",
-    "看下",
-    "帮我",
-    "请",
-    "麻烦",
-    "吧",
-    "一下吧",
-    "下吧",
-}
-
-
-@dataclass(frozen=True)
-class CommandSchemaSelection:
-    """A scored schema choice.
-
-    The selector keeps command choice deterministic when several schemas share the
-    same head, while still accepting LLM-provided command_id as the strongest hint.
-    """
-
-    schema: PluginCommandSchema
-    score: float
-    reason: str
-    slots: dict[str, Any] = field(default_factory=dict)
-    missing: tuple[str, ...] = ()
+_HELP_ROLE_TERMS = ("帮助", "说明", "用法", "教程", "参数", "示例", "文档", "列表")
+_RANDOM_ROLE_TERMS = ("随机", "抽", "roll", "掷", "选择", "塔罗")
+_TEMPLATE_ROLE_TERMS = ("生成", "制作", "做", "表情", "模板", "绘制", "画图", "图片")
+_QUERY_ROLE_TERMS = ("查询", "查看", "搜索", "识别", "解析", "翻译", "统计", "排行")
+_SELF_SCOPE_TERMS = ("我的", "自己", "本人", "个人", "我")
+_ASCII_TARGET_TERMS = {"at", "user", "member", "target", "nickname"}
+_CJK_TARGET_TERMS = ("用户", "成员", "群友", "目标", "对象", "昵称")
 
 
 def _slot(
@@ -70,6 +42,7 @@ def _slot(
     default: Any = None,
     aliases: list[str] | None = None,
     description: str = "",
+    choices: list[str] | None = None,
 ) -> CommandSlotSpec:
     return CommandSlotSpec(
         name=name,
@@ -78,6 +51,7 @@ def _slot(
         default=default,
         aliases=list(aliases or []),
         description=description,
+        choices=_normalize_choices(choices or []),
     )
 
 
@@ -90,6 +64,10 @@ def _schema(
     slots: list[CommandSlotSpec] | None = None,
     render: str | None = None,
     requires: dict[str, bool] | None = None,
+    allow_at: bool | None = None,
+    actor_scope: str = "allow_other",
+    target_requirement: str = "none",
+    target_sources: list[str] | None = None,
     command_role: str = "execute",
     payload_policy: str = "none",
     extra_text_policy: str = "keep",
@@ -131,6 +109,10 @@ def _schema(
             "at": False,
             **dict(requires or {}),
         },
+        allow_at=allow_at,  # type: ignore[arg-type]
+        actor_scope=actor_scope,  # type: ignore[arg-type]
+        target_requirement=target_requirement,  # type: ignore[arg-type]
+        target_sources=list(target_sources or []),  # type: ignore[arg-type]
         command_role=command_role,  # type: ignore[arg-type]
         payload_policy=payload_policy,  # type: ignore[arg-type]
         extra_text_policy=extra_text_policy,  # type: ignore[arg-type]
@@ -141,6 +123,79 @@ def _schema(
     )
 
 
+def normalize_schema_command_head(command: str | None) -> str:
+    """Return the executable command head without parameter placeholders."""
+
+    normalized = normalize_message_text(command or "")
+    if not normalized:
+        return ""
+    candidate = _COMMAND_PARAM_TOKEN_PATTERN.split(normalized, maxsplit=1)[0]
+    candidate = _COMMAND_PARAM_BRACKET_PATTERN.split(candidate, maxsplit=1)[0]
+    candidate = normalize_message_text(candidate)
+    if not candidate:
+        return ""
+    return normalize_message_text(candidate.split(" ", 1)[0])
+
+
+def _clean_usage_line(line: str) -> str:
+    text = str(line or "").strip().strip("`")
+    text = _USAGE_LINE_PREFIX_PATTERN.sub("", text).strip()
+    return normalize_message_text(text)
+
+
+def _collect_relevant_usage_lines(
+    usage: str | None,
+    *,
+    head: str,
+    aliases: list[str],
+) -> list[str]:
+    if not usage:
+        return []
+    heads = [text for text in [head, *aliases] if normalize_message_text(text)]
+    heads = sorted(dict.fromkeys(heads), key=len, reverse=True)
+    lines: list[str] = []
+    for raw_line in str(usage or "").splitlines():
+        line = _clean_usage_line(raw_line)
+        if not line:
+            continue
+        if any(_line_starts_with_head(line, candidate) for candidate in heads):
+            if line not in lines:
+                lines.append(line)
+    return lines
+
+
+def _line_starts_with_head(line: str, head: str) -> bool:
+    normalized_line = normalize_message_text(line).casefold()
+    normalized_head = normalize_message_text(head).casefold()
+    if not normalized_line or not normalized_head:
+        return False
+    return normalized_line == normalized_head or normalized_line.startswith(
+        normalized_head + " "
+    )
+
+
+def _extract_placeholder_names(text: str) -> list[str]:
+    names: list[str] = []
+    for raw in _PLACEHOLDER_NAME_PATTERN.findall(str(text or "")):
+        name = normalize_message_text(str(raw or ""))
+        name = name.lstrip("?*+")
+        name = name.split("=", 1)[0].split(":", 1)[0].split(" ", 1)[0]
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _required_placeholder_names(text: str) -> set[str]:
+    required: set[str] = set()
+    for match in re.finditer(r"([<(｟{])([^>\)｠}]+)[>\)｠}]", str(text or "")):
+        raw_name = normalize_message_text(str(match.group(2) or ""))
+        raw_name = raw_name.lstrip("?*+")
+        name = raw_name.split("=", 1)[0].split(":", 1)[0].split(" ", 1)[0]
+        if name:
+            required.add(name)
+    return required
+
+
 def _command_id(module: str, head: str) -> str:
     safe_module = re.sub(r"[^0-9A-Za-z_]+", "_", module.rsplit(".", 1)[-1])
     safe_head = re.sub(r"\s+", "_", normalize_message_text(head))
@@ -149,34 +204,95 @@ def _command_id(module: str, head: str) -> str:
 
 def _requires_from_capability(command: CommandCapability) -> dict[str, bool]:
     requirement = command.requirement
-    params = [
-        normalize_message_text(str(param or "")).lower()
-        for param in requirement.params
-        if normalize_message_text(str(param or ""))
-    ]
-    internal_media_params = {"meme_params", "img", "image", "images", "图片"}
-    params_require_text = bool(params) and not (
-        requirement.text_min <= 0
-        and requirement.image_min > 0
-        and all(param in internal_media_params for param in params)
-    )
+    allow_at = _capability_accepts_at_target(command)
     return {
-        "text": bool(requirement.text_min > 0 or params_require_text),
+
+
+        "text": bool(requirement.text_min > 0),
         "image": bool(requirement.image_min > 0),
         "reply": bool(requirement.requires_reply),
         "private": bool(requirement.requires_private),
         "to_me": bool(requirement.requires_to_me),
-        "at": bool(
-            requirement.allow_at
-            or "at" in requirement.target_sources
-            or requirement.target_requirement == "required"
-        ),
+        "at": allow_at,
     }
 
 
+def _normalize_param_name(name: str) -> str:
+    return normalize_message_text(name).lower()
+
+
+def _contains_target_term(text: str) -> bool:
+    normalized = _normalize_param_name(text)
+    if not normalized:
+        return False
+    if "@" in normalized or any(term in normalized for term in _CJK_TARGET_TERMS):
+        return True
+    return any(
+        token in _ASCII_TARGET_TERMS
+        for token in re.findall(r"[a-z]+", normalized)
+    )
+
+
+def _capability_accepts_image_input(command: CommandCapability) -> bool:
+    requirement = command.requirement
+    image_min = max(int(requirement.image_min or 0), 0)
+    image_max = requirement.image_max
+    if image_min > 0:
+        return True
+    if image_max is None:
+        return True
+    try:
+        return int(image_max) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _capability_has_explicit_at_slot(command: CommandCapability) -> bool:
+    return any(
+        _slot_type_from_name(str(param or "")) == "at"
+        for param in command.requirement.params
+    )
+
+
+def _capability_accepts_at_target(command: CommandCapability) -> bool:
+    requirement = command.requirement
+    if _capability_has_explicit_at_slot(command):
+        return True
+    if not _capability_accepts_image_input(command):
+        return False
+    return bool(
+        requirement.allow_at
+        or "at" in requirement.target_sources
+        or requirement.target_requirement == "required"
+    )
+
+
+def _target_requirement_from_capability(command: CommandCapability) -> str:
+    requirement = command.requirement
+    if _capability_accepts_at_target(command):
+        return requirement.target_requirement
+    if requirement.target_requirement == "required":
+        return "required"
+    return "none"
+
+
+def _target_sources_from_capability(command: CommandCapability) -> list[str]:
+    if _capability_accepts_at_target(command):
+        return list(command.requirement.target_sources)
+    return [
+        source
+        for source in command.requirement.target_sources
+        if source not in {"at", "reply", "nickname", "self"}
+    ]
+
+
 def _is_internal_media_param(name: str, requirement: Any) -> bool:
-    normalized = normalize_message_text(name).lower()
-    if normalized not in {"meme_params", "img", "image", "images", "图片"}:
+    normalized = _normalize_param_name(name)
+    media_named = normalized in {"img", "image", "images", "图片"} or (
+        _slot_type_from_name(name) == "image"
+    )
+    aggregate_media = _is_generic_aggregate_param(name)
+    if not (media_named or aggregate_media):
         return False
     return (
         max(int(getattr(requirement, "text_min", 0) or 0), 0) <= 0
@@ -184,19 +300,40 @@ def _is_internal_media_param(name: str, requirement: Any) -> bool:
     )
 
 
+def _is_generic_aggregate_param(name: str) -> bool:
+    normalized = _normalize_param_name(name)
+    return (
+        normalized
+        in {
+            "params",
+            "args",
+            "arguments",
+            "content",
+            "contents",
+        }
+        or normalized.endswith("_params")
+        or normalized.endswith("params")
+    )
+
+
 def _payload_policy_from_capability(command: CommandCapability) -> tuple[str, str]:
     requirement = command.requirement
-    if requirement.image_min > 0 and requirement.text_min <= 0:
+    accepts_text = requirement.text_min > 0 or (
+        bool(requirement.params) and requirement.text_max != 0
+    )
+    if requirement.image_min > 0 and accepts_text:
+        return "text_or_image", "slot_only"
+    if requirement.image_min > 0:
         return "image_only", "discard"
     if requirement.text_min > 0:
         return "text", "slot_only"
-    if requirement.params:
+    if accepts_text:
         return "slots", "slot_only"
     return "none", "keep"
 
 
 def _slot_type_from_name(name: str) -> str:
-    normalized = normalize_message_text(name).lower()
+    normalized = _normalize_param_name(name)
     if any(
         token in normalized
         for token in (
@@ -209,14 +346,241 @@ def _slot_type_from_name(name: str) -> str:
             "次数",
             "份",
             "个数",
+            "人数",
+            "等级",
+            "页",
         )
     ):
         return "int"
+    if any(token in normalized for token in ("ratio", "rate", "概率", "比例", "倍率")):
+        return "float"
     if any(token in normalized for token in ("image", "图片", "图", "照片")):
         return "image"
-    if any(token in normalized for token in ("at", "user", "用户", "目标", "对象")):
+    if _contains_target_term(normalized):
         return "at"
     return "text"
+
+
+def _normalize_choices(values: list[str] | tuple[str, ...]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        text = normalize_message_text(str(value or ""))
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def _slot_choices_from_requirement(
+    requirement: CommandRequirement,
+) -> dict[str, list[str]]:
+    raw = getattr(requirement, "choices", None) or getattr(
+        requirement, "slot_choices", None
+    )
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, list[str]] = {}
+    for key, values in raw.items():
+        name = normalize_message_text(str(key or ""))
+        if not name:
+            continue
+        if isinstance(values, str):
+            choices = [values]
+        elif isinstance(values, list | tuple | set | frozenset):
+            choices = [str(value) for value in values]
+        else:
+            continue
+        normalized = _normalize_choices(choices)
+        if normalized:
+            result[name] = normalized
+    return result
+
+
+def _slot_type_from_examples(name: str, values: list[str]) -> str:
+    by_name = _slot_type_from_name(name)
+    if by_name != "text":
+        return by_name
+    normalized_values = [
+        normalize_message_text(value)
+        for value in values
+        if normalize_message_text(value)
+    ]
+    if not normalized_values:
+        return by_name
+    if all(re.fullmatch(r"[-+]?\d+", value) for value in normalized_values):
+        return "int"
+    if all(
+        re.fullmatch(r"[-+]?(?:\d+\.\d+|\d+)", value) for value in normalized_values
+    ):
+        return "float"
+    if all(
+        value.startswith("@") or (value.isdigit() and len(value) >= 5)
+        for value in normalized_values
+    ):
+        return "at"
+    return by_name
+
+
+def _prepare_schema_param_names(
+    raw_params: list[str],
+    *,
+    text_min: int,
+    requirement: Any,
+) -> list[str]:
+    """Convert aggregate parser params into concrete schema slots.
+
+    Some plugins expose a single variadic parser arg (for example `params`)
+    while their runtime metadata knows the exact text/image bounds.  LLM tool
+    schemas work better with explicit slots, so split generic aggregate params
+    into `text1`, `text2`, ... when the command requires fixed text segments.
+    """
+
+    params = [
+        param
+        for param in raw_params
+        if not _is_internal_media_param(param, requirement)
+    ]
+    try:
+        text_max = int(getattr(requirement, "text_max", -1))
+    except (TypeError, ValueError):
+        text_max = -1
+    if text_max == 0:
+        params = [
+            param
+            for param in params
+            if not (
+                _slot_type_from_name(param) == "text"
+                and _is_generic_aggregate_param(param)
+            )
+        ]
+    if text_min <= 0:
+        return params
+
+    text_like_params = [
+        param for param in params if _slot_type_from_name(param) == "text"
+    ]
+    if len(text_like_params) == 1 and _is_generic_aggregate_param(text_like_params[0]):
+        params = [param for param in params if param != text_like_params[0]]
+        text_like_params = []
+
+    if not text_like_params:
+        return [*params, *[f"text{index + 1}" for index in range(text_min)]]
+
+    if len(text_like_params) < text_min:
+        return [
+            *params,
+            *[f"text{index + 1}" for index in range(len(text_like_params), text_min)],
+        ]
+
+    return params
+
+
+def _example_argument_rows(
+    command: CommandCapability,
+    *,
+    head: str,
+    usage_lines: list[str],
+) -> list[list[str]]:
+    rows: list[list[str]] = []
+    examples = [
+        *[
+            normalize_message_text(example)
+            for example in command.examples
+            if normalize_message_text(example)
+        ],
+        *usage_lines,
+    ]
+    heads = [
+        text
+        for text in [head, command.command, *command.aliases]
+        if normalize_message_text(text)
+    ]
+    heads = sorted(dict.fromkeys(heads), key=len, reverse=True)
+    for example in examples:
+        matched = next(
+            (
+                candidate
+                for candidate in heads
+                if _line_starts_with_head(example, candidate)
+            ),
+            "",
+        )
+        if not matched:
+            continue
+        tail = normalize_message_text(example[len(matched) :])
+        if not tail:
+            continue
+        tail = re.split(r"\s+(?:--|-|：|:)\s+", tail, maxsplit=1)[0]
+        values = [
+            value
+            for value in re.findall(r'"[^"]+"|“[^”]+”|\'[^\']+\'|\S+', tail)
+            if value
+        ]
+        values = [value.strip("\"'“”") for value in values if value.strip("\"'“”")]
+        if values:
+            rows.append(values)
+    return rows
+
+
+def _infer_param_names_from_examples(
+    command: CommandCapability,
+    *,
+    head: str,
+    usage_lines: list[str],
+    text_min: int,
+) -> list[str]:
+    if text_min > 0:
+        return (
+            ["text"]
+            if text_min == 1
+            else [f"text{index + 1}" for index in range(text_min)]
+        )
+    rows = _example_argument_rows(command, head=head, usage_lines=usage_lines)
+    if not rows:
+        return []
+    max_count = min(max(len(row) for row in rows), 6)
+    if max_count <= 0:
+        return []
+    if max_count == 1:
+        return ["text"]
+    metadata_text = normalize_message_text(
+        " ".join(
+            [
+                head,
+                command.description,
+                " ".join(command.examples),
+                " ".join(usage_lines),
+            ]
+        )
+    ).lower()
+    names: list[str] = []
+    for index in range(max_count):
+        column_values = [row[index] for row in rows if len(row) > index]
+        slot_type = _slot_type_from_examples("", column_values)
+        if slot_type in {"int", "float"}:
+            if index == 0 and any(
+                token in metadata_text
+                for token in ("金额", "金币", "余额", "积分", "价格", "总额")
+            ):
+                names.append("amount")
+            elif any(
+                token in metadata_text
+                for token in ("数量", "人数", "个数", "份数", "次数")
+            ):
+                names.append("count" if "count" not in names else f"count{index + 1}")
+            else:
+                names.append(f"number{index + 1}")
+        elif slot_type == "at":
+            names.append("target")
+        else:
+            names.append(f"arg{index + 1}")
+    return names
+
+
+def _example_values_for_slot(
+    rows: list[list[str]],
+    index: int,
+) -> list[str]:
+    return [row[index] for row in rows if len(row) > index]
 
 
 def _slot_aliases_from_name(name: str) -> list[str]:
@@ -248,6 +612,8 @@ def _slot_description(name: str, slot_type: str) -> str:
         return ""
     if slot_type == "int":
         return f"{normalized}，通常填写数字"
+    if slot_type == "float":
+        return f"{normalized}，通常填写小数或数字"
     if slot_type == "image":
         return f"{normalized}，需要图片上下文"
     if slot_type == "at":
@@ -255,11 +621,35 @@ def _slot_description(name: str, slot_type: str) -> str:
     return f"{normalized}文本"
 
 
-def _command_description(command: CommandCapability, head: str) -> str:
+def _description_with_choices(description: str, choices: list[str]) -> str:
+    normalized_choices = _normalize_choices(choices)
+    if not normalized_choices:
+        return description
+    choices_text = "可选值: " + "/".join(normalized_choices[:16])
+    base = normalize_message_text(description)
+    return normalize_message_text(
+        "；".join(part for part in (base, choices_text) if part)
+    )
+
+
+def _command_description(
+    command: CommandCapability,
+    head: str,
+    *,
+    usage_lines: list[str] | None = None,
+    plugin_description: str = "",
+    include_global_context: bool = True,
+) -> str:
     parts: list[str] = []
+    command_description = normalize_message_text(command.description)
+    if command_description:
+        parts.append(command_description)
+    plugin_desc = normalize_message_text(plugin_description)
+    if include_global_context and plugin_desc and plugin_desc != "暂无描述":
+        parts.append(plugin_desc)
     examples = [
         normalize_message_text(example)
-        for example in command.examples[:2]
+        for example in command.examples
         if normalize_message_text(example)
     ]
     if examples:
@@ -267,7 +657,7 @@ def _command_description(command: CommandCapability, head: str) -> str:
     requirement = command.requirement
     requirement_parts: list[str] = []
     if requirement.params:
-        requirement_parts.append("参数: " + " ".join(requirement.params[:4]))
+        requirement_parts.append("参数: " + " ".join(requirement.params))
     if requirement.text_min > 0:
         requirement_parts.append(f"至少{requirement.text_min}段文本")
     if requirement.image_min > 0:
@@ -278,19 +668,84 @@ def _command_description(command: CommandCapability, head: str) -> str:
         requirement_parts.append("需要明确目标")
     if requirement_parts:
         parts.append("；".join(requirement_parts))
+    if include_global_context and usage_lines:
+        parts.append("用法: " + " / ".join(usage_lines[:3]))
     if not parts:
         parts.append(f"执行“{head}”命令")
     description = "；".join(parts)
-    return description[:120].rstrip()
+    return description.rstrip()
+
+
+def _command_role_from_text(
+    *,
+    text: str,
+    requirement: Any,
+) -> str:
+    normalized = normalize_message_text(text).casefold()
+    if any(term.casefold() in normalized for term in _HELP_ROLE_TERMS):
+        return "usage"
+    if any(term.casefold() in normalized for term in _RANDOM_ROLE_TERMS):
+        return "random"
+    if requirement.image_min > 0 and any(
+        term.casefold() in normalized for term in _TEMPLATE_ROLE_TERMS
+    ):
+        return "template"
+    if any(term.casefold() in normalized for term in _TEMPLATE_ROLE_TERMS):
+        return "template"
+    if any(term.casefold() in normalized for term in _QUERY_ROLE_TERMS):
+        return "execute"
+    return "execute"
+
+
+def _actor_scope_from_text(default: str, text: str) -> str:
+    normalized = normalize_message_text(text)
+    if normalized.startswith(_SELF_SCOPE_TERMS):
+        return "self_only"
+    return default
+
+
+def _target_requirement_from_slots(
+    default: str,
+    slots: list[CommandSlotSpec],
+) -> str:
+    at_slots = [slot for slot in slots if slot.type == "at"]
+    if not at_slots:
+        return default
+    if any(slot.required for slot in at_slots):
+        return "required"
+    return "optional" if default == "none" else default
+
+
+def _target_sources_from_slots(
+    default: list[str],
+    slots: list[CommandSlotSpec],
+) -> list[str]:
+    if not any(slot.type == "at" for slot in slots):
+        return default
+    result = list(default)
+    for source in ("at", "reply", "nickname"):
+        if source not in result:
+            result.append(source)
+    return result
 
 
 def schema_from_capability(
     module: str,
     command: CommandCapability,
+    *,
+    usage: str | None = None,
+    plugin_description: str = "",
+    include_global_context: bool = True,
 ) -> PluginCommandSchema | None:
-    head = normalize_message_text(command.command)
+    raw_command = normalize_message_text(command.command)
+    head = normalize_schema_command_head(raw_command) or raw_command
     if not head:
         return None
+    usage_lines = _collect_relevant_usage_lines(
+        usage,
+        head=head,
+        aliases=list(command.aliases),
+    )
     slots: list[CommandSlotSpec] = []
     requirement = command.requirement
     raw_params = [
@@ -298,443 +753,316 @@ def schema_from_capability(
         for param in requirement.params
         if normalize_message_text(str(param or ""))
     ]
-    raw_params = [
-        param
-        for param in raw_params
-        if not _is_internal_media_param(param, requirement)
-    ]
-    if not raw_params and requirement.text_min > 0:
-        raw_params = ["text"]
-    for index, slot_name in enumerate(raw_params[:4]):
-        slot_type = _slot_type_from_name(slot_name)
+    required_param_names: set[str] = set()
+    for value in [raw_command, *usage_lines]:
+        required_param_names.update(_required_placeholder_names(value))
+        raw_params = [
+            *raw_params,
+            *[
+                item
+                for item in _extract_placeholder_names(value)
+                if item and item not in raw_params
+            ],
+        ]
+    text_min = max(int(requirement.text_min or 0), 0)
+    if not raw_params:
+        raw_params = _infer_param_names_from_examples(
+            command,
+            head=head,
+            usage_lines=usage_lines,
+            text_min=text_min,
+        )
+    raw_params = _prepare_schema_param_names(
+        raw_params,
+        text_min=text_min,
+        requirement=requirement,
+    )
+    slot_choices = _slot_choices_from_requirement(requirement)
+    example_rows = _example_argument_rows(command, head=head, usage_lines=usage_lines)
+    inferred_from_examples = bool(example_rows and not requirement.params)
+    for index, slot_name in enumerate(raw_params):
+        choices = slot_choices.get(normalize_message_text(slot_name), [])
+        slot_type = _slot_type_from_examples(
+            slot_name,
+            _example_values_for_slot(example_rows, index),
+        )
+        if choices and slot_type not in {"int", "float", "bool"}:
+            slot_type = "text"
+        text_slot_index = sum(
+            1
+            for previous in raw_params[:index]
+            if _slot_type_from_name(previous) in {"text", "int", "float"}
+        )
+        image_slot_index = sum(
+            1
+            for previous in raw_params[:index]
+            if _slot_type_from_name(previous) == "image"
+        )
         slots.append(
             _slot(
                 slot_name,
                 slot_type,
-                required=requirement.text_min > index,
+                required=(
+                    (
+                        slot_type in {"text", "int", "float"}
+                        and (
+                            text_slot_index < text_min
+                            or slot_name in required_param_names
+                            or inferred_from_examples
+                        )
+                    )
+                    or (
+                        slot_type == "image"
+                        and (
+                            image_slot_index < max(int(requirement.image_min or 0), 0)
+                            or slot_name in required_param_names
+                        )
+                    )
+                    or (
+                        slot_type == "at"
+                        and (
+                            requirement.target_requirement == "required"
+                            or slot_name in required_param_names
+                        )
+                    )
+                ),
                 aliases=_slot_aliases_from_name(slot_name),
-                description=_slot_description(slot_name, slot_type),
+                description=_description_with_choices(
+                    _slot_description(slot_name, slot_type),
+                    choices,
+                ),
+                choices=choices,
             )
         )
     render = head
     if slots:
         render = " ".join([head, *[f"{{{slot.name}}}" for slot in slots]])
     payload_policy, extra_text_policy = _payload_policy_from_capability(command)
-    aliases = [
-        *command.aliases,
-        *derive_adapter_semantic_aliases(
-            head,
-            module=module,
-            image_required=requirement.image_min > 0,
-        ),
-    ]
-    return _schema(
+    if slots and payload_policy == "none":
+        payload_policy, extra_text_policy = "slots", "slot_only"
+    description = _command_description(
+        command,
+        head,
+        usage_lines=usage_lines,
+        plugin_description=plugin_description,
+        include_global_context=include_global_context,
+    )
+    metadata_text = normalize_message_text(
+        " ".join(
+            [
+                head,
+                raw_command,
+                description,
+                command.description,
+                " ".join(command.examples),
+                " ".join(usage_lines),
+                plugin_description,
+                " ".join(raw_params),
+            ]
+        )
+    )
+    command_role = _command_role_from_text(text=metadata_text, requirement=requirement)
+    actor_scope = _actor_scope_from_text(requirement.actor_scope, metadata_text)
+    target_requirement = _target_requirement_from_slots(
+        _target_requirement_from_capability(command),
+        slots,
+    )
+    target_sources = _target_sources_from_slots(
+        _target_sources_from_capability(command),
+        slots,
+    )
+    confidence = 0.5
+    if raw_params:
+        confidence += 0.12
+    if command.description:
+        confidence += 0.1
+    if command.examples:
+        confidence += 0.08
+    if usage_lines:
+        confidence += 0.08
+    if requirement.image_min > 0 or requirement.text_min > 0:
+        confidence += 0.07
+    confidence = min(confidence, 0.9)
+    aliases = list(command.aliases)
+    requires = _requires_from_capability(command)
+    if any(slot.required and slot.type in {"text", "int", "float"} for slot in slots):
+        requires["text"] = True
+    if any(slot.required and slot.type == "image" for slot in slots):
+        requires["image"] = True
+    if any(slot.type == "at" for slot in slots):
+        requires["at"] = True
+    schema = _schema(
         _command_id(module, head),
         head,
         aliases=list(dict.fromkeys(alias for alias in aliases if alias)),
-        description=_command_description(command, head),
+        description=description,
         slots=slots,
         render=render,
-        requires=_requires_from_capability(command),
-        command_role="template" if requirement.image_min > 0 else "execute",
+        requires=requires,
+        allow_at=_capability_accepts_at_target(command)
+        or any(slot.type == "at" for slot in slots),
+        actor_scope=actor_scope,
+        target_requirement=target_requirement,
+        target_sources=target_sources,
+        command_role=command_role,
         payload_policy=payload_policy,
         extra_text_policy=extra_text_policy,
-        source="matcher",
-        confidence=0.68,
+        source="metadata"
+        if (raw_params or command.description or command.examples or usage_lines)
+        else "matcher",
+        confidence=confidence,
         matcher_key=f"{module}:{head}",
+        retrieval_phrases=[
+            phrase
+            for phrase in [
+                raw_command if raw_command and raw_command != head else "",
+                command.description,
+                *command.examples,
+                *usage_lines,
+                plugin_description if include_global_context else "",
+            ]
+            if normalize_message_text(phrase)
+        ],
     )
+    schema.shortcut_renders = list(command.shortcut_renders or [])
+    return schema
+
+
+def _shortcut_schema_views(
+    module: str,
+    schema: PluginCommandSchema,
+) -> list[PluginCommandSchema]:
+    views: list[PluginCommandSchema] = []
+    for shortcut in schema.shortcut_renders:
+        if not isinstance(shortcut, dict):
+            continue
+        view = _shortcut_schema_view(module, schema, shortcut)
+        if view is not None:
+            views.append(view)
+    return views
+
+
+def _shortcut_schema_view(
+    module: str,
+    schema: PluginCommandSchema,
+    shortcut: dict[str, Any],
+) -> PluginCommandSchema | None:
+    alias = normalize_message_text(str(shortcut.get("alias", "") or ""))
+    if not alias or alias == schema.head:
+        return None
+    optional_params = _optional_shortcut_params(shortcut)
+    return schema.model_copy(
+        update={
+            "command_id": _command_id(module, alias),
+            "head": alias,
+            "aliases": [],
+            "slots": _slots_with_optional_shortcut_params(
+                schema.slots,
+                optional_params,
+            ),
+            "render": alias,
+            "shortcut_renders": [],
+            "retrieval_phrases": list(
+                dict.fromkeys([alias, schema.head, *schema.retrieval_phrases])
+            ),
+        },
+        deep=True,
+    )
+
+
+def _optional_shortcut_params(shortcut: dict[str, Any]) -> set[str]:
+    return {
+        normalize_message_text(str(param or "")).casefold()
+        for param in shortcut.get("optional_params", []) or []
+        if normalize_message_text(str(param or ""))
+    }
+
+
+def _slots_with_optional_shortcut_params(
+    slots: list[CommandSlotSpec],
+    optional_params: set[str],
+) -> list[CommandSlotSpec]:
+    if not optional_params:
+        return list(slots)
+    return [
+        slot.model_copy(update={"required": False})
+        if _slot_matches_optional_shortcut_param(slot, optional_params)
+        else slot
+        for slot in slots
+    ]
+
+
+def _slot_matches_optional_shortcut_param(
+    slot: CommandSlotSpec,
+    optional_params: set[str],
+) -> bool:
+    name = normalize_message_text(slot.name).casefold()
+    return name in optional_params or (
+        slot.type in {"text", "int", "float"}
+        and name == "text"
+        and len(optional_params) == 1
+    )
+
+
+def _schema_with_optional_shortcut_params(
+    schema: PluginCommandSchema,
+    optional_params: set[str],
+) -> PluginCommandSchema:
+    if not optional_params:
+        return schema
+    slots = _slots_with_optional_shortcut_params(schema.slots, optional_params)
+    requires = dict(schema.requires or {})
+    if not any(
+        slot.required and slot.type in {"text", "int", "float"} for slot in slots
+    ):
+        requires["text"] = False
+    return schema.model_copy(update={"slots": slots, "requires": requires}, deep=True)
 
 
 def build_command_schemas(
     module: str,
     commands: list[CommandCapability],
+    *,
+    usage: str | None = None,
+    plugin_description: str = "",
 ) -> list[PluginCommandSchema]:
     module_key = normalize_message_text(module)
-    adapter_schemas = build_adapter_schemas(module_key, commands)
-    if adapter_schemas is not None:
-        return adapter_schemas
-
     schemas: list[PluginCommandSchema] = []
     seen: set[str] = set()
+    include_global_context = len(commands) <= 1
     for command in commands:
-        schema = schema_from_capability(module_key, command)
+        schema = schema_from_capability(
+            module_key,
+            command,
+            usage=usage,
+            plugin_description=plugin_description,
+            include_global_context=include_global_context,
+        )
         if schema is None or schema.command_id in seen:
             continue
         seen.add(schema.command_id)
         schemas.append(schema)
-    return schemas
-
-
-def _command_head(command: str | None) -> str:
-    normalized = normalize_message_text(command or "")
-    return normalize_message_text(normalized.split(" ", 1)[0]) if normalized else ""
-
-
-def _command_tail(command: str | None) -> str:
-    normalized = normalize_message_text(command or "")
-    if not normalized or " " not in normalized:
-        return ""
-    return normalize_message_text(normalized.split(" ", 1)[1])
-
-
-def _tokenize(text: str) -> set[str]:
-    return {
-        token.casefold()
-        for token in _TOKEN_PATTERN.findall(normalize_message_text(text))
-        if token
-    }
-
-
-def _schema_phrases(schema: PluginCommandSchema) -> list[str]:
-    values = [
-        schema.command_id,
-        schema.head,
-        *schema.aliases,
-        schema.description,
-        *schema.retrieval_phrases,
-    ]
-    for slot in schema.slots:
-        values.extend([slot.name, slot.description, *slot.aliases])
-    result: list[str] = []
-    for value in values:
-        text = normalize_message_text(value)
-        if text and text not in result:
-            result.append(text)
-    return result
-
-
-def _schema_render_slots(schema: PluginCommandSchema) -> set[str]:
-    return {
-        normalize_message_text(match.group("name"))
-        for match in _TEXT_PLACEHOLDER_PATTERN.finditer(schema.render or "")
-        if normalize_message_text(match.group("name"))
-    }
-
-
-def _message_has_text_payload(text: str) -> bool:
-    normalized = normalize_message_text(text)
-    if not normalized:
-        return False
-    if re.search(r"\d", normalized):
-        return True
-    if len(normalized) >= 4:
-        return True
-    return bool(_tokenize(normalized))
-
-
-def _score_schema(
-    schema: PluginCommandSchema,
-    *,
-    command_id: str | None,
-    command: str | None,
-    message_text: str,
-    arguments_text: str,
-    slots: dict[str, Any] | None,
-    action: str | None,
-) -> CommandSchemaSelection:
-    normalized_id = normalize_message_text(command_id or "").casefold()
-    schema_id = normalize_message_text(schema.command_id).casefold()
-    command_text = normalize_message_text(command or "")
-    command_head = _command_head(command_text).casefold()
-    command_tail = _command_tail(command_text)
-    message = normalize_message_text(" ".join([message_text, arguments_text]))
-    message_fold = message.casefold()
-    action_text = normalize_message_text(action or "").casefold()
-    score = 0.0
-    reasons: list[str] = []
-
-    if normalized_id:
-        if normalized_id == schema_id:
-            score += 1000.0
-            reasons.append("command_id")
-        else:
-            score -= 24.0
-
-    head = normalize_message_text(schema.head).casefold()
-    aliases = [
-        normalize_message_text(alias).casefold()
-        for alias in schema.aliases
-        if normalize_message_text(alias)
-    ]
-    if command_head:
-        if command_head == head:
-            score += 420.0
-            reasons.append("head")
-        elif command_head in aliases:
-            score += 380.0
-            reasons.append("alias_head")
-        elif head and command_text.casefold().startswith(head):
-            score += 260.0
-            reasons.append("head_prefix")
-        elif any(
-            alias and command_text.casefold().startswith(alias) for alias in aliases
-        ):
-            score += 220.0
-            reasons.append("alias_prefix")
-
-    if message_fold:
-        for alias in aliases:
-            if alias and alias in message_fold:
-                score += 130.0 + min(len(alias), 16)
-                reasons.append("message_alias")
-        if head and head in message_fold:
-            score += 84.0 + min(len(head), 12)
-            reasons.append("message_head")
-
-        message_tokens = _tokenize(message)
-        phrase_tokens: set[str] = set()
-        for phrase in _schema_phrases(schema):
-            phrase_tokens.update(_tokenize(phrase))
-        overlap = len(message_tokens & phrase_tokens)
-        if overlap:
-            score += min(overlap * 10.0, 60.0)
-            reasons.append("token_overlap")
-
-    completed_slots, missing = complete_slots(
-        schema,
-        slots=slots,
-        message_text=message_text,
-        arguments_text=arguments_text or command_tail,
-    )
-    provided_slot_names = {
-        normalize_message_text(str(name or ""))
-        for name, value in dict(slots or {}).items()
-        if normalize_message_text(str(name or "")) and value is not None
-    }
-    schema_slot_names = {normalize_message_text(slot.name) for slot in schema.slots}
-    matched_provided = len(provided_slot_names & schema_slot_names)
-    if matched_provided:
-        score += matched_provided * 72.0
-        reasons.append("slots")
-
-    render_slots = _schema_render_slots(schema)
-    completed_render_slots = {
-        name
-        for name in render_slots
-        if name in completed_slots and completed_slots.get(name) is not None
-    }
-    if completed_render_slots:
-        score += len(completed_render_slots) * 28.0
-        reasons.append("completed_slots")
-
-    if missing:
-        penalty = 18.0 if action_text == "clarify" else 86.0
-        score -= len(missing) * penalty
-        reasons.append("missing")
-
-    requires = schema.requires or {}
-    has_payload = _message_has_text_payload(
-        " ".join([command_tail, arguments_text, message_text])
-    )
-    if requires.get("text") and has_payload:
-        score += 18.0
-    elif not requires.get("text") and command_tail:
-        score -= 16.0
-
-    if not schema.slots and not requires.get("text") and action_text == "execute":
-        score += 3.0
-
-    return CommandSchemaSelection(
-        schema=schema,
-        score=score,
-        reason=",".join(dict.fromkeys(reasons)) or "fallback",
-        slots=completed_slots,
-        missing=tuple(missing),
-    )
-
-
-def select_command_schema(
-    schemas: list[PluginCommandSchema],
-    *,
-    command_id: str | None = None,
-    command: str | None = None,
-    message_text: str = "",
-    arguments_text: str = "",
-    slots: dict[str, Any] | None = None,
-    action: str | None = None,
-) -> CommandSchemaSelection | None:
-    if not schemas:
-        return None
-    has_hint = any(
-        normalize_message_text(value or "")
-        for value in (command_id, command, message_text, arguments_text)
-    ) or bool(slots)
-    if not has_hint:
-        return None
-
-    selections = [
-        _score_schema(
-            schema,
-            command_id=command_id,
-            command=command,
-            message_text=message_text,
-            arguments_text=arguments_text,
-            slots=slots,
-            action=action,
-        )
-        for schema in schemas
-    ]
-    selections.sort(
-        key=lambda item: (
-            item.score,
-            -len(item.missing),
-            len(item.schema.slots),
-            -len(item.schema.head),
-        ),
-        reverse=True,
-    )
-    best = selections[0]
-    if best.score <= 0:
-        return None
-    return best
-
-
-def find_command_schema(
-    schemas: list[PluginCommandSchema],
-    *,
-    command_id: str | None = None,
-    command: str | None = None,
-) -> PluginCommandSchema | None:
-    selection = select_command_schema(
-        schemas,
-        command_id=command_id,
-        command=command,
-    )
-    return selection.schema if selection is not None else None
-
-
-def _infer_adapter_slots(
-    schema: PluginCommandSchema,
-    message_text: str,
-) -> dict[str, Any]:
-    command_id = normalize_message_text(schema.command_id)
-    if not command_id:
-        return {}
-    return extract_adapter_slots(command_id, message_text)
-
-
-def _clean_text_payload(value: str) -> str:
-    payload = normalize_message_text(value)
-    while payload:
-        cleaned = normalize_message_text(_TEXT_TAIL_PREFIX_PATTERN.sub("", payload))
-        if cleaned == payload:
-            break
-        payload = cleaned
-    return payload
-
-
-def _clean_head_payload(raw_payload: str, head: str) -> str:
-    payload = normalize_message_text(raw_payload)
-    if not payload:
-        return ""
-    head_text = normalize_message_text(head)
-    if head_text and payload.startswith(head_text):
-        payload = normalize_message_text(payload[len(head_text) :])
-    payload = re.sub(
-        r"^(?:做一句|做一段|写一句|写一段|说一句|说一段|做|写|说|"
-        r"内容(?:是|为)?|文本(?:是|为)?|文字(?:是|为)?|"
-        r"：|:|，|,|。)+",
-        "",
-        payload,
-    )
-    payload = _clean_text_payload(payload)
-    return "" if payload in _EMPTY_TEXT_PAYLOAD_WORDS else payload
-
-
-def _extract_command_tail_payload(
-    schema: PluginCommandSchema,
-    message_text: str,
-) -> str:
-    heads = [schema.head, *schema.aliases]
-    for head in heads:
-        normalized_head = normalize_message_text(head)
-        if not normalized_head:
-            continue
-        head_index = normalize_message_text(message_text).find(normalized_head)
-        if head_index > 0:
-            payload = _clean_head_payload(
-                normalize_message_text(
-                    message_text[head_index + len(normalized_head) :]
-                ),
-                normalized_head,
-            )
-            if payload:
-                return payload
-        parsed = parse_command_with_head(
-            message_text,
-            normalized_head,
-            allow_sticky=True,
-            max_prefix_len=12,
-        )
-        if parsed is None:
-            continue
-        payload = _clean_head_payload(parsed.payload_text, normalized_head)
-        if payload:
-            return payload
-    return ""
-
-
-def _slot_accepts_url(slot: CommandSlotSpec) -> bool:
-    text = normalize_message_text(
-        " ".join([slot.name, slot.description, *slot.aliases])
-    ).casefold()
-    return any(
-        token in text for token in ("链接", "地址", "url", "bv", "av", "视频", "link")
-    )
-
-
-def _extract_url_payload(message_text: str) -> str:
-    match = _URL_PAYLOAD_PATTERN.search(normalize_message_text(message_text))
-    return match.group(0) if match else ""
-
-
-def _fill_slots_from_payload(
-    merged: dict[str, Any],
-    schema: PluginCommandSchema,
-    payload: str,
-) -> None:
-    argument_payload = _clean_text_payload(payload)
-    if not argument_payload:
-        return
-    payload_tokens = [token for token in argument_payload.split(" ") if token]
-    token_index = 0
-    for slot in schema.slots:
-        if slot.name in merged or slot.type == "text":
-            continue
-        if token_index >= len(payload_tokens):
-            break
-        value: Any = payload_tokens[token_index]
-        token_index += 1
-        if slot.type == "int":
-            from .slot_extractors import parse_int_token
-
-            parsed_value = parse_int_token(value)
-            if parsed_value is None:
+    for schema in list(schemas):
+        for shortcut in schema.shortcut_renders:
+            if not isinstance(shortcut, dict):
                 continue
-            value = parsed_value
-        merged[slot.name] = value
-    for slot in schema.slots:
-        if slot.name in merged or slot.type != "text":
-            continue
-        merged[slot.name] = argument_payload
-        break
-
-
-def _fill_link_slots_from_message(
-    merged: dict[str, Any],
-    schema: PluginCommandSchema,
-    message_text: str,
-) -> None:
-    url_payload = _extract_url_payload(message_text)
-    if not url_payload:
-        return
-    for slot in schema.slots:
-        if slot.name in merged or slot.type != "text":
-            continue
-        if not _slot_accepts_url(slot):
-            continue
-        merged[slot.name] = url_payload
-        return
+            shortcut_schema = _shortcut_schema_view(module_key, schema, shortcut)
+            if shortcut_schema is None:
+                continue
+            if shortcut_schema.command_id in seen:
+                optional_params = _optional_shortcut_params(shortcut)
+                if optional_params:
+                    for index, existing in enumerate(schemas):
+                        if existing.command_id == shortcut_schema.command_id:
+                            schemas[index] = _schema_with_optional_shortcut_params(
+                                existing,
+                                optional_params,
+                            )
+                            break
+                continue
+            seen.add(shortcut_schema.command_id)
+            schemas.append(shortcut_schema)
+    return schemas
 
 
 def complete_slots(
@@ -744,27 +1072,24 @@ def complete_slots(
     message_text: str = "",
     arguments_text: str = "",
 ) -> tuple[dict[str, Any], list[str]]:
+    _ = (message_text, arguments_text)
     merged: dict[str, Any] = {}
+    slot_by_key: dict[str, CommandSlotSpec] = {}
+    for slot in schema.slots:
+        for key in (slot.name, *slot.aliases):
+            normalized = normalize_message_text(str(key or ""))
+            if normalized:
+                slot_by_key[normalized] = slot
+
     for key, value in dict(slots or {}).items():
+        slot = slot_by_key.get(normalize_message_text(str(key or "")))
+        if slot is None:
+            continue
         if value is None:
             continue
         if isinstance(value, str) and not normalize_message_text(value):
             continue
-        merged[key] = value
-    # Adapter extractors provide optional plugin-specific slot correction without
-    # leaking those rules into the generic renderer.
-    inferred = _infer_adapter_slots(schema, normalize_message_text(message_text))
-    if not inferred and arguments_text:
-        inferred = _infer_adapter_slots(schema, normalize_message_text(arguments_text))
-    merged.update(
-        inferred,
-    )
-    _fill_link_slots_from_message(merged, schema, message_text)
-    argument_payload = normalize_message_text(arguments_text)
-    if not argument_payload:
-        argument_payload = _extract_command_tail_payload(schema, message_text)
-    if argument_payload:
-        _fill_slots_from_payload(merged, schema, argument_payload)
+        merged[slot.name] = value
 
     missing: list[str] = []
     for slot in schema.slots:
@@ -791,11 +1116,68 @@ def render_command(
     if missing:
         return schema.head, missing
     values = {
-        slot.name: normalize_message_text(str(completed.get(slot.name, "")))
+        slot.name: _render_slot_value(schema, slot, completed.get(slot.name, ""))
         for slot in schema.slots
     }
+    shortcut_render = _matched_shortcut_render(schema, message_text)
+    if shortcut_render:
+        shortcut_parts = shortcut_render.split()
+        rendered_parts = shortcut_parts[:1] if shortcut_parts else [shortcut_render]
+        rendered_parts.extend(
+            values.get(slot.name, "") for slot in schema.slots if values.get(slot.name)
+        )
+        rendered_parts.extend(shortcut_parts[1:])
+        rendered = " ".join(rendered_parts)
+        return normalize_message_text(rendered), []
     try:
         rendered = schema.render.format_map(values)
     except Exception:
         rendered = schema.head
     return normalize_message_text(rendered), []
+
+
+def _matched_shortcut_render(
+    schema: PluginCommandSchema,
+    message_text: str,
+) -> str:
+    text = normalize_message_text(message_text)
+    if not text:
+        return ""
+    for shortcut in schema.shortcut_renders:
+        if not isinstance(shortcut, dict):
+            continue
+        alias = normalize_message_text(str(shortcut.get("alias", "") or ""))
+        render = normalize_message_text(str(shortcut.get("render", "") or ""))
+        if alias and render and alias in text:
+            return render
+    return ""
+
+
+def _render_slot_value(
+    schema: PluginCommandSchema,
+    slot: CommandSlotSpec,
+    value: Any,
+) -> str:
+    """Render slot values so downstream command parsers keep slot boundaries."""
+
+    text = normalize_message_text(str(value or ""))
+    if not text:
+        return ""
+    if not _slot_needs_quoting(schema, slot, text):
+        return text
+    escaped = json.dumps(text, ensure_ascii=False)
+    return escaped
+
+
+def _slot_needs_quoting(
+    schema: PluginCommandSchema,
+    slot: CommandSlotSpec,
+    text: str,
+) -> bool:
+    if slot.type not in {"text", "str"}:
+        return False
+    if " " not in text:
+        return False
+    if len(schema.slots) <= 1:
+        return True
+    return True
