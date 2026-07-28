@@ -120,7 +120,31 @@ async def _handle_runtime_approval_locked(
         if _approval_run_id(approval) == active_run_id
     ]
     if not approvals:
-        return False
+        state = (
+            load_agent_run_state(active_run_id, tool_map=build_superuser_tools())
+            if active_run_id
+            else None
+        )
+        if state is not None and state.pending_approval:
+            state.pending_approval = ""
+            state.paused_reason = "approval_expired"
+            state.final_text = ""
+            state.final_source = ""
+            persist_agent_run_state(
+                state,
+                stage="approval_expired",
+                metadata={"reason": "pending_approval_not_found"},
+            )
+            reply = "该确认已过期，操作未执行，请重新发送任务。"
+        else:
+            reply = "当前没有待确认操作。"
+        await _send_runtime_reply(
+            bot=bot,
+            event=event,
+            session=session,
+            text=reply,
+        )
+        return True
     approval = approvals[0]
 
     if intent == "reject":
@@ -551,6 +575,7 @@ async def _resume_agent_run(
             "run_id": state.run_id,
             "resumed_run_id": state.run_id,
             "artifact_refs": state.artifact_refs,
+            "plan_items": state.plan_items,
             "provider_capability": provider_adapter.profile.to_metadata(),
         },
     )

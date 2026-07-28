@@ -1,4 +1,10 @@
-"""Prompt pipeline orchestration for ChatInter turns."""
+"""Prompt pipeline orchestration for ChatInter turns.
+
+One unified runtime shape: every turn (group or private) builds the full chat
+context, then runs the unified agent which decides between plugin invocation
+and plain reply inside a single model loop.  The old plugin-router /
+chat-degrade split no longer exists.
+"""
 
 from __future__ import annotations
 
@@ -9,16 +15,13 @@ from nonebot_plugin_uninfo import Uninfo
 
 from .group_plugin_flow import (
     stage_group_capability_hint,
-    stage_plugin_run,
     stage_route_media_context,
 )
 from .middleware import get_middleware_manager
 from .pipeline_stages import (
     handle_pipeline_cancelled,
     handle_pipeline_error,
-    prepare_plugin_fallback_chat_context,
     stage_chat_capability_hint,
-    stage_chat_run,
     stage_current_user,
     stage_dialogue_state,
     stage_event_context,
@@ -30,6 +33,7 @@ from .pipeline_stages import (
     stage_thread_context,
 )
 from .turn_frame import TurnFrame
+from .unified_flow import stage_unified_run
 
 PostGateCallback = Callable[..., Awaitable[None]]
 
@@ -82,7 +86,7 @@ class PromptPipeline:
             cached_plain_text=frame.cached_plain_text,
         )
         await stage_thread_context(frame=frame)
-        if frame.scenario == "group_plugin_selector" and frame.allow_plugin_tools:
+        if frame.allow_plugin_tools:
             await stage_route_media_context(frame=frame, bot=bot, event=event)
             await stage_group_capability_hint(
                 frame=frame,
@@ -92,39 +96,15 @@ class PromptPipeline:
                 middleware=middleware,
                 cached_plain_text=frame.cached_plain_text,
             )
-            await stage_plugin_run(
+        else:
+            await stage_chat_capability_hint(
                 frame=frame,
                 bot=bot,
                 event=event,
                 middleware_state=middleware_state,
                 middleware=middleware,
+                cached_plain_text=frame.cached_plain_text,
             )
-            if frame.main_result is None:
-                raise RuntimeError("missing plugin result")
-            if frame.main_result.output.outcome == "plugin_no_selection":
-                await prepare_plugin_fallback_chat_context(
-                    frame=frame,
-                    bot=bot,
-                    event=event,
-                    middleware_state=middleware_state,
-                    middleware=middleware,
-                )
-                await stage_chat_run(
-                    frame=frame,
-                    middleware_state=middleware_state,
-                    middleware=middleware,
-                )
-            await stage_send(frame)
-            await stage_persist(frame)
-            return
-        await stage_chat_capability_hint(
-            frame=frame,
-            bot=bot,
-            event=event,
-            middleware_state=middleware_state,
-            middleware=middleware,
-            cached_plain_text=frame.cached_plain_text,
-        )
         await stage_dialogue_state(frame=frame)
         await stage_memory(frame=frame, bot=bot, event=event)
         await stage_current_user(frame=frame, message=frame.message)
@@ -133,8 +113,10 @@ class PromptPipeline:
             middleware_state=middleware_state,
             middleware=middleware,
         )
-        await stage_chat_run(
+        await stage_unified_run(
             frame=frame,
+            bot=bot,
+            event=event,
             middleware_state=middleware_state,
             middleware=middleware,
         )

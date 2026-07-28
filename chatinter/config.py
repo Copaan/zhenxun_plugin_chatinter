@@ -81,6 +81,22 @@ CHATINTER_REGISTER_CONFIGS = (
         default_value=dict(_DEFAULT_PERMISSIONS),
         type=dict,
     ),
+    RegisterConfig(
+        module=CHATINTER_GROUP,
+        key="PRIVATE_PLUGIN_TOOLS",
+        value=True,
+        help="私聊是否启用插件调用（统一混合模式）",
+        default_value=True,
+        type=bool,
+    ),
+    RegisterConfig(
+        module=CHATINTER_GROUP,
+        key="UNIFIED_MAX_TOOL_STEPS",
+        value=4,
+        help="统一混合模式单回合最多工具循环步数（1-8）",
+        default_value=4,
+        type=int,
+    ),
 )
 
 
@@ -121,12 +137,6 @@ AGENT_COST_CHECKPOINT_TOKENS: dict[str, int] = {
 EXPOSE_FALLBACK_SCHEMAS = False
 SCHEMA_FALLBACK_ALLOWLIST: frozenset[str] = frozenset()
 
-
-
-
-COMMAND_TWO_STAGE_THRESHOLD = 30
-COMMAND_INITIAL_EXPOSURE_CAP = 40
-COMMAND_TWO_STAGE_PLUGIN_CAP = 4
 
 
 
@@ -197,6 +207,20 @@ def get_agent_model(role: AgentRole) -> str:
 def chatinter_enabled() -> bool:
     raw = Config.get_config(CHATINTER_GROUP, "ENABLED", True)
     return _parse_bool(raw, True)
+
+
+def private_plugin_tools_enabled() -> bool:
+    raw = Config.get_config(CHATINTER_GROUP, "PRIVATE_PLUGIN_TOOLS", True)
+    return _parse_bool(raw, True)
+
+
+def get_unified_max_tool_steps() -> int:
+    raw = Config.get_config(CHATINTER_GROUP, "UNIFIED_MAX_TOOL_STEPS", 4)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 4
+    return max(1, min(value, 8))
 
 
 def get_fallback_models(primary_model: str | None = None) -> tuple[str, ...]:

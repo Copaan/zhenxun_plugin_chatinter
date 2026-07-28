@@ -80,10 +80,12 @@ def resolve_chatinter_scenario(
             allow_plugin_tools=False,
         )
 
+    from .config import private_plugin_tools_enabled
+
     return ScenarioRoute(
         scenario=ChatInterScenario.PRIVATE_CHAT,
         reason="private_user_chat",
-        allow_plugin_tools=False,
+        allow_plugin_tools=private_plugin_tools_enabled(),
     )
 
 __all__ = [

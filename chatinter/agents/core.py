@@ -11,8 +11,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from ..llm_compat import LLMMessage
-from ..models.pydantic_models import PluginKnowledgeBase
-from ..native_executor import ExecuteNativeRoute
+from ..native_executor import NativeCommandExecutionContext
 from ..native_route import NativeRouteReport
 from ..provider_capability import ProviderCapabilityAdapter
 from ..route_text import normalize_reply_text
@@ -23,7 +22,7 @@ if TYPE_CHECKING:
     from ..main_request_models import MainRequestResult
 
 ProgressHook = Callable[[str], Awaitable[None] | None]
-AgentKind = Literal["plugin_command", "private_chat"]
+AgentKind = Literal["unified_chat", "superuser"]
 AgentObservationStatus = Literal["ok", "error", "fallback"]
 
 
@@ -35,8 +34,7 @@ class ToolScope:
     allow_plugin: bool = False
 
 
-PLUGIN_COMMAND_TOOL_SCOPE = ToolScope(kind="plugin_command", allow_plugin=True)
-PRIVATE_CHAT_TOOL_SCOPE = ToolScope(kind="private_chat")
+UNIFIED_CHAT_TOOL_SCOPE = ToolScope(kind="unified_chat", allow_plugin=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,32 +67,21 @@ class AgentResult:
 
 
 @dataclass(slots=True)
-class PluginCommandRequest:
-    """Request envelope for the group plugin router."""
-
-    message_text: str
-    knowledge_base: PluginKnowledgeBase
-    session_key: str | None
-    budget_controller: TurnBudgetController | None
-    has_reply: bool
-    command_tools: list[Any] | None
-    route_executor: ExecuteNativeRoute
-    router_context: dict[str, object] | None = None
-    report: NativeRouteReport | None = None
-
-
-@dataclass(slots=True)
-class PrivateChatRequest:
-    """Request envelope for ordinary private chat."""
+class UnifiedChatRequest:
+    """Request envelope for the unified chat + plugin-invocation turn."""
 
     message_text: str
     session_key: str | None
     budget_controller: TurnBudgetController | None
     messages: list[LLMMessage]
-    report: NativeRouteReport | None = None
+    report: NativeRouteReport
+    scenario: str = "private_chat"
+    catalog_text: str = ""
+    tools: dict[str, Any] | None = None
+    command_context: NativeCommandExecutionContext | None = None
 
 
-AgentRequest = PluginCommandRequest | PrivateChatRequest
+AgentRequest = UnifiedChatRequest
 
 
 class ChatInterAgent(Protocol):
@@ -184,16 +171,14 @@ def error_observation(*, kind: str, error: BaseException) -> AgentObservation:
 
 
 __all__ = [
-    "PLUGIN_COMMAND_TOOL_SCOPE",
-    "PRIVATE_CHAT_TOOL_SCOPE",
+    "UNIFIED_CHAT_TOOL_SCOPE",
     "AgentObservation",
     "AgentRequest",
     "AgentResult",
     "ChatInterAgent",
-    "PluginCommandRequest",
-    "PrivateChatRequest",
     "ProgressHook",
     "ToolScope",
+    "UnifiedChatRequest",
     "error_observation",
     "estimate_prompt_tokens",
     "fallback_text",

@@ -79,7 +79,7 @@ def snapshot_group_turn_context(
             continue
         if current_text and item.user_id == current_user and item.text == current_text:
             continue
-        timestamp = time.strftime("%H:%M:%S", time.localtime(item.created_at))
+        timestamp = time.strftime("%H:%M", time.localtime(item.created_at))
         lines.append(f"[{timestamp}] {item.nickname}: {item.text}")
     return lines[-max(int(limit or 0), 0) :]
 

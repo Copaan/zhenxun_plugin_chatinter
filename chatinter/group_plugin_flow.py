@@ -10,8 +10,6 @@ from nonebot.adapters import Bot, Event
 
 from zhenxun.services import logger
 
-from .agents.core import PluginCommandRequest
-from .agents.plugin_command_agent import PluginCommandAgent
 from .chat_handler import (
     artifacts_from_send_observations,
     messages_summary_from_send_observations,
@@ -38,17 +36,14 @@ from .feedback_keys import (
     FEEDBACK_REASON_TARGET_REQUIRED as _FEEDBACK_REASON_TARGET_REQUIRED,
 )
 from .intent_classifier import classify_message_intent
-from .main_request_models import MainRequestResult
 from .memory import _chat_memory
 from .middleware import TurnMiddlewareState
-from .models.pydantic_models import CommandToolSnapshot, PluginKnowledgeBase
+from .models.pydantic_models import CommandToolSnapshot
 from .native_executor import NativeToolExecutionResult, NativeValidatedRoute
 from .native_route import NativeRouteDecision, NativeRouteReport
 from .pipeline_stages import (
-    _build_agent_stage_hooks,
     _prepare_current_message_context,
     _route_report_observer_kwargs,
-    _set_agent_stage_result,
     _tag_execution_observation,
 )
 from .plugin_registry import (
@@ -74,7 +69,6 @@ from .route_text import (
     normalize_message_text,
     should_force_knowledge_refresh,
 )
-from .runtime_result import _finalize_result
 from .target_context import (
     append_mention_context_xml,
     build_mention_name_map,
@@ -83,7 +77,6 @@ from .target_context import (
 from .target_resolver import resolve_execution_target, resolve_pre_route_target
 from .trace import StageTrace
 from .turn_frame import PipelineStage, TurnFrame
-from .turn_runtime import TurnBudgetController
 
 _KNOWLEDGE_REFRESH_COOLDOWN = 30.0
 
@@ -688,101 +681,6 @@ async def _select_capability_route(
         route_candidates=route_report.candidate_total,
     )
 
-async def _run_plugin_command_agent_turn(
-    *,
-    message_text: str,
-    knowledge_base: PluginKnowledgeBase,
-    session_key: str | None,
-    budget_controller: TurnBudgetController | None,
-    has_reply: bool,
-    command_tools: list[Any] | None,
-    route_executor: Any,
-    route_completed_hook: Any | None,
-    reply_hook: Any | None,
-    router_context: dict[str, object] | None,
-) -> MainRequestResult:
-    normalized_message = normalize_message_text(message_text)
-    report = NativeRouteReport(helper_mode=is_usage_question(normalized_message))
-    started = time.perf_counter()
-    try:
-        result = (
-            await PluginCommandAgent().run(
-                PluginCommandRequest(
-                    message_text=normalized_message,
-                    knowledge_base=knowledge_base,
-                    session_key=session_key,
-                    budget_controller=budget_controller,
-                    has_reply=has_reply,
-                    command_tools=command_tools,
-                    route_executor=route_executor,
-                    router_context=router_context,
-                    report=report,
-                )
-            )
-        ).to_main_result()
-        return await _finalize_result(
-            result,
-            route_completed_hook=route_completed_hook,
-            reply_hook=reply_hook,
-        )
-    finally:
-        if budget_controller is not None:
-            budget_controller.record_stage(
-                "main_request",
-                time.perf_counter() - started,
-            )
-
-async def stage_plugin_run(
-    *,
-    frame: TurnFrame,
-    bot: Bot,
-    event: Event,
-    middleware_state: TurnMiddlewareState,
-    middleware,
-) -> None:
-    knowledge_base = frame.knowledge_base
-    if knowledge_base is None:
-        raise RuntimeError("missing plugin knowledge base")
-    frame.stage(PipelineStage.AGENT_RUN)
-    route_completed_hook, reply_hook = _build_agent_stage_hooks(
-        frame=frame,
-        middleware_state=middleware_state,
-        middleware=middleware,
-    )
-
-    async def execute_native_route(
-        validated: NativeValidatedRoute,
-        report: NativeRouteReport,
-    ) -> NativeToolExecutionResult:
-        return await _execute_native_tool_route(
-            bot=bot,
-            event=event,
-            trace=frame.trace,
-            validated=validated,
-            knowledge_plugins=knowledge_base.plugins,
-            current_message=frame.route_message or frame.current_message,
-            user_id=frame.user_id,
-            group_id=frame.group_id,
-            session_id=frame.session_key,
-            has_reply=frame.has_reply,
-            extra_image_segments=frame.reply_image_segments_for_reroute,
-            route_report=report,
-            mention_profiles=frame.mention_profiles,
-        )
-
-    main_result = await _run_plugin_command_agent_turn(
-        message_text=frame.route_message or frame.current_message,
-        knowledge_base=knowledge_base,
-        session_key=frame.session_key,
-        budget_controller=frame.budget_controller,
-        has_reply=frame.has_reply,
-        command_tools=frame.command_tools,
-        route_executor=execute_native_route,
-        route_completed_hook=route_completed_hook,
-        reply_hook=reply_hook,
-        router_context=frame.router_context,
-    )
-    _set_agent_stage_result(frame=frame, main_result=main_result)
 async def stage_group_capability_hint(
     *,
     frame: TurnFrame,

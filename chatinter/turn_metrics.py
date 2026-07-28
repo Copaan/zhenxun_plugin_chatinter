@@ -91,6 +91,8 @@ class RouteObservation:
     final_reason: str
     response_quality: str = ""
     response_quality_action: str = ""
+    prompt_tokens: int = 0
+    cached_prompt_tokens: int = 0
 
 
 class _RouteObserver:
@@ -119,6 +121,9 @@ class _RouteObserver:
                 "avg_candidate_total": 0.0,
                 "avg_tool_candidates": 0.0,
                 "avg_prompt_full_candidates": 0.0,
+                "prompt_tokens_total": 0,
+                "cached_prompt_tokens_total": 0,
+                "prompt_cache_hit_rate": 0.0,
                 "recent_failures": [],
             }
 
@@ -135,6 +140,13 @@ class _RouteObserver:
         avg_prompt_full_candidates = sum(
             row.prompt_full_candidates for row in rows
         ) / len(rows)
+        prompt_tokens_total = sum(row.prompt_tokens for row in rows)
+        cached_tokens_total = sum(row.cached_prompt_tokens for row in rows)
+        cache_hit_rate = (
+            round(cached_tokens_total / prompt_tokens_total, 4)
+            if prompt_tokens_total > 0
+            else 0.0
+        )
         recent_failures = [
             asdict(row)
             for row in rows
@@ -163,6 +175,9 @@ class _RouteObserver:
             "avg_candidate_total": round(avg_candidate_total, 2),
             "avg_tool_candidates": round(avg_tool_candidates, 2),
             "avg_prompt_full_candidates": round(avg_prompt_full_candidates, 2),
+            "prompt_tokens_total": prompt_tokens_total,
+            "cached_prompt_tokens_total": cached_tokens_total,
+            "prompt_cache_hit_rate": cache_hit_rate,
             "recent_failures": recent_failures,
         }
 
@@ -177,6 +192,8 @@ def record_route_observation(
     message_preview: str,
     trace_tags: dict[str, str],
     route_report: Any | None = None,
+    prompt_tokens: int = 0,
+    cached_prompt_tokens: int = 0,
 ) -> None:
     route_stage = str(trace_tags.get("route_stage", "") or "")
     route_plugin = str(trace_tags.get("route_plugin", "") or "")
@@ -248,6 +265,8 @@ def record_route_observation(
             final_reason=final_reason,
             response_quality=response_quality,
             response_quality_action=response_quality_action,
+            prompt_tokens=max(int(prompt_tokens or 0), 0),
+            cached_prompt_tokens=max(int(cached_prompt_tokens or 0), 0),
         )
     )
 
@@ -275,6 +294,11 @@ def render_route_observer_summary(limit: int = 200) -> str:
             f"avg_tool_candidates={payload['avg_tool_candidates']}"
         ),
         (f"avg_prompt_full_schema={payload['avg_prompt_full_candidates']}"),
+        (
+            f"prompt_cache: hit_rate={payload['prompt_cache_hit_rate'] * 100:.1f}%, "
+            f"cached={payload['cached_prompt_tokens_total']}, "
+            f"prompt={payload['prompt_tokens_total']}"
+        ),
     ]
     top_plugins = payload.get("top_plugins") or {}
     if top_plugins:

@@ -91,8 +91,6 @@ class AgentObservation:
 
 @dataclass
 class AgentBudgetState:
-    classifier_calls: int = 0
-    hook_calls: int = 0
     tool_calls: int = 0
     tool_batches: int = 0
     run_input_tokens: int = 0
@@ -153,6 +151,7 @@ class AgentRunState:
     paused_reason: str = ""
     pending_approval: str = ""
     artifact_refs: list[str] = field(default_factory=list)
+    plan_items: list[dict[str, str]] = field(default_factory=list)
     tool_executions: list[ToolExecutionRecord] = field(default_factory=list)
     stop_reason: str = "running"
     step: int = 0
@@ -219,6 +218,7 @@ class AgentRunState:
             cost_checkpoint_tokens=cost_checkpoint_tokens,
         )
         state.artifact_refs = list(previous.artifact_refs)
+        state.plan_items = [dict(item) for item in previous.plan_items]
         state.compression_failure_fingerprint = (
             previous.compression_failure_fingerprint
         )

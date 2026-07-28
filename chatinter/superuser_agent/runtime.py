@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -45,6 +46,7 @@ from ..llm_compat import (
 from ..provider_capability import ProviderCapabilityAdapter
 from ..provider_failover import request_with_failover
 from ..route_text import normalize_message_text, normalize_reply_text
+from .approval_store import get_pending_approval
 from .context import (
     build_semantic_compression_plan,
     compact_messages,
@@ -78,7 +80,6 @@ from .store import (
     clear_agent_run_cancel_signal,
     get_active_agent_run_id,
     get_active_conversation,
-    get_agent_run_snapshot,
     is_agent_run_cancel_signaled,
     load_agent_run_state,
     persist_agent_run_state,
@@ -221,6 +222,9 @@ class AgentRuntime:
         self._active_model_name = model_name
         self._awaiting_real_usage_after_compression = False
         self._tool_prune_attempted = False
+        self._tool_schema_metrics_cache: dict[
+            tuple[tuple[str, int], ...], tuple[int, int]
+        ] = {}
 
     async def run(self) -> AgentRuntimeResult:
         started_at = time.time()
@@ -244,7 +248,6 @@ class AgentRuntime:
                 self._progress.emit(
                     observations=self.state.runtime_observations(),
                 )
-                self._sync_tools()
                 self._persist_state("step_started")
                 response = await self._request_model(
                     tools=self.state.tool_map,
@@ -349,7 +352,6 @@ class AgentRuntime:
                             tool_result,
                         )
                     )
-                    self._sync_tools()
                     self.state.append_tool_observation(
                         tool_call=resolved_call,
                         tool_result=tool_result,
@@ -378,8 +380,19 @@ class AgentRuntime:
                             execution_status=execution_status,
                         )
                     else:
+                        output = (
+                            tool_result.output
+                            if isinstance(tool_result.output, dict)
+                            else {}
+                        )
+                        persist_stage = (
+                            "plan_updated"
+                            if str(resolved_call.function.name or "") == "plan"
+                            and output.get("status") == "plan_updated"
+                            else "tool_observation"
+                        )
                         self._persist_state(
-                            "tool_observation",
+                            persist_stage,
                             tool_name=str(resolved_call.function.name or ""),
                         )
                     if failure_notice is not None:
@@ -407,6 +420,11 @@ class AgentRuntime:
             self.state.cancel(reason="cancelled_by_agent_run_cancel")
             self._persist_state("cancelled")
             return self.state.to_result()
+        except asyncio.CancelledError:
+            self._close_pending_tool_calls_after_cancel()
+            self.state.cancel(reason="cancelled_by_runtime_control")
+            self._persist_state("cancelled")
+            raise
         except Exception as exc:
             self.state.status = "failed"
             self.state.stop_reason = f"runtime_exception:{type(exc).__name__}"
@@ -428,7 +446,7 @@ class AgentRuntime:
         self._active_model_name = self.model_name
         primary_adapter = self._provider_adapter_for_model(self.model_name)
         primary_tools = primary_adapter.prepare_tool_map_for_request(tools)
-        schema_chars, schema_tokens = await _tool_schema_metrics(primary_tools)
+        schema_chars, schema_tokens = await self._tool_schema_metrics(primary_tools)
         active_schema_tokens = schema_tokens
         primary_max_input_tokens = resolve_superuser_max_input_tokens(self.model_name)
         output_reserve_tokens = _final_output_token_reserve(
@@ -454,7 +472,9 @@ class AgentRuntime:
                 tool_choice,
                 has_tools=bool(candidate_tools),
             )
-            _, candidate_schema_tokens = await _tool_schema_metrics(candidate_tools)
+            _, candidate_schema_tokens = await self._tool_schema_metrics(
+                candidate_tools
+            )
             active_schema_tokens = candidate_schema_tokens
             self.provider_adapter = candidate_adapter
             candidate_max_input_tokens = resolve_superuser_max_input_tokens(
@@ -478,6 +498,13 @@ class AgentRuntime:
                 tool_choice=candidate_tool_choice,
                 generation_config=self.generation_config,
             )
+            prompt_cache_key = None
+            profile = getattr(candidate_adapter, "profile", None)
+            if bool(getattr(profile, "supports_prompt_cache_key", False)):
+                prompt_cache_key = await self._prompt_cache_key_for_candidate(
+                    model_name=model or self.model_name,
+                    tools=request.tools,
+                )
             return await self.ai.generate_internal(
                 request.messages,
                 model=model,
@@ -485,6 +512,7 @@ class AgentRuntime:
                 tools=cast(Any, request.tools),
                 tool_choice=request.tool_choice,
                 timeout=self.timeout,
+                prompt_cache_key=prompt_cache_key,
             )
 
         async def _compress_after_overflow() -> None:
@@ -506,7 +534,14 @@ class AgentRuntime:
         )
         outcome = await self._await_with_abort(request_task)
         self._active_model_name = outcome.used_model or self.model_name
-        estimated_input_tokens = _estimate_prompt_tokens(self.state.messages)
+        usage = parse_usage_info(getattr(outcome.response, "usage_info", None))
+        if usage.prompt_tokens > 0:
+            estimated_input_tokens = max(
+                int(usage.prompt_tokens) - active_schema_tokens,
+                0,
+            )
+        else:
+            estimated_input_tokens = _estimate_prompt_tokens(self.state.messages)
         self._record_model_usage(
             outcome.response,
             estimated_input_tokens=estimated_input_tokens + active_schema_tokens,
@@ -529,6 +564,49 @@ class AgentRuntime:
                 },
             )
         return outcome.response
+
+    async def _tool_schema_metrics(
+        self,
+        tools: dict[str, ToolExecutable] | None,
+    ) -> tuple[int, int]:
+        key = tuple(
+            (name, id(tool)) for name, tool in sorted((tools or {}).items())
+        )
+        cache = getattr(self, "_tool_schema_metrics_cache", None)
+        if cache is None:
+            cache = {}
+            self._tool_schema_metrics_cache = cache
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        metrics = await _calculate_tool_schema_metrics(tools)
+        cache[key] = metrics
+        return metrics
+
+    async def _prompt_cache_key_for_candidate(
+        self,
+        *,
+        model_name: str | None,
+        tools: dict[str, ToolExecutable] | None,
+    ) -> str:
+        key = (
+            normalize_message_text(str(model_name or self.model_name or "default")),
+            tuple((tools or {}).keys()),
+        )
+        cache = getattr(self, "_prompt_cache_keys", None)
+        if cache is None:
+            cache = {}
+            self._prompt_cache_keys = cache
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        value = await _superuser_prompt_cache_key(
+            model_name=model_name or self.model_name,
+            session_key=self.state.session_key,
+            tools=tools,
+        )
+        cache[key] = value
+        return value
 
     def _provider_adapter_for_model(
         self,
@@ -704,12 +782,22 @@ class AgentRuntime:
             schema_tokens=schema_tokens,
             update_context=update_context,
         )
+        cached_prompt_tokens = max(
+            int(getattr(usage, "prompt_cache_hit_tokens", 0) or 0), 0
+        )
         self.state.append_metric(
             role="system",
             kind="model_usage",
             metadata={
                 "estimated_prompt_tokens": max(int(estimated_input_tokens or 0), 0),
                 "provider_prompt_tokens": max(int(usage.prompt_tokens or 0), 0),
+                "provider_cached_prompt_tokens": cached_prompt_tokens,
+                "prompt_cache_hit_rate": round(
+                    cached_prompt_tokens / usage.prompt_tokens,
+                    4,
+                )
+                if usage.prompt_tokens > 0
+                else None,
                 "estimate_ratio": round(
                     estimated_input_tokens / usage.prompt_tokens,
                     4,
@@ -723,13 +811,6 @@ class AgentRuntime:
         if update_context:
             self._awaiting_real_usage_after_compression = False
             self._tool_prune_attempted = False
-
-    def _sync_tools(self) -> None:
-        self.state.tool_map = {
-            name: tool
-            for name, tool in self.state.tool_map.items()
-            if name not in self._blocked_tool_names
-        }
 
     def _record_tool_failure(
         self,
@@ -754,7 +835,6 @@ class AgentRuntime:
         blocked = count >= 3
         if blocked:
             self._blocked_tool_names.add(tool_name)
-            self._sync_tools()
         message = f"工具 {tool_name} 使用相同参数重复失败 {count} 次。" + (
             "本轮已停用该工具，请换工具或基于现有结果回复。"
             if blocked
@@ -801,13 +881,7 @@ class AgentRuntime:
 
     def _cancelled_externally(self) -> bool:
         run_key = self.state.run_id or self.state.trace_id
-        if is_agent_run_cancel_signaled(run_key):
-            return True
-        snapshot = get_agent_run_snapshot(run_key)
-        return (
-            isinstance(snapshot, dict)
-            and str(snapshot.get("status", "")) == "cancelled"
-        )
+        return is_agent_run_cancel_signaled(run_key)
 
     async def _compress_context_under_pressure(
         self,
@@ -1062,9 +1136,8 @@ class AgentRuntime:
             source=f"tool_result:{tool_call.function.name}",
             **_FILE_TOOL_INLINE_LIMITS.get(tool_call.function.name, {}),
         )
-        display_content = self._compact_tool_display_content(
-            tool_call,
-            tool_result,
+        display_content = summarize_artifact_text(
+            str(tool_result.display_content or output.get("status", "") or "")
         )
         return ToolResult(
             output=output,
@@ -1073,45 +1146,20 @@ class AgentRuntime:
             is_retryable=tool_result.is_retryable,
         )
 
-    def _compact_tool_display_content(
-        self,
-        tool_call: LLMToolCall,
-        tool_result: ToolResult,
-    ) -> str:
-        content = str(tool_result.display_content or "")
-        if not content:
-            output = tool_result.output if isinstance(tool_result.output, dict) else {}
-            content = str(output.get("status", "") or "")
-        compacted = compact_tool_result_output(
-            {"display_content": content},
-            trace_id=self.state.trace_id,
-            source=f"display_content:{tool_call.function.name}",
-        )
-        return summarize_artifact_text(str(compacted.get("display_content", "")))
-
     def _tool_result_for_model(
         self,
         tool_call: LLMToolCall,
         tool_result: ToolResult,
     ) -> dict[str, Any]:
         if isinstance(tool_result.output, dict):
-            payload = compact_tool_result_output(
-                tool_result.output,
-                trace_id=self.state.trace_id,
-                source=f"model_payload:{tool_call.function.name}",
-                **_FILE_TOOL_INLINE_LIMITS.get(tool_call.function.name, {}),
-            )
+            payload = tool_result.output
         else:
-            payload = compact_tool_result_output(
-                {
-                    "ok": False,
-                    "status": "invalid_tool_result",
-                    "tool_name": str(tool_call.function.name or ""),
-                    "error": normalize_message_text(str(tool_result.output or "")),
-                },
-                trace_id=self.state.trace_id,
-                source=f"model_payload:{tool_call.function.name}",
-            )
+            payload = {
+                "ok": False,
+                "status": "invalid_tool_result",
+                "tool_name": str(tool_call.function.name or ""),
+                "error": normalize_message_text(str(tool_result.output or "")),
+            }
         return _model_visible_observation(tool_call, payload)
 
     def _record_trajectory_once(
@@ -1346,6 +1394,7 @@ def _approval_action_label(action: str) -> str:
         "shell_command": "执行命令",
         "write_file": "写入文件",
         "replace_in_file": "替换文件内容",
+        "apply_patch": "应用补丁",
     }.get(action, action)
 
 
@@ -1368,6 +1417,11 @@ def _approval_operation_summary(action: str, payload: dict[str, Any]) -> str:
             f"原文={_utf8_size(payload.get('old_text'))} bytes",
             f"新文={_utf8_size(payload.get('new_text'))} bytes",
             _optional_summary("期望替换", payload.get("expected_replacements")),
+        )
+    if action == "apply_patch":
+        return _join_summary(
+            f"补丁={_utf8_size(payload.get('patch'))} bytes",
+            _non_default_cwd_summary(payload.get("cwd")),
         )
     if action in {"read_file", "list_dir", "search_files"}:
         return _join_summary(
@@ -1489,7 +1543,7 @@ def _estimate_response_tokens(response: LLMResponse) -> int:
     return total
 
 
-async def _tool_schema_metrics(
+async def _calculate_tool_schema_metrics(
     tools: dict[str, ToolExecutable] | None,
 ) -> tuple[int, int]:
     total_chars = 0
@@ -1508,11 +1562,60 @@ async def _tool_schema_metrics(
     return total_chars, total_tokens
 
 
-async def _tool_schema_chars(
+async def _superuser_prompt_cache_key(
+    *,
+    model_name: str | None,
+    session_key: str,
     tools: dict[str, ToolExecutable] | None,
-) -> int:
-    chars, _ = await _tool_schema_metrics(tools)
-    return chars
+) -> str:
+    tool_schemas: list[dict[str, Any]] = []
+    for name, tool in (tools or {}).items():
+        definition = await tool.get_definition()
+        if hasattr(definition, "model_dump"):
+            payload = definition.model_dump(mode="json")
+        else:
+            payload = {
+                "name": str(getattr(definition, "name", name) or name),
+                "description": str(getattr(definition, "description", "") or ""),
+                "parameters": getattr(definition, "parameters", {}) or {},
+            }
+        tool_schemas.append({"name": name, "schema": payload})
+    schema_json = json.dumps(
+        tool_schemas,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    normalized_model = normalize_message_text(str(model_name or "default"))
+    provider, separator, model = normalized_model.partition("/")
+    if not separator:
+        provider, model = "default", provider
+    session_digest = hashlib.sha256(session_key.encode("utf-8")).digest()
+    components = {
+        "provider": provider.casefold(),
+        "model": model.casefold(),
+        "prompt": hashlib.sha256(
+            _SUPERUSER_AGENT_SYSTEM_PROMPT.encode("utf-8")
+        ).hexdigest(),
+        "schema": hashlib.sha256(schema_json.encode("utf-8")).hexdigest(),
+        "session_shard": session_digest[0] % 8,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            components,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"chatinter-superuser-v1-{digest[:32]}"
+
+
+async def _tool_schema_metrics(
+    tools: dict[str, ToolExecutable] | None,
+) -> tuple[int, int]:
+    """Calculate schema metrics for standalone diagnostics and acceptance scripts."""
+    return await _calculate_tool_schema_metrics(tools)
 
 
 def _truthy(value: Any) -> bool:
@@ -1529,6 +1632,17 @@ def _permission_mode_for_run(state: AgentRunState) -> str:
     ):
         return get_default_permission_mode()
     return str(conversation.get("permission_mode", "") or get_default_permission_mode())
+
+
+def _needs_tool_protocol_repair(state: AgentRunState | None) -> bool:
+    if state is None:
+        return False
+    if state.status in {"running", "paused"}:
+        return True
+    return any(
+        record.status in {"started", "uncertain"}
+        for record in state.tool_executions
+    )
 
 
 async def run_superuser_agent_runtime(
@@ -1560,17 +1674,33 @@ async def _run_superuser_agent_runtime_unlocked(
     run_id = get_active_agent_run_id(session_key or "")
     tool_map = build_superuser_tools()
     previous = load_agent_run_state(run_id, tool_map=tool_map) if run_id else None
+    protocol_repair_needed = _needs_tool_protocol_repair(previous)
     if (
         previous is not None
         and previous.status == "paused"
         and previous.pending_approval
     ):
-        if not previous.final_text:
-            previous.final_text = (
-                "当前任务正在等待确认，请使用审批消息中的命令，或回复 /中断。"
-            )
-            previous.final_source = "local_fallback"
-        return previous.to_result()
+        pending = get_pending_approval(
+            approval_id=previous.pending_approval,
+            user_id=previous.session_key,
+            session_key=previous.session_key,
+        )
+        if pending is not None:
+            if not previous.final_text:
+                previous.final_text = (
+                    "当前任务正在等待确认，请使用审批消息中的命令，或回复 /中断。"
+                )
+                previous.final_source = "local_fallback"
+            return previous.to_result()
+        previous.pending_approval = ""
+        previous.paused_reason = "approval_expired"
+        previous.final_text = ""
+        previous.final_source = ""
+        persist_agent_run_state(
+            previous,
+            stage="approval_expired",
+            metadata={"reason": "pending_approval_not_found"},
+        )
     starts_new_turn = previous is None or previous.status in {
         "completed",
         "failed",
@@ -1589,16 +1719,17 @@ async def _run_superuser_agent_runtime_unlocked(
             cost_checkpoint_tokens=run_budget.cost_checkpoint_tokens,
         )
     else:
-        repair = repair_interrupted_tool_protocol(
-            previous,
-            provider_adapter=provider_adapter,
-        )
-        if any(repair.values()):
-            persist_agent_run_state(
+        if protocol_repair_needed:
+            repair = repair_interrupted_tool_protocol(
                 previous,
-                stage="tool_protocol_repaired",
-                metadata=repair,
+                provider_adapter=provider_adapter,
             )
+            if any(repair.values()):
+                persist_agent_run_state(
+                    previous,
+                    stage="tool_protocol_repaired",
+                    metadata=repair,
+                )
         if starts_new_turn:
             state = AgentRunState.start_new_turn(
                 previous,
@@ -1641,6 +1772,7 @@ async def _run_superuser_agent_runtime_unlocked(
                 "trace_id": state.trace_id,
                 "run_id": run_id,
                 "artifact_refs": state.artifact_refs,
+                "plan_items": state.plan_items,
             },
         ),
         message_text=task_text,
@@ -1654,9 +1786,8 @@ async def _run_superuser_agent_runtime_unlocked(
 
 def _build_superuser_runtime_messages(task_text: str) -> list[LLMMessage]:
     return [
-        LLMMessage.system(
-            f"{_SUPERUSER_AGENT_SYSTEM_PROMPT}\n\n{_runtime_environment()}"
-        ),
+        LLMMessage.system(_SUPERUSER_AGENT_SYSTEM_PROMPT),
+        LLMMessage.system(_runtime_environment()),
         LLMMessage.user(task_text),
     ]
 
@@ -1669,7 +1800,7 @@ def _runtime_environment() -> str:
         (
             f"Platform: {platform.system()}",
             f"Shell: {shell}",
-            f"Working directory: {Path.cwd()}",
+            "Working directory: current workspace root",
         )
     )
 

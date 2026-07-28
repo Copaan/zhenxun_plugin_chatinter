@@ -79,34 +79,6 @@ class NativeCommandTool:
             )
 
 
-class CompactNativeCommandTool:
-    """Lightweight schema view for first-pass command selection.
-
-    The tool name stays identical to the executable command tool.  The runtime
-    re-queries with the selected full schema before execution, mirroring Astr's
-    skills-like mode while keeping dispatch through the same executor.
-    """
-
-    def __init__(self, executable: NativeCommandTool):
-        self.executable = executable
-        self.binding = executable.binding
-
-    async def get_definition(self) -> ToolDefinition:
-        return ToolDefinition(
-            name=self.binding.tool_name,
-            description=_build_compact_tool_description(self.binding.candidate),
-            parameters={
-                "type": "object",
-                "properties": {},
-                "required": [],
-                "additionalProperties": False,
-            },
-        )
-
-    async def execute(self, context: Any | None = None, **kwargs: Any) -> ToolResult:
-        return await self.executable.execute(context=context, **kwargs)
-
-
 def build_native_command_tools(
     candidates: list[CommandCandidate],
 ) -> list[NativeCommandTool]:
@@ -126,14 +98,6 @@ def build_native_command_tools(
         tools.append(NativeCommandTool(binding))
 
     return tools
-
-
-def compact_command_tool_view(
-    executable: Any,
-) -> Any:
-    if isinstance(executable, NativeCommandTool):
-        return CompactNativeCommandTool(executable)
-    return executable
 
 
 def _safe_tool_name(command_id: str) -> str:
@@ -237,43 +201,6 @@ def _build_tool_description(candidate: CommandCandidate) -> str:
     return "\n".join(part for part in parts if normalize_message_text(part))
 
 
-def _build_compact_tool_description(candidate: CommandCandidate) -> str:
-    schema = candidate.schema
-    snapshot = candidate.tool
-    description = _clip_text(
-        schema.description or getattr(snapshot, "capability_text", ""), 90
-    )
-    parts = [
-        "Compact capability card; selecting it only asks runtime for full schema.",
-        f"command_id: {schema.command_id}",
-        f"head: {schema.head}",
-        f"role: {schema.command_role}",
-        f"payload_policy: {schema.payload_policy}",
-    ]
-    if description:
-        parts.append(f"description: {description}")
-    if snapshot is not None:
-        card_lines = _compact_capability_card_lines(snapshot)
-        if card_lines:
-            parts.extend(card_lines)
-    if schema.aliases:
-        parts.append("aliases: " + _join_values(schema.aliases[:3], limit=80))
-    if schema.retrieval_phrases:
-        parts.append("phrases: " + _join_values(schema.retrieval_phrases[:3], limit=80))
-    if schema.slots:
-        parts.append(
-            "slots_summary: "
-            + _join_values(
-                (
-                    f"{slot.name}:{slot.type}:{'req' if slot.required else 'opt'}"
-                    for slot in schema.slots[:4]
-                    if normalize_message_text(slot.name)
-                ),
-                limit=96,
-            )
-        )
-    return "\n".join(part for part in parts if normalize_message_text(part))
-
 
 def _capability_card_lines(snapshot: CommandToolSnapshot) -> list[str]:
     lines: list[str] = []
@@ -309,32 +236,6 @@ def _capability_card_lines(snapshot: CommandToolSnapshot) -> list[str]:
         lines.append("anti_use_cases: " + _join_values(snapshot.anti_use_cases))
     return lines
 
-
-def _compact_capability_card_lines(snapshot: CommandToolSnapshot) -> list[str]:
-    lines: list[str] = []
-    if snapshot.source_of_truth:
-        lines.append(f"source_of_truth: {snapshot.source_of_truth}")
-    lines.append(
-        "requires_real_tool: " + str(bool(snapshot.requires_real_tool)).lower()
-    )
-    if snapshot.output_mode:
-        lines.append(f"output_mode: {snapshot.output_mode}")
-    if snapshot.side_effect:
-        lines.append(f"side_effect: {snapshot.side_effect}")
-    risk = snapshot.risk or snapshot.risk_level
-    if risk:
-        lines.append(f"risk: {risk}")
-    if snapshot.intent_types:
-        lines.append(
-            "intent_types: " + _join_values(snapshot.intent_types[:4], limit=80)
-        )
-    if snapshot.use_cases:
-        lines.append("use_cases: " + _join_values(snapshot.use_cases[:2], limit=96))
-    if snapshot.anti_use_cases:
-        lines.append(
-            "anti_use_cases: " + _join_values(snapshot.anti_use_cases[:1], limit=96)
-        )
-    return lines
 
 
 def _build_parameters(
@@ -517,9 +418,7 @@ def _clip_text(text: str, limit: int) -> str:
 
 
 __all__ = [
-    "CompactNativeCommandTool",
     "NativeCommandTool",
     "NativeCommandToolBinding",
     "build_native_command_tools",
-    "compact_command_tool_view",
 ]

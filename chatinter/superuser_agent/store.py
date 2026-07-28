@@ -39,13 +39,13 @@ _ACTIVITY_RING: dict[str, deque[dict[str, Any]]] = {}
 _IMPORTANT_PERSIST_STAGES = frozenset(
     {
         "started",
-        "tool_observation",
         "tool_execution_started",
         "tool_execution_completed",
         "tool_execution_reconciled",
         "tool_protocol_repaired",
         "semantic_compression_failed",
         "semantic_context_compressed",
+        "plan_updated",
         "paused",
         "cancelled",
         "completed",
@@ -821,6 +821,7 @@ def _state_payload(
         "paused_reason": str(getattr(state, "paused_reason", "") or ""),
         "pending_approval": str(getattr(state, "pending_approval", "") or ""),
         "artifact_refs": to_jsonable(getattr(state, "artifact_refs", [])),
+        "plan_items": to_jsonable(getattr(state, "plan_items", [])),
         "step": int(getattr(state, "step", 0) or 0),
         "max_steps": int(getattr(state, "max_steps", 0) or 0),
         "cost_checkpoint_tokens": int(getattr(state, "cost_checkpoint_tokens", 0) or 0),
@@ -1037,6 +1038,7 @@ def _state_from_snapshot(
             paused_reason=str(snapshot.get("paused_reason", "") or ""),
             pending_approval=_pending_approval_from_snapshot(snapshot),
             artifact_refs=_text_list(snapshot.get("artifact_refs")),
+            plan_items=_plan_items_from_payload(snapshot.get("plan_items", [])),
             tool_executions=_tool_executions_from_payload(
                 snapshot.get("tool_executions", [])
             ),
@@ -1065,6 +1067,26 @@ def _state_from_snapshot(
     except Exception:
         return None
     return state
+
+
+def _plan_items_from_payload(value: Any) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    if not isinstance(value, list):
+        return items
+    for item in value[:20]:
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("id", "") or "").strip()[:64]
+        content = str(item.get("content", "") or "").strip()[:500]
+        status = str(item.get("status", "") or "").strip()
+        if item_id and content and status in {
+            "pending",
+            "in_progress",
+            "completed",
+            "cancelled",
+        }:
+            items.append({"id": item_id, "content": content, "status": status})
+    return items
 
 
 def _messages_from_payload(value: Any) -> list[LLMMessage]:
@@ -1139,8 +1161,6 @@ def _budget_from_payload(value: Any) -> AgentBudgetState:
         return AgentBudgetState()
     legacy_prompt_tokens = int(value.get("prompt_tokens", 0) or 0)
     return AgentBudgetState(
-        classifier_calls=int(value.get("classifier_calls", 0) or 0),
-        hook_calls=int(value.get("hook_calls", 0) or 0),
         tool_calls=int(value.get("tool_calls", 0) or 0),
         tool_batches=int(value.get("tool_batches", 0) or 0),
         run_input_tokens=int(value.get("run_input_tokens", legacy_prompt_tokens) or 0),

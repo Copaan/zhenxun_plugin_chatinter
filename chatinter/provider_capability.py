@@ -19,7 +19,7 @@ from zhenxun.services.ai.llm.system.capabilities import (
     get_model_capabilities,
 )
 
-from .config import COMMAND_TWO_STAGE_THRESHOLD, build_tool_generation_config
+from .config import build_tool_generation_config
 from .llm_compat import (
     LLMContentPart,
     LLMMessage,
@@ -27,7 +27,6 @@ from .llm_compat import (
     ToolExecutable,
     ToolResult,
 )
-from .native_command_tools import compact_command_tool_view
 from .provider_protocol import (
     MCPToolProtocolProfile,
     ProviderProtocolProfile,
@@ -70,6 +69,7 @@ class ProviderCapabilityProfile:
     supports_parallel_tool_calls: bool
     supports_required_tool_choice: bool
     supports_named_tool_choice: bool
+    supports_prompt_cache_key: bool
     prefers_compact_command_schema: bool
     full_schema_tool_cap: int
     auto_command_tool_cap: int
@@ -89,6 +89,7 @@ class ProviderCapabilityProfile:
             "supports_parallel_tool_calls": self.supports_parallel_tool_calls,
             "supports_required_tool_choice": self.supports_required_tool_choice,
             "supports_named_tool_choice": self.supports_named_tool_choice,
+            "supports_prompt_cache_key": self.supports_prompt_cache_key,
             "prefers_compact_command_schema": self.prefers_compact_command_schema,
             "full_schema_tool_cap": self.full_schema_tool_cap,
             "auto_command_tool_cap": self.auto_command_tool_cap,
@@ -100,23 +101,6 @@ class ProviderCapabilityProfile:
             payload["protocol"] = self.protocol.to_metadata()
         return payload
 
-
-@dataclass(frozen=True)
-class ProviderToolSchemaPlan:
-    """Schema exposure decision for one model request."""
-
-    use_compact_schema: bool
-    full_schema_names: frozenset[str]
-    schema_modes: dict[str, ToolSchemaMode]
-    reason: str
-
-    def to_metadata(self) -> dict[str, Any]:
-        return {
-            "use_compact_schema": self.use_compact_schema,
-            "full_schema_names": sorted(self.full_schema_names),
-            "schema_modes": dict(self.schema_modes),
-            "reason": self.reason,
-        }
 
 
 @dataclass(frozen=True)
@@ -185,6 +169,7 @@ class ProviderCapabilityAdapter:
             supports_parallel_tool_calls=protocol.tool_choice.supports_parallel,
             supports_required_tool_choice=protocol.tool_choice.supports_required,
             supports_named_tool_choice=protocol.tool_choice.supports_named,
+            supports_prompt_cache_key=protocol.family == "openai",
             prefers_compact_command_schema=protocol.schema_exposure.prefers_compact,
             full_schema_tool_cap=max(
                 1,
@@ -317,46 +302,6 @@ class ProviderCapabilityAdapter:
             for name, tool in limited.items()
         }
 
-    def prepare_chatinter_tools_for_request(
-        self,
-        tools: dict[str, ToolExecutable] | None,
-        *,
-        tool_choice: str | dict[str, Any] | None,
-        required_tool_names: Iterable[str] = (),
-        tool_obligation: str = "auto",
-        has_command_observation: bool = False,
-    ) -> dict[str, ToolExecutable] | None:
-        """Prepare turn tools with provider-specific schema exposure policy."""
-
-        if not tools or not self.profile.supports_tools:
-            return None
-        if tool_obligation == "none" and tool_choice is None:
-            return None
-
-        sorted_tools = self.sort_tool_map(
-            tools,
-            required_tool_names=required_tool_names,
-        )
-        schema_plan = self.command_schema_plan(
-            sorted_tools,
-            tool_choice=tool_choice,
-            required_tool_names=required_tool_names,
-            tool_obligation=tool_obligation,
-            has_command_observation=has_command_observation,
-        )
-        request_tools = {
-            name: compact_command_tool_view(tool)
-            if _is_command_tool(tool)
-            and schema_plan.schema_modes.get(name) == "compact"
-            else tool
-            for name, tool in sorted_tools.items()
-        }
-        return self.prepare_tool_map_for_request(
-            request_tools,
-            required_tool_names=required_tool_names,
-            schema_modes=schema_plan.schema_modes,
-        )
-
     def prepare_model_request(
         self,
         *,
@@ -428,80 +373,6 @@ class ProviderCapabilityAdapter:
             )
         }
 
-    def command_schema_plan(
-        self,
-        tools: dict[str, ToolExecutable],
-        *,
-        tool_choice: str | dict[str, Any] | None,
-        required_tool_names: Iterable[str] = (),
-        tool_obligation: str = "auto",
-        has_command_observation: bool = False,
-    ) -> ProviderToolSchemaPlan:
-        required = {
-            normalize_message_text(str(name or ""))
-            for name in required_tool_names
-            if normalize_message_text(str(name or ""))
-        }
-        command_names = [name for name, tool in tools.items() if _is_command_tool(tool)]
-        if not command_names:
-            return ProviderToolSchemaPlan(
-                use_compact_schema=False,
-                full_schema_names=frozenset(),
-                schema_modes={name: "full" for name in tools},
-                reason="no_command_tools",
-            )
-        if tool_choice == "required" or tool_obligation == "required":
-            full = frozenset(command_names)
-            return ProviderToolSchemaPlan(
-                use_compact_schema=False,
-                full_schema_names=full,
-                schema_modes={name: "full" for name in tools},
-                reason="required_tool_choice_full_schema",
-            )
-        if has_command_observation:
-            return ProviderToolSchemaPlan(
-                use_compact_schema=False,
-                full_schema_names=frozenset(command_names),
-                schema_modes={name: "full" for name in tools},
-                reason="after_command_observation_full_schema",
-            )
-
-        two_stage = (
-            len(command_names) > COMMAND_TWO_STAGE_THRESHOLD
-            and tool_obligation != "required"
-            and tool_choice != "required"
-        )
-        if two_stage:
-            full_names = set(required)
-        else:
-            full_names = self._full_schema_tool_names(
-                tools,
-                required_tool_names=required,
-            )
-        use_compact = self._should_use_compact_command_schema(
-            tools,
-            full_schema_names=full_names,
-            force=two_stage,
-        )
-        schema_modes: dict[str, ToolSchemaMode] = {}
-        for name, tool in tools.items():
-            if _is_command_tool(tool) and use_compact and name not in full_names:
-                schema_modes[name] = "compact"
-            else:
-                schema_modes[name] = "full"
-        if two_stage and use_compact:
-            reason = "skills_like_two_stage_compact"
-        elif use_compact:
-            reason = "provider_compact_schema_policy"
-        else:
-            reason = "provider_full_schema_policy"
-        return ProviderToolSchemaPlan(
-            use_compact_schema=use_compact,
-            full_schema_names=frozenset(full_names),
-            schema_modes=schema_modes,
-            reason=reason,
-        )
-
     def adapt_messages(self, messages: list[LLMMessage]) -> list[LLMMessage]:
         host_messages = list(messages)
         if self.profile.supports_image_input:
@@ -553,12 +424,6 @@ class ProviderCapabilityAdapter:
             parameters=parameters,
         )
 
-    def should_use_compact_schema(self, *, tool_count: int) -> bool:
-        return (
-            self.profile.prefers_compact_command_schema
-            or tool_count > self.profile.full_schema_tool_cap
-        )
-
     def tool_calls_for_execution(self, tool_calls: list[Any]) -> list[Any]:
         if self.profile.supports_parallel_tool_calls:
             return list(tool_calls)
@@ -583,60 +448,6 @@ class ProviderCapabilityAdapter:
                 "Continue with remaining tasks after this observation."
             ),
         }
-
-    def uses_compact_command_schema(
-        self,
-        *,
-        request_tools: dict[str, ToolExecutable] | None,
-        base_tool_map: dict[str, ToolExecutable],
-        tool_calls: list[Any],
-    ) -> bool:
-        if not request_tools or not tool_calls:
-            return False
-        for tool_call in tool_calls:
-            name = normalize_message_text(str(tool_call.function.name or ""))
-            tool = request_tools.get(name)
-            if is_compact_request_tool(tool):
-                return True
-            if str(getattr(tool, "chatinter_schema_mode", "") or "") == "full":
-                continue
-            if tool is not None and tool is not base_tool_map.get(name):
-                return True
-        return False
-
-    def selected_command_tools(
-        self,
-        tools: dict[str, ToolExecutable],
-        tool_calls: list[Any],
-    ) -> dict[str, ToolExecutable]:
-        selected: dict[str, ToolExecutable] = {}
-        for tool_call in tool_calls:
-            name = normalize_message_text(str(tool_call.function.name or ""))
-            tool = tools.get(name)
-            if tool is not None and _is_command_tool(tool):
-                selected[name] = tool
-        return self.sort_tool_map(selected)
-
-    def compact_schema_upgrade_prompt(self) -> str:
-        protocol = self.profile.protocol
-        provider_hint = normalize_message_text(
-            str(
-                getattr(
-                    getattr(protocol, "schema_exposure", None),
-                    "compact_upgrade_prompt",
-                    "",
-                )
-                or "Call the selected full-schema tool if it fits."
-            )
-        )
-        return (
-            "You selected compact plugin capability card(s). "
-            "Now use the selected real command tool(s) with the full schema "
-            "and fill arguments from the user's current task. "
-            "If the selected tool is not actually appropriate, answer briefly "
-            "instead of calling it. "
-            f"{provider_hint}"
-        )
 
     def tool_result_message(
         self,
@@ -709,90 +520,6 @@ class ProviderCapabilityAdapter:
             -score,
             command_id or normalized_name,
         )
-
-    def _should_use_compact_command_schema(
-        self,
-        tools: dict[str, ToolExecutable],
-        *,
-        full_schema_names: set[str],
-        force: bool = False,
-    ) -> bool:
-        command_tool_count = sum(1 for tool in tools.values() if _is_command_tool(tool))
-        if command_tool_count <= len(full_schema_names):
-            return False
-        if force:
-            return True
-        if self.should_use_compact_schema(tool_count=command_tool_count):
-            return command_tool_count > self.profile.full_schema_tool_cap
-        return any(
-            self._is_compact_schema_candidate(tool)
-            for tool in tools.values()
-            if _is_command_tool(tool)
-        )
-
-    def _full_schema_tool_names(
-        self,
-        tools: dict[str, ToolExecutable],
-        *,
-        required_tool_names: set[str],
-    ) -> set[str]:
-        selected: list[tuple[str, ToolExecutable]] = []
-        for name, tool in tools.items():
-            if not _is_command_tool(tool):
-                continue
-            if name in required_tool_names or self._is_full_schema_candidate(tool):
-                selected.append((name, tool))
-        cap = max(
-            1,
-            min(
-                _AUTO_FULL_SCHEMA_TOOL_CAP,
-                int(self.profile.full_schema_tool_cap or 1),
-            ),
-        )
-        return {name for name, _tool in selected[:cap]}
-
-    def _is_full_schema_candidate(self, tool: ToolExecutable) -> bool:
-        binding = getattr(tool, "binding", None)
-        candidate = getattr(binding, "candidate", None)
-        if candidate is None:
-            return False
-        if bool(getattr(candidate, "exact_protected", False)):
-            return True
-        features = getattr(candidate, "features", None)
-        exact_score = float(getattr(features, "exact_score", 0.0) or 0.0)
-        schema_score = float(getattr(features, "schema_score", 0.0) or 0.0)
-        context_score = float(getattr(features, "context_score", 0.0) or 0.0)
-        reliability_score = float(getattr(features, "reliability_score", 0.0) or 0.0)
-        param_failure_score = float(
-            getattr(features, "param_failure_score", 0.0) or 0.0
-        )
-        score = float(getattr(candidate, "score", 0.0) or 0.0)
-        if reliability_score >= 8.0 and param_failure_score >= -3.0 and score >= 80.0:
-            return True
-        high_reliability = _is_high_reliability_candidate(candidate)
-        if high_reliability and (
-            score >= 90.0 or exact_score > 0 or schema_score + context_score >= 12.0
-        ):
-            return True
-        return (
-            exact_score > 0
-            or score >= 180.0
-            or (score >= 120.0 and schema_score + context_score >= 8.0)
-        )
-
-    def _is_compact_schema_candidate(self, tool: ToolExecutable) -> bool:
-        binding = getattr(tool, "binding", None)
-        candidate = getattr(binding, "candidate", None)
-        if candidate is None:
-            return False
-        if _is_low_reliability_candidate(candidate):
-            return True
-        return not self._is_full_schema_candidate(tool)
-
-
-def is_compact_request_tool(tool: ToolExecutable | None) -> bool:
-    return str(getattr(tool, "chatinter_schema_mode", "") or "") == "compact"
-
 
 def is_light_request_tool(tool: ToolExecutable | None) -> bool:
     return str(getattr(tool, "chatinter_schema_mode", "") or "") == "light"
@@ -971,8 +698,6 @@ __all__ = [
     "ProviderCapabilityAdapter",
     "ProviderCapabilityProfile",
     "ProviderPreparedRequest",
-    "ProviderToolSchemaPlan",
-    "is_compact_request_tool",
     "is_light_request_tool",
     "sanitize_json_schema",
 ]

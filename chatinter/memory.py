@@ -104,6 +104,7 @@ _CONTEXT_MIN_TOKEN_BUDGETS = {
     "identity": 260,
     "event": 520,
     "reply_layers": 420,
+    "relationship": 120,
 }
 _CONTEXT_FLEX_SECTION_TOKEN_BUDGETS = {
     "chatroom": 640,
@@ -113,6 +114,7 @@ _CONTEXT_SECTION_PRIORITY = {
     "identity": 0,
     "event": 10,
     "reply_layers": 30,
+    "relationship": 90,
     "memory": 100,
     "chatroom": 110,
 }
@@ -929,16 +931,26 @@ class ChatMemory:
             )
 
 
-        impression = 0.0
-        attitude = "一般"
         if inject_chat_memory and USE_SIGN_IN_IMPRESSION:
             impression, attitude = await self.get_user_impression(user_id)
+            impression_rule = build_global_attitude_prompt(
+                impression,
+                attitude,
+            ).strip()
+            if impression_rule:
+                self._append_context_section(
+                    context_sections,
+                    "relationship",
+                    [
+                        "<relationship>"
+                        f"{_xml_escape(impression_rule, quote=False)}"
+                        "</relationship>",
+                    ],
+                )
 
         context_xml = "\n".join(self._render_budgeted_context(context_sections))
         system_prompt = (
             self._build_system_prompt(
-                impression,
-                attitude,
                 current_message_text=current_message_text,
                 persona_selection=persona_selection,
             )
@@ -1142,12 +1154,14 @@ class ChatMemory:
 
     def _build_system_prompt(
         self,
-        impression: float,
-        attitude: str,
         current_message_text: str = "",
         persona_selection: "PersonaSelection | None" = None,
     ) -> str:
-        """构建系统提示词"""
+        """构建系统提示词。
+
+        产出必须在会话内逐字节稳定（供应商按前缀缓存 prompt）：
+        任何会随轮次变化的内容（好感度、召回、时间）都放 context_xml，不放这里。
+        """
         persona = persona_selection.persona if persona_selection is not None else None
         chat_style = persona.style if persona is not None else ""
         _ = current_message_text
@@ -1160,10 +1174,6 @@ class ChatMemory:
             chat_style,
             length_rule,
         )
-        if USE_SIGN_IN_IMPRESSION:
-            impression_rule = build_global_attitude_prompt(impression, attitude)
-        else:
-            impression_rule = ""
 
         custom_prompt = persona.prompt_fragment() if persona is not None else ""
         persona_prompt = (
@@ -1178,7 +1188,6 @@ class ChatMemory:
                 persona_prompt,
                 base,
                 _LONG_TERM_MEMORY_RULE,
-                impression_rule,
             )
             if part
         )

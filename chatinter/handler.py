@@ -78,11 +78,7 @@ async def handle_fallback(
         group_id=group_id,
         nickname=get_nickname(session),
         bot_id=str(bot.self_id) if hasattr(bot, "self_id") else None,
-        model_name=get_agent_model(
-            "plugin"
-            if scenario_route.scenario is ChatInterScenario.GROUP_PLUGIN_SELECTOR
-            else "chat"
-        ),
+        model_name=get_agent_model("chat"),
         is_superuser=resolve_superuser(bot, user_id),
         scenario=scenario_route.scenario.value,
         allow_plugin_tools=scenario_route.allow_plugin_tools,

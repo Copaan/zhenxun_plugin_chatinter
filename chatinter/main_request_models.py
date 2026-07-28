@@ -4,14 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from .llm_compat import ToolResult
 from .native_executor import NativeToolExecutionResult
 from .native_route import NativeRouteDecision, NativeRouteReport, NativeRouteResult
-
-if TYPE_CHECKING:
-    from .tool_intent_gate import ToolIntentGateResult
 
 
 @dataclass(frozen=True)
@@ -63,38 +60,14 @@ class MainRequestResult:
         return any(item.route_result is not None for item in self.executions)
 
 
-@dataclass(frozen=True)
-class ToolObligationDecision:
-    obligation: str
-    reason: str
-    required_tool_names: tuple[str, ...] = ()
-    gate_result: "ToolIntentGateResult | None" = None
-
-
-@dataclass(frozen=True)
-class CandidateObligationEvaluation:
-    candidate: Any
-    score: float
-    request_strength: Any
-    capability_factor: float
-    recall_factor: float
-    reliability_factor: float
-    schema_factor: float
-    requires_real_tool: bool
-    real_output_factor: float
-    reason: str
-
-
 MainRequestRouteHook = Callable[[MainRequestResult], Awaitable[None] | None]
 MainRequestReplyHook = Callable[[str], Awaitable[str] | str]
 
 
 __all__ = [
-    "CandidateObligationEvaluation",
     "MainRequestOutput",
     "MainRequestReplyHook",
     "MainRequestResult",
     "MainRequestRouteHook",
     "MainRequestTimelineItem",
-    "ToolObligationDecision",
 ]

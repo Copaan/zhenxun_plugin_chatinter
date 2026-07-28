@@ -63,28 +63,6 @@ _COMPLEX_VALUE_KEYS = {
     "response",
     "result",
 }
-_REFERENCE_KEYS = {
-    "artifact_id",
-    "approval_id",
-    "command_id",
-    "rendered_command",
-    "matched_plugin",
-    "plugin_module",
-    "task_text",
-    "remaining_task_hint",
-    "status",
-    "ok",
-    "returncode",
-    "retryable",
-    "need_continue",
-    "truncated",
-    "count",
-    "path",
-    "cwd",
-    "command",
-    "args",
-    "instruction",
-}
 
 
 @dataclass(frozen=True)

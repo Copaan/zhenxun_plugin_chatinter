@@ -50,9 +50,6 @@ class ChatRuntime:
     @staticmethod
     def isolation_for_frame(frame: Any) -> ChatIsolationDecision:
         scenario = normalize_message_text(str(getattr(frame, "scenario", "") or ""))
-        exposure_state = normalize_message_text(
-            str(getattr(frame, "chat_tool_exposure_state", "") or "unknown")
-        )
         if scenario == "private_chat":
             return ChatIsolationDecision(
                 allow_prompt_profile=True,
@@ -62,20 +59,12 @@ class ChatRuntime:
                 reason="private_chat",
             )
         if scenario == "group_plugin_selector":
-            if exposure_state in {"unknown", "plugin_tools_exposed"}:
-                return ChatIsolationDecision(
-                    allow_prompt_profile=False,
-                    allow_memory_profile=False,
-                    allow_quality_judge=False,
-                    allow_state_persist=False,
-                    reason=exposure_state or "plugin_tools_exposed",
-                )
             return ChatIsolationDecision(
                 allow_prompt_profile=True,
                 allow_memory_profile=True,
                 allow_quality_judge=True,
                 allow_state_persist=True,
-                reason="group_chat_no_tool_exposure",
+                reason="group_unified",
             )
         return ChatIsolationDecision(
             allow_prompt_profile=False,

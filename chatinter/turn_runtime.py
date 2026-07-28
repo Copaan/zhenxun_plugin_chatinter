@@ -20,6 +20,7 @@ class TurnBudgetSnapshot:
     tool_batches: int
     prompt_tokens: int
     completion_tokens: int
+    cached_prompt_tokens: int
     durations_ms: dict[str, float]
 
 
@@ -37,6 +38,7 @@ class TurnBudgetController:
     tool_batches: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    cached_prompt_tokens: int = 0
     durations: defaultdict[str, float] = field(
         default_factory=lambda: defaultdict(float)
     )
@@ -107,9 +109,11 @@ class TurnBudgetController:
         *,
         prompt_tokens: int,
         completion_tokens: int,
+        cached_prompt_tokens: int = 0,
     ) -> None:
         self.prompt_tokens += max(int(prompt_tokens), 0)
         self.completion_tokens += max(int(completion_tokens), 0)
+        self.cached_prompt_tokens += max(int(cached_prompt_tokens), 0)
 
     def prompt_budget_remaining(self) -> int:
         return max(self.prompt_budget_tokens - self.prompt_tokens, 0)
@@ -122,6 +126,7 @@ class TurnBudgetController:
             tool_batches=self.tool_batches,
             prompt_tokens=self.prompt_tokens,
             completion_tokens=self.completion_tokens,
+            cached_prompt_tokens=self.cached_prompt_tokens,
             durations_ms={
                 key: round(value * 1000, 2)
                 for key, value in sorted(self.durations.items())

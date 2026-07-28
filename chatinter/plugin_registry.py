@@ -2120,9 +2120,15 @@ class PluginRegistry:
         *,
         selection_context: PluginSelectionContext | None,
     ) -> list[CommandToolSnapshot]:
-        cache_key = cls._command_tool_cache_key(
-            knowledge_base,
-            selection_context=selection_context,
+        from .command_metadata_overrides import load_command_overrides
+
+        overrides = load_command_overrides()
+        cache_key = (
+            cls._command_tool_cache_key(
+                knowledge_base,
+                selection_context=selection_context,
+            ),
+            overrides.version,
         )
         cached = cls._command_tool_cache.get(cache_key)
         if cached is not None:
@@ -2133,8 +2139,10 @@ class PluginRegistry:
             selection_context=selection_context,
             limit=None,
         )
-        snapshots = cls._dedupe_execution_identity_snapshots(
-            build_command_tool_snapshots(graph, limit=None)
+        snapshots = overrides.apply(
+            cls._dedupe_execution_identity_snapshots(
+                build_command_tool_snapshots(graph, limit=None)
+            )
         )
         cls._command_tool_cache[cache_key] = (list(snapshots), len(snapshots))
         cls._command_tool_cache_order.append(cache_key)

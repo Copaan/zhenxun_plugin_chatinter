@@ -378,6 +378,7 @@ class AI:
         tools: list[Any] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         timeout: float | None = None,
+        prompt_cache_key: str | None = None,
     ) -> _CompatResponse:
         from zhenxun.services.ai.llm.api import generate
 
@@ -390,14 +391,18 @@ class AI:
                 tool_choice=tool_choice,
                 timeout=timeout,
                 session_id=self.session_id,
+                prompt_cache_key=prompt_cache_key,
             )
         else:
+            extra = {"session_id": self.session_id} if self.session_id else {}
+            if prompt_cache_key:
+                extra["_chatinter_prompt_cache_key"] = prompt_cache_key
             response = await generate(
                 messages=_new_messages(messages),
                 model=model,
                 config=_new_generation_config(config),
                 timeout=timeout,
-                extra={"session_id": self.session_id} if self.session_id else None,
+                extra=extra or None,
             )
         return _CompatResponse(response)
 
@@ -449,17 +454,21 @@ async def _generate_with_tools(
     tool_choice: str | dict[str, Any] | None,
     timeout: float | None,
     session_id: str | None,
+    prompt_cache_key: str | None,
 ) -> Any:
     from zhenxun.services.ai.core.messages import ChatRequest
     from zhenxun.services.ai.llm.engine.router import LLMOrchestrator
 
+    extra = {"session_id": session_id} if session_id else {}
+    if prompt_cache_key:
+        extra["_chatinter_prompt_cache_key"] = prompt_cache_key
     request = ChatRequest(
         messages=messages,
         config=config,
         tools=tools,
         tool_choice=tool_choice,
         timeout=timeout,
-        extra={"session_id": session_id} if session_id else {},
+        extra=extra,
     )
     return await LLMOrchestrator.invoke(
         request,

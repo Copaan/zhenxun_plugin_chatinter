@@ -29,7 +29,9 @@ from .permission_policy import (
 )
 from .progress import progress_phase
 from .runtime import (
+    SuperuserSessionBusyError,
     cancel_superuser_session_execution,
+    superuser_session_execution,
     superuser_session_is_executing,
 )
 from .store import (
@@ -51,6 +53,10 @@ from .store import (
     set_conversation_permission_mode,
     switch_conversation,
     update_agent_run_status,
+)
+from .tools.shell_tools import (
+    has_running_background_shell_tasks,
+    stop_background_shell_tasks,
 )
 
 _ACTIVE_STATUSES = {"running", "paused"}
@@ -117,7 +123,7 @@ async def try_handle_runtime_control(
     is_active = bool(session_state.get("active"))
     snapshot = get_agent_run_snapshot(run_id) if run_id else None
     is_executing = superuser_session_is_executing(session_key)
-    is_running = is_executing or bool(
+    is_running = is_executing or has_running_background_shell_tasks(run_id) or bool(
         isinstance(snapshot, dict) and str(snapshot.get("status", "")) == "running"
     )
     is_waiting_approval = (
@@ -205,7 +211,11 @@ async def try_handle_runtime_control(
         )
         return True
     if intent == "compact":
-        text = await _compact_conversation(run_id)
+        try:
+            async with superuser_session_execution(session_key):
+                text = await _compact_conversation(run_id)
+        except SuperuserSessionBusyError:
+            text = "当前任务仍在执行，请先回复 /中断，再压缩上下文。"
         await _send_runtime_reply(bot=bot, event=event, text=text)
         return True
 
@@ -252,6 +262,7 @@ async def try_handle_runtime_control(
             session_key=session_key,
         )
         cancel_superuser_session_execution(session_key)
+        await stop_background_shell_tasks(run_id)
         await _send_runtime_reply(bot=bot, event=event, text="已中断当前任务。")
         return True
     return False
@@ -530,17 +541,32 @@ def _has_pending_approval(
     user_id: str,
     session_key: str,
 ) -> bool:
-    if isinstance(snapshot, dict) and snapshot.get("pending_approval"):
-        return True
     if not run_id:
         return False
-    return any(
-        _approval_run_id(approval) == run_id
-        for approval in list_pending_approvals(
-            user_id=user_id,
-            session_key=session_key,
-        )
+    approvals = list_pending_approvals(
+        user_id=user_id,
+        session_key=session_key,
     )
+    pending_id = (
+        str(snapshot.get("pending_approval", "") or "")
+        if isinstance(snapshot, dict)
+        else ""
+    )
+    if any(
+        approval.approval_id == pending_id or _approval_run_id(approval) == run_id
+        for approval in approvals
+    ):
+        return True
+    if pending_id:
+        update_agent_run_status(
+            run_id,
+            status="paused",
+            reason="approval_expired",
+            clear_pending_approval=True,
+        )
+        snapshot["pending_approval"] = ""
+        snapshot.pop("waiting_approval_ids", None)
+    return False
 
 
 def _has_uncertain_side_effect(snapshot: dict[str, Any] | None) -> bool:

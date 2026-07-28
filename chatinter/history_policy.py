@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from html import escape as _xml_escape
@@ -25,12 +26,31 @@ _HISTORY_TOTAL_TOKEN_BUDGET = 4000
 _DIALOG_HISTORY_TOKEN_BUDGET = 3000
 _CHATROOM_HISTORY_TOKEN_BUDGET = 800
 _MIN_RECENT_TURNS = 1
-_SUMMARY_FETCH_LIMIT = 24
 _SUMMARY_MAX_LINES = 8
 _SUMMARY_USER_CLIP = 96
 _SUMMARY_RESULT_CLIP = 128
-_TOOL_HISTORY_KEEP_RECENT_TURNS = 1
 _TOOL_HISTORY_MAX_TOOL_ITEMS = 2
+
+# 滞回裁剪：历史消息在会话内保持 append-only（供应商按前缀缓存 prompt），
+# 只在越过高水位时一次性裁到低水位，期间前缀逐字节不变。
+_HISTORY_COUNT_SLACK = 4
+_HISTORY_TRIM_LOW_RATIO = 0.62
+_TRIM_STATE_LIMIT = 512
+_session_history_boundary: OrderedDict[str, int] = OrderedDict()
+
+
+def _get_history_boundary(session_id: str) -> int:
+    value = _session_history_boundary.get(session_id, 0)
+    if session_id in _session_history_boundary:
+        _session_history_boundary.move_to_end(session_id)
+    return value
+
+
+def _set_history_boundary(session_id: str, dialog_id: int) -> None:
+    _session_history_boundary[session_id] = dialog_id
+    _session_history_boundary.move_to_end(session_id)
+    while len(_session_history_boundary) > _TRIM_STATE_LIMIT:
+        _session_history_boundary.popitem(last=False)
 
 
 @dataclass(frozen=True)
@@ -48,6 +68,7 @@ class AstrHistoryPayload:
 
 @dataclass(frozen=True)
 class _HistoryTurn:
+    dialog_id: int
     messages: list[LLMMessage]
     summary: str
     token_cost: int
@@ -117,22 +138,19 @@ async def _build_turn_managed_dialog_messages(
     if limit <= 0:
         return []
     token_budget = max(int(token_budget or 0), 0)
-
-    fetch_limit = max(limit, min(_SUMMARY_FETCH_LIMIT, limit + _SUMMARY_MAX_LINES))
+    high_count = limit + _HISTORY_COUNT_SLACK
+    fetch_limit = high_count + _SUMMARY_MAX_LINES
     dialogs = await ChatInterChatHistory.get_recent_dialogs(session_id, fetch_limit)
     turns: list[_HistoryTurn] = []
-    total_dialogs = len(dialogs)
-    for index, dialog in enumerate(dialogs):
+    for dialog in dialogs:
         timeline_messages = await _timeline_to_history_messages(
             dialog,
             group_id=group_id,
-            include_tool_details=(
-                total_dialogs - index <= _TOOL_HISTORY_KEEP_RECENT_TURNS
-            ),
         )
         if timeline_messages:
             turns.append(
                 _HistoryTurn(
+                    dialog_id=int(getattr(dialog, "id", 0) or 0),
                     messages=timeline_messages,
                     summary=await _timeline_to_summary_line(
                         dialog,
@@ -146,24 +164,31 @@ async def _build_turn_managed_dialog_messages(
     if not turns:
         return []
 
-    kept_reversed: list[_HistoryTurn] = []
-    omitted: list[_HistoryTurn] = []
-    used_tokens = 0
+    boundary = _get_history_boundary(session_id)
+    kept = [turn for turn in turns if turn.dialog_id >= boundary]
+    omitted = [turn for turn in turns if turn.dialog_id < boundary]
     min_recent_turns = min(_MIN_RECENT_TURNS, limit)
-    for turn in reversed(turns):
-        should_keep = len(kept_reversed) < min_recent_turns or (
-            len(kept_reversed) < limit
-            and used_tokens + turn.token_cost <= token_budget
-        )
-        if should_keep:
-            kept_reversed.append(turn)
-            used_tokens += turn.token_cost
-        else:
-            omitted.append(turn)
+    if len(kept) < min_recent_turns:
+        recovered = turns[-min_recent_turns:]
+        recovered_ids = {turn.dialog_id for turn in recovered}
+        omitted = [turn for turn in turns if turn.dialog_id not in recovered_ids]
+        kept = recovered
 
-    kept = list(reversed(kept_reversed))
+    used_tokens = sum(turn.token_cost for turn in kept)
+    if len(kept) > high_count or used_tokens > token_budget:
+        low_tokens = int(token_budget * _HISTORY_TRIM_LOW_RATIO)
+        while len(kept) > min_recent_turns and (
+            len(kept) > limit or used_tokens > low_tokens
+        ):
+            dropped = kept.pop(0)
+            used_tokens -= dropped.token_cost
+            omitted.append(dropped)
+        if kept:
+            _set_history_boundary(session_id, kept[0].dialog_id)
+
+    omitted.sort(key=lambda turn: turn.dialog_id)
     messages: list[LLMMessage] = []
-    summary_lines = [turn.summary for turn in reversed(omitted) if turn.summary][
+    summary_lines = [turn.summary for turn in omitted if turn.summary][
         -_SUMMARY_MAX_LINES:
     ]
     if summary_lines:
@@ -177,8 +202,12 @@ async def _timeline_to_history_messages(
     dialog: ChatInterChatHistory,
     *,
     group_id: str | None,
-    include_tool_details: bool,
 ) -> list[LLMMessage]:
+    """Render one dialog into history messages.
+
+    渲染只依赖对话自身，与它在历史中的位置/新旧无关——同一条对话在后续
+    每一轮请求里必须渲染出逐字节相同的消息（前缀缓存的前提）。
+    """
     timeline = dialog.get_timeline()
     if not timeline:
         return []
@@ -202,7 +231,7 @@ async def _timeline_to_history_messages(
                 messages.append(LLMMessage.user(f"{sender}: {content}"))
             continue
         if kind == "tool_call":
-            if not include_tool_details or tool_items >= _TOOL_HISTORY_MAX_TOOL_ITEMS:
+            if tool_items >= _TOOL_HISTORY_MAX_TOOL_ITEMS:
                 continue
             tool_items += 1
             tool_name = _clean_history_text(item.get("tool_name", ""), 80)
@@ -216,7 +245,7 @@ async def _timeline_to_history_messages(
             messages.append(LLMMessage.assistant_text_response(text))
             continue
         if kind == "tool_result":
-            if not include_tool_details or tool_items >= _TOOL_HISTORY_MAX_TOOL_ITEMS:
+            if tool_items >= _TOOL_HISTORY_MAX_TOOL_ITEMS:
                 continue
             tool_items += 1
             tool_name = _clean_history_text(item.get("tool_name", ""), 80)
@@ -364,9 +393,9 @@ async def _build_chatroom_lines(
     lines: list[str] = []
     for row, content in selected:
         timestamp = (
-            row.create_time.strftime("%m-%d %H:%M:%S")
+            row.create_time.strftime("%m-%d %H:%M")
             if row.create_time
-            else "??:??:??"
+            else "??:??"
         )
         row_user_id = str(row.user_id or "")
         is_bot_message = bool(bot_id and row_user_id == str(bot_id))

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from inspect import isawaitable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from .llm_compat import ToolResult
 from .main_request_models import (
@@ -14,13 +14,10 @@ from .main_request_models import (
     MainRequestRouteHook,
     MainRequestTimelineItem,
 )
-from .native_executor import NativeCommandExecutionContext, NativeToolExecutionResult
+from .native_executor import NativeToolExecutionResult
 from .native_route import NativeRouteDecision, NativeRouteReport, NativeRouteResult
 from .route_text import normalize_message_text, normalize_reply_text
 
-if TYPE_CHECKING:
-    from .superuser_agent.state import AgentRuntimeResult, AgentRuntimeTimelineItem
-from .task_coverage import TaskCoverageReport
 
 _MAIN_STAGE = "main_request"
 
@@ -48,135 +45,6 @@ def _fallback_result(
         output=MainRequestOutput(final_text=reply, memory_text=reply),
     )
 
-def _result_from_agent_runtime(
-    *,
-    report: NativeRouteReport,
-    executions: list[NativeToolExecutionResult],
-    agent_result: AgentRuntimeResult,
-    timeline: list[MainRequestTimelineItem],
-) -> MainRequestResult:
-    stop_reason = agent_result.stop_reason
-    reason = f"main_request:{stop_reason}"
-    if report.final_reason == "init":
-        first_route = _first_route(executions)
-        report.finalize(
-            reason=reason,
-            stage=first_route.stage if first_route is not None else _MAIN_STAGE,
-            plugin_name=first_route.decision.plugin_name
-            if first_route is not None
-            else None,
-            plugin_module=first_route.decision.plugin_module
-            if first_route is not None
-            else None,
-            command=first_route.decision.command if first_route is not None else None,
-        )
-    command_tool_results = [
-        result
-        for result in agent_result.tool_results
-        if not _is_catalog_tool_result(result)
-    ]
-    final_text = normalize_reply_text(agent_result.final_text)
-    should_send = bool(final_text)
-    memory_text = _timeline_memory_text(timeline, fallback=final_text)
-    handled_by_tools = bool(executions or command_tool_results)
-    return MainRequestResult(
-        decision=NativeRouteDecision(
-            action="chat",
-            confidence=0.9 if handled_by_tools else 0.84,
-            reason=reason,
-        ),
-        route_result=_first_route(executions),
-        report=report,
-        executions=tuple(executions),
-        tool_results=tuple(command_tool_results),
-        timeline=tuple(timeline),
-        output=MainRequestOutput(
-            final_text=final_text,
-            memory_text=memory_text,
-            should_send=should_send,
-            outcome="tool_completed" if handled_by_tools else "chat_completed",
-            feedback_kind="tool_completed" if handled_by_tools else "chat_completed",
-            record_chat_feedback=not handled_by_tools,
-            observation_reason="route_success"
-            if any(item.success for item in executions)
-            else "reroute_failed"
-            if handled_by_tools
-            else "chat_completed",
-        ),
-    )
-
-def _result_from_task_execution_queue(
-    *,
-    message_text: str,
-    report: NativeRouteReport,
-    command_context: NativeCommandExecutionContext,
-    task_router_payload: dict[str, Any],
-    task_queue_payload: dict[str, Any],
-    task_coverage_report: TaskCoverageReport,
-    tool_results: list[ToolResult],
-    final_text: str,
-) -> MainRequestResult:
-    executions = list(command_context.executions)
-    reason = "main_request:task_execution_queue"
-    if report.final_reason == "init":
-        first_route = _first_route(executions)
-        report.finalize(
-            reason=reason,
-            stage=first_route.stage if first_route is not None else _MAIN_STAGE,
-            plugin_name=first_route.decision.plugin_name
-            if first_route is not None
-            else None,
-            plugin_module=first_route.decision.plugin_module
-            if first_route is not None
-            else None,
-            command=first_route.decision.command if first_route is not None else None,
-        )
-    timeline: tuple[MainRequestTimelineItem, ...] = (
-        _user_timeline_item(message_text),
-        MainRequestTimelineItem(
-            role="system",
-            kind="task_router",
-            metadata=task_router_payload,
-        ),
-        MainRequestTimelineItem(
-            role="system",
-            kind="task_execution_queue",
-            metadata=task_queue_payload,
-        ),
-        MainRequestTimelineItem(
-            role="system",
-            kind="task_coverage",
-            metadata=task_coverage_report.to_payload(),
-        ),
-    )
-    reply = normalize_reply_text(final_text)
-    return MainRequestResult(
-        decision=NativeRouteDecision(
-            action="execute",
-            confidence=0.94,
-            reason=reason,
-        ),
-        route_result=_first_route(executions),
-        report=report,
-        executions=tuple(executions),
-        tool_results=tuple(tool_results),
-        timeline=timeline,
-        output=MainRequestOutput(
-            final_text=reply,
-            memory_text=_timeline_memory_text(timeline, fallback=reply),
-            should_send=False,
-            outcome="tool_completed"
-            if task_coverage_report.all_completed
-            else "tool_failed",
-            feedback_kind="tool_completed"
-            if task_coverage_report.all_completed
-            else "tool_failed",
-            record_chat_feedback=False,
-            observation_reason="route_success"
-            if task_coverage_report.all_completed
-            else "reroute_failed",
-        ),
-    )
 
 def _is_catalog_tool_result(result: ToolResult) -> bool:
     output = result.output if isinstance(result.output, dict) else {}
@@ -334,19 +202,6 @@ def _user_timeline_item(message_text: str) -> MainRequestTimelineItem:
         content=message_text,
     )
 
-def _convert_runtime_timeline(
-    items: tuple[AgentRuntimeTimelineItem, ...],
-) -> list[MainRequestTimelineItem]:
-    return [
-        MainRequestTimelineItem(
-            role=item.role,
-            kind=item.kind,
-            content=item.content,
-            tool_name=item.tool_name,
-            metadata=dict(item.metadata),
-        )
-        for item in items
-    ]
 
 def _with_final_timeline(
     timeline: tuple[MainRequestTimelineItem, ...],
@@ -366,12 +221,9 @@ def _with_final_timeline(
     )
 
 __all__ = [
-    "_convert_runtime_timeline",
     "_fallback_final_reply",
     "_fallback_result",
     "_finalize_result",
-    "_result_from_agent_runtime",
-    "_result_from_task_execution_queue",
     "_timeline_memory_text",
     "_user_timeline_item",
 ]

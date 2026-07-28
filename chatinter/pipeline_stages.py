@@ -22,8 +22,6 @@ from zhenxun.services import logger
 from zhenxun.utils.message import MessageUtils
 
 from .addressee_resolver import AddresseeResult, resolve_addressee
-from .agents.chat_reply_agent import ChatReplyAgent
-from .agents.core import PrivateChatRequest
 from .chat_handler import (
     normalize_ai_reply_text,
     replace_mention_ids_with_names,
@@ -293,6 +291,14 @@ def _finish_trace(
         message_preview=message_preview,
         trace_tags=dict(trace.tags),
         route_report=route_report,
+        prompt_tokens=(
+            budget_controller.prompt_tokens if budget_controller is not None else 0
+        ),
+        cached_prompt_tokens=(
+            budget_controller.cached_prompt_tokens
+            if budget_controller is not None
+            else 0
+        ),
     )
 
 
@@ -828,11 +834,8 @@ def _build_agent_messages(frame: TurnFrame) -> list[LLMMessage]:
 
 
 def _should_build_agent_messages(frame: TurnFrame) -> bool:
-
-    return not (
-        frame.scenario == "group_plugin_selector"
-        and frame.chat_tool_exposure_state in {"unknown", "plugin_tools_exposed"}
-    )
+    del frame
+    return True
 
 
 def _build_turn_queue_context(frame: TurnFrame) -> str:
@@ -997,41 +1000,6 @@ async def stage_scratchpad(
 
 
 
-async def _run_chat_reply_agent_turn(
-    *,
-    message_text: str,
-    session_key: str | None,
-    budget_controller: TurnBudgetController | None,
-    messages: list[LLMMessage],
-    route_completed_hook: Any | None,
-    reply_hook: Any | None,
-) -> MainRequestResult:
-    normalized_message = normalize_message_text(message_text)
-    report = NativeRouteReport(helper_mode=is_usage_question(normalized_message))
-
-    async def run_agent() -> MainRequestResult:
-        return (
-            await ChatReplyAgent().run(
-                PrivateChatRequest(
-                    message_text=normalized_message,
-                    session_key=session_key,
-                    budget_controller=budget_controller,
-                    messages=messages,
-                    report=report,
-                )
-            )
-        ).to_main_result()
-
-    return await _run_direct_agent_turn(
-        message_text=normalized_message,
-        report=report,
-        budget_controller=budget_controller,
-        route_completed_hook=route_completed_hook,
-        reply_hook=reply_hook,
-        run_agent=run_agent,
-    )
-
-
 async def _run_direct_agent_turn(
     *,
     message_text: str,
@@ -1166,70 +1134,10 @@ def _set_agent_stage_result(
 
 
 
-async def stage_chat_run(
-    *,
-    frame: TurnFrame,
-    middleware_state: TurnMiddlewareState,
-    middleware,
-) -> None:
-    if frame.dialogue_plan is None:
-        raise RuntimeError("missing dialogue plan for main request")
-    if not frame.agent_messages:
-        await _prepare_chat_multimodal(frame)
-        frame.agent_messages = _build_agent_messages(frame)
-    frame.stage(PipelineStage.AGENT_RUN)
-    route_completed_hook, reply_hook = _build_agent_stage_hooks(
-        frame=frame,
-        middleware_state=middleware_state,
-        middleware=middleware,
-    )
-    progress_task = (
-        asyncio.create_task(_send_delayed_reply_status(frame))
-        if frame.scenario == "private_chat"
-        else None
-    )
-    try:
-        main_result = await _run_chat_reply_agent_turn(
-            message_text=frame.route_message or frame.current_message,
-            session_key=frame.session_key,
-            budget_controller=frame.budget_controller,
-            messages=frame.agent_messages,
-            route_completed_hook=route_completed_hook,
-            reply_hook=reply_hook,
-        )
-    finally:
-        if progress_task is not None:
-            progress_task.cancel()
-            await asyncio.gather(progress_task, return_exceptions=True)
-    _set_agent_stage_result(frame=frame, main_result=main_result)
-
-
 async def _send_delayed_reply_status(frame: TurnFrame) -> None:
     await asyncio.sleep(15.0)
     if _frame_is_current(frame) and not frame.turn_finished:
         await MessageUtils.build_message("正在回复...").send()
-
-
-async def prepare_plugin_fallback_chat_context(
-    *,
-    frame: TurnFrame,
-    bot: Bot,
-    event: Event,
-    middleware_state: TurnMiddlewareState,
-    middleware,
-) -> None:
-    frame.command_tools = []
-    frame.chat_tool_exposure_state = "none"
-    frame.route_message = frame.current_message
-    frame.update_tags(plugin_router_fallback="chat")
-    await stage_dialogue_state(frame=frame)
-    await stage_memory(frame=frame, bot=bot, event=event)
-    await stage_current_user(frame=frame, message=frame.message)
-    await stage_scratchpad(
-        frame=frame,
-        middleware_state=middleware_state,
-        middleware=middleware,
-    )
 
 
 async def stage_persist(frame: TurnFrame) -> None:
