@@ -8,6 +8,13 @@ from ..llm_compat import ToolResult
 from .approval_store import PendingApproval, approval_payload_matches_fingerprint
 from .audit_log import record_audit_event
 from .permission_policy import file_path_deny, shell_command_deny
+from .tools.active_task_tools import (
+    active_task_audit_payload,
+    execute_active_task_control_payload,
+    execute_active_task_create_payload,
+    execute_active_task_update_payload,
+    validate_active_task_approval_payload,
+)
 from .tools.common import permission_denied_result, tool_result
 from .tools.file_tools import (
     apply_patch_text,
@@ -24,6 +31,9 @@ _APPROVED_ACTIONS = {
     "write_file",
     "replace_in_file",
     "apply_patch",
+    "active_task_create",
+    "active_task_control",
+    "active_task_update",
 }
 
 
@@ -46,6 +56,16 @@ def validate_approved_action(
             approval_id=approval.approval_id,
             action=approval.action,
             error="该操作不支持审批执行。",
+        )
+    if approval.action in {
+        "active_task_create",
+        "active_task_control",
+        "active_task_update",
+    }:
+        return validate_active_task_approval_payload(
+            action=approval.action,
+            payload=approval.payload,
+            actor=actor,
         )
     if approval.action == "shell_command":
         denied = shell_command_deny(str(approval.payload.get("command", "") or ""))
@@ -99,15 +119,26 @@ async def execute_approved_action(
     validation_error = validate_approved_action(approval=approval, actor=actor)
     if validation_error is not None:
         return validation_error
+    audit_payload = (
+        active_task_audit_payload(approval.payload)
+        if approval.action.startswith("active_task_")
+        else approval.payload
+    )
     record_audit_event(
         event="approval_accepted",
         user_id=actor["user_id"],
         session_key=actor["session_key"],
         action=approval.action,
-        payload={"approval_id": approval.approval_id, **approval.payload},
+        payload={"approval_id": approval.approval_id, **audit_payload},
     )
     payload = approval.payload
     approval_id = approval.approval_id
+    if approval.action == "active_task_create":
+        return await execute_active_task_create_payload(payload, actor=actor)
+    if approval.action == "active_task_control":
+        return await execute_active_task_control_payload(payload, actor=actor)
+    if approval.action == "active_task_update":
+        return await execute_active_task_update_payload(payload, actor=actor)
     if approval.action == "shell_command":
         if str(payload.get("action", "") or "run") == "start":
             return start_background_shell_command(

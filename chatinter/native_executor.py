@@ -70,6 +70,7 @@ class NativeToolExecutionResult:
     output: dict[str, Any] = field(default_factory=dict)
     display_text: str = ""
     reason: str = ""
+    execution_started: bool = False
 
 
 ExecuteNativeRoute = Callable[
@@ -85,8 +86,14 @@ class NativeCommandExecutionContext:
     report: NativeRouteReport
     route_executor: ExecuteNativeRoute
     message_text: str
+    event_target_hint: str = ""
+    target_refs: dict[str, str] = field(default_factory=dict)
+    retrieval_context: dict[str, bool | int | str] = field(default_factory=dict)
     executions: list[NativeToolExecutionResult] = field(default_factory=list)
     task_count: int = 0
+    execution_receipts: dict[str, NativeToolExecutionResult] = field(
+        default_factory=dict
+    )
 
     async def execute_tool(
         self,
@@ -94,6 +101,7 @@ class NativeCommandExecutionContext:
         binding: NativeCommandToolBinding,
         raw_slots: dict[str, Any],
     ) -> ToolResult:
+        self.report.note_tool_choice()
         validated = self._validate_tool_call(binding=binding, raw_slots=raw_slots)
         if validated is None:
             task_text, _slots = pop_task_text(raw_slots)
@@ -104,6 +112,19 @@ class NativeCommandExecutionContext:
                 error="工具调用未通过本地校验，请重新选择候选工具或直接聊天。",
                 display_content="工具调用校验失败",
                 retryable=True,
+            )
+
+        execution_key = _native_execution_key(binding=binding, validated=validated)
+        previous_execution = self.execution_receipts.get(execution_key)
+        if previous_execution is not None and (
+            bool(previous_execution.output.get("execution_uncertain"))
+            or _has_nonrepeatable_side_effect(binding)
+        ):
+            return _duplicate_execution_tool_result(
+                binding=binding,
+                validated=validated,
+                ambient_message=self.message_text,
+                previous_execution=previous_execution,
             )
 
         try:
@@ -121,11 +142,19 @@ class NativeCommandExecutionContext:
             validated=validated,
             ambient_message=self.message_text,
         )
+        if (
+            execution.execution_started
+            or execution.success
+            or bool(execution.output.get("execution_uncertain"))
+        ):
+            self.execution_receipts[execution_key] = execution
         self.executions.append(execution)
         self._finalize_report(validated=validated, execution=execution)
         return ToolResult(
             output=execution.output,
             display_content=execution.display_text or execution.reason,
+            is_error=not execution.success,
+            is_retryable=bool(execution.output.get("retryable", False)),
         )
 
     def _validate_tool_call(
@@ -135,9 +164,22 @@ class NativeCommandExecutionContext:
         raw_slots: dict[str, Any],
     ) -> NativeValidatedRoute | None:
         candidate = binding.candidate
-        task_text, target_hint, payload_hint, plugin_raw_slots = pop_task_context(
-            raw_slots
-        )
+        (
+            task_text,
+            target_hint,
+            target_ref,
+            payload_hint,
+            plugin_raw_slots,
+        ) = pop_task_context(raw_slots)
+        if _has_untrusted_task_target(task_text, self.message_text):
+            return None
+        if self.event_target_hint:
+            target_hint = self.event_target_hint
+        elif target_ref and _schema_accepts_target(candidate.schema):
+            target_user_id = self.target_refs.get(target_ref.casefold())
+            if not target_user_id:
+                return None
+            target_hint = f"[@{target_user_id}]"
         target_hint = _normalize_target_hint_for_schema(
             candidate.schema,
             target_hint,
@@ -155,11 +197,6 @@ class NativeCommandExecutionContext:
             target_hint=target_hint,
             task_text=task_text,
         )
-        shortcut_command = _shortcut_command_for_task(
-            candidate,
-            task_text=task_text,
-            ambient_message=self.message_text,
-        )
         self.task_count += 1
         task_frame = TaskFrame(
             task_index=self.task_count,
@@ -171,17 +208,12 @@ class NativeCommandExecutionContext:
             target_hint=target_hint,
             payload_hint=payload_hint,
             ambient_message=self.message_text,
+            target_refs=(target_ref,) if target_ref else (),
         )
         route_message_text = _merge_ambient_context_tokens(
             _merge_task_frame_hints(task_frame),
             self.message_text,
         )
-        if shortcut_command:
-            route_message_text = shortcut_command
-            slots = _slots_from_shortcut_command(
-                candidate.schema, shortcut_command, slots
-            )
-            task_frame = replace(task_frame, slots=dict(slots))
         selection = NativeCommandSelection(
             action="execute",
             command_id=binding.command_id,
@@ -204,12 +236,6 @@ class NativeCommandExecutionContext:
         if route is None:
             return None
         decision, route_result = route
-        if shortcut_command and route_result is not None:
-            decision.command = shortcut_command
-            route_result = replace(
-                route_result,
-                decision=replace(route_result.decision, command=shortcut_command),
-            )
         return NativeValidatedRoute(
             decision=decision,
             route_result=route_result,
@@ -250,13 +276,96 @@ def normalize_native_tool_slots(
     normalized_slots: dict[str, str] = {}
     for key, value in raw_slots.items():
         slot = slot_by_key.get(normalize_message_text(str(key or "")))
-        if slot is None:
+        if slot is None or slot.type == "at":
             continue
         coerced = _coerce_slot_value(slot, value)
         if coerced is None:
             continue
         normalized_slots[slot.name] = coerced
     return normalized_slots
+
+
+def _native_execution_key(
+    *,
+    binding: NativeCommandToolBinding,
+    validated: NativeValidatedRoute,
+) -> str:
+    route_result = validated.route_result
+    module = normalize_message_text(
+        (
+            route_result.decision.plugin_module
+            if route_result is not None
+            else ""
+        )
+        or binding.candidate.plugin_module
+        or (
+            route_result.decision.plugin_name
+            if route_result is not None
+            else ""
+        )
+        or binding.candidate.plugin_name
+    ).casefold()
+    command = normalize_message_text(
+        validated.decision.command
+        or (
+            route_result.decision.command
+            if route_result is not None
+            else ""
+        )
+    )
+    task_frame = validated.task_frame
+    task_identity = "\0".join(
+        normalize_message_text(value)
+        for value in (
+            task_frame.effective_text if task_frame is not None else "",
+            task_frame.target_hint if task_frame is not None else "",
+        )
+    )
+    return f"{module}\0{command}\0{task_identity}"
+
+
+def _has_nonrepeatable_side_effect(binding: NativeCommandToolBinding) -> bool:
+    snapshot = binding.candidate.tool
+    side_effect = normalize_message_text(
+        str(getattr(snapshot, "side_effect", "") or "")
+    ).casefold()
+    return side_effect in {"send", "mutate"}
+
+
+def _duplicate_execution_tool_result(
+    *,
+    binding: NativeCommandToolBinding,
+    validated: NativeValidatedRoute,
+    ambient_message: str,
+    previous_execution: NativeToolExecutionResult,
+) -> ToolResult:
+    route_result = validated.route_result
+    task_text = (
+        validated.task_frame.effective_text if validated.task_frame is not None else ""
+    )
+    rendered = validated.decision.command or binding.candidate.schema.head
+    payload = build_command_observation(
+        ok=False,
+        command_id=binding.command_id,
+        rendered_command=rendered,
+        matched_plugin=binding.candidate.plugin_name,
+        task_text=task_text,
+        ambient_message=ambient_message,
+        error="本轮已提交相同的副作用操作，已阻止重复执行。",
+        slots=route_result.slots if route_result is not None else {},
+        retryable=False,
+        plugin_module=binding.candidate.plugin_module,
+    )
+    payload["status"] = "blocked"
+    if bool(previous_execution.output.get("execution_uncertain")):
+        payload["prior_execution_uncertain"] = True
+    payload["duplicate_blocked"] = True
+    return ToolResult(
+        output=payload,
+        display_content="本轮相同操作已提交，已阻止重复执行。",
+        is_error=True,
+        is_retryable=False,
+    )
 
 
 def _fill_missing_slots_from_payload_hint(
@@ -389,6 +498,18 @@ def _normalize_target_hint_for_schema(schema: Any, target_hint: str) -> str:
     return text
 
 
+def _has_untrusted_task_target(task_text: str, ambient_text: str) -> bool:
+    ambient_targets = {
+        token
+        for token in collect_placeholders(ambient_text)
+        if token.startswith("[@")
+    }
+    return any(
+        token.startswith("[@") and token not in ambient_targets
+        for token in collect_placeholders(task_text)
+    )
+
+
 def _merge_ambient_context_tokens(task_text: str, ambient_text: str) -> str:
     """Expose media/@ context to validators without leaking other task text."""
 
@@ -456,59 +577,6 @@ def _coerce_slot_value(slot: CommandSlotSpec, value: Any) -> str | None:
     if choices and normalized not in choices:
         return None
     return normalized
-
-
-def _shortcut_command_for_task(
-    candidate: CommandCandidate,
-    *,
-    task_text: str,
-    ambient_message: str,
-) -> str:
-    schema = candidate.schema
-    shortcuts = getattr(schema, "shortcut_renders", None)
-    if not shortcuts:
-        meta = (
-            getattr(candidate.tool, "meta", None)
-            if candidate.tool is not None
-            else None
-        )
-        shortcuts = meta.get("shortcut_renders") if isinstance(meta, dict) else None
-    if not isinstance(shortcuts, list):
-        return ""
-    haystack = normalize_message_text(" ".join([task_text, ambient_message]))
-    if not haystack:
-        return ""
-    best_alias = ""
-    best_render = ""
-    for item in shortcuts:
-        if not isinstance(item, dict):
-            continue
-        alias = normalize_message_text(str(item.get("alias") or ""))
-        render = normalize_message_text(str(item.get("render") or ""))
-        if not alias or not render:
-            continue
-        if alias and alias in haystack and len(alias) > len(best_alias):
-            best_alias = alias
-            best_render = render
-    return best_render
-
-
-def _slots_from_shortcut_command(
-    schema: Any,
-    shortcut_command: str,
-    existing_slots: dict[str, str],
-) -> dict[str, str]:
-    parts = normalize_message_text(shortcut_command).split()
-    if len(parts) <= 1:
-        return existing_slots
-    slots = dict(existing_slots)
-    values = parts[1:]
-    slot_specs = list(getattr(schema, "slots", []) or [])
-    for slot, value in zip(slot_specs, values, strict=False):
-        coerced = _coerce_slot_value(slot, value)
-        if coerced is not None:
-            slots[slot.name] = coerced
-    return slots
 
 
 def _failure_tool_result(

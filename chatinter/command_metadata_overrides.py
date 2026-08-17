@@ -7,12 +7,21 @@
 
 文件格式（data/chatinter/command_metadata_overrides.json）：
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "commands": {
     "<command_id>": {
       "description": "一行能力描述（可选，非空则替换）",
       "aliases": ["口语别名", ...],
       "examples": ["口语示例", ...],
+      "use_cases": ["适用场景", ...],
+      "anti_use_cases": ["不适用场景", ...],
+      "side_effect": "none" | "query" | "send" | "mutate",
+      "source_of_truth": "plugin_runtime" | "bot_state" | "external_service" | ...,
+      "requires_real_tool": true,
+      "intent_types": ["query", "status", ...],
+      "requires_real_result": true,
+      "execution_policy": "normal" | "explicit_only" | "strong_intent"
+                          | "confirmation_required",
       "exclude": false,
       "exclude_reason": "",
       "source": "llm_enrichment" | "manual",
@@ -37,6 +46,37 @@ from .route_text import normalize_message_text
 OVERRIDES_PATH = Path("data/chatinter/command_metadata_overrides.json")
 _ALIAS_LIMIT = 12
 _EXAMPLE_LIMIT = 6
+_CASE_LIMIT = 8
+_ENUM_FIELDS: dict[str, set[str]] = {
+    "output_mode": {"text", "image", "file", "plugin_output", "action"},
+    "side_effect": {"none", "query", "send", "mutate"},
+    "risk": {"low", "medium", "high"},
+    "source_of_truth": {
+        "model_knowledge",
+        "plugin_runtime",
+        "bot_state",
+        "external_service",
+        "local_state",
+        "user_provided",
+        "unknown",
+    },
+    "entity_scope": {
+        "none",
+        "self_bot",
+        "actor_user",
+        "target_user",
+        "group",
+        "global",
+        "external",
+    },
+    "execution_policy": {
+        "normal",
+        "explicit_only",
+        "strong_intent",
+        "confirmation_required",
+    },
+}
+_BOOL_FIELDS = {"requires_real_tool", "requires_real_result"}
 
 
 @dataclass(frozen=True)
@@ -103,8 +143,14 @@ def load_command_overrides(
             commands=commands,
         )
     except Exception as exc:
-        logger.warning(f"ChatInter 命令元数据 overrides 加载失败：{exc}")
-        _cached = _EMPTY_OVERRIDES
+        _has_valid = _cached is not None and _cached is not _EMPTY_OVERRIDES
+        logger.warning(
+            f"ChatInter 命令元数据 overrides 加载失败：{exc}。"
+            + ("沿用上次有效版本。" if _has_valid else "使用空覆盖。")
+        )
+        if _cached is None:
+            _cached = _EMPTY_OVERRIDES
+        # else: 保留 _cached 不变（上次有效版本）
     _cached_stat = stat_key
     return _cached
 
@@ -131,8 +177,34 @@ def _apply_one(
             extra_examples,
             limit=_EXAMPLE_LIMIT,
         )
+    for field_name in ("use_cases", "anti_use_cases"):
+        values = _clean_texts(override.get(field_name))
+        if values:
+            update[field_name] = _merge_texts(
+                list(getattr(snapshot, field_name)),
+                values,
+                limit=_CASE_LIMIT,
+            )
+    intent_types = _clean_texts(override.get("intent_types"))
+    if intent_types:
+        update["intent_types"] = _merge_texts(
+            snapshot.intent_types,
+            intent_types,
+            limit=_CASE_LIMIT,
+        )
+    for field_name, allowed in _ENUM_FIELDS.items():
+        value = normalize_message_text(str(override.get(field_name, "") or ""))
+        if value in allowed:
+            update[field_name] = value
+    if "risk" in update:
+        update["risk_level"] = update["risk"]
+    for field_name in _BOOL_FIELDS:
+        value = override.get(field_name)
+        if isinstance(value, bool):
+            update[field_name] = value
     if not update:
         return snapshot
+    update["source"] = "override"
     return snapshot.model_copy(update=update)
 
 

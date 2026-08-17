@@ -21,6 +21,10 @@ class TurnBudgetSnapshot:
     prompt_tokens: int
     completion_tokens: int
     cached_prompt_tokens: int
+    cache_observed_prompt_tokens: int
+    cache_unknown_prompt_tokens: int
+    cache_observed_model_calls: int
+    cache_unknown_model_calls: int
     durations_ms: dict[str, float]
 
 
@@ -39,6 +43,10 @@ class TurnBudgetController:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cached_prompt_tokens: int = 0
+    cache_observed_prompt_tokens: int = 0
+    cache_unknown_prompt_tokens: int = 0
+    cache_observed_model_calls: int = 0
+    cache_unknown_model_calls: int = 0
     durations: defaultdict[str, float] = field(
         default_factory=lambda: defaultdict(float)
     )
@@ -110,10 +118,18 @@ class TurnBudgetController:
         prompt_tokens: int,
         completion_tokens: int,
         cached_prompt_tokens: int = 0,
+        cache_observed: bool = False,
     ) -> None:
-        self.prompt_tokens += max(int(prompt_tokens), 0)
+        normalized_prompt = max(int(prompt_tokens), 0)
+        self.prompt_tokens += normalized_prompt
         self.completion_tokens += max(int(completion_tokens), 0)
         self.cached_prompt_tokens += max(int(cached_prompt_tokens), 0)
+        if cache_observed:
+            self.cache_observed_prompt_tokens += normalized_prompt
+            self.cache_observed_model_calls += 1
+        else:
+            self.cache_unknown_prompt_tokens += normalized_prompt
+            self.cache_unknown_model_calls += 1
 
     def prompt_budget_remaining(self) -> int:
         return max(self.prompt_budget_tokens - self.prompt_tokens, 0)
@@ -127,6 +143,10 @@ class TurnBudgetController:
             prompt_tokens=self.prompt_tokens,
             completion_tokens=self.completion_tokens,
             cached_prompt_tokens=self.cached_prompt_tokens,
+            cache_observed_prompt_tokens=self.cache_observed_prompt_tokens,
+            cache_unknown_prompt_tokens=self.cache_unknown_prompt_tokens,
+            cache_observed_model_calls=self.cache_observed_model_calls,
+            cache_unknown_model_calls=self.cache_unknown_model_calls,
             durations_ms={
                 key: round(value * 1000, 2)
                 for key, value in sorted(self.durations.items())

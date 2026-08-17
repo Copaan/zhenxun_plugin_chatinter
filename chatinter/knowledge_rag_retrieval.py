@@ -9,13 +9,13 @@ import re
 import time
 from typing import ClassVar
 
+from zhenxun.services.cache import BoundedTTLCache
 from zhenxun.services.log import logger
 
 from .llm_compat import embed_documents, embed_query, list_embedding_models
 from .models.pydantic_models import PluginInfo, PluginKnowledgeBase
 from .route_text import contains_any, normalize_message_text
 from .schema_policy import resolve_command_target_policy
-from .target_policy import get_target_policy
 from .vector_store import (
     BM25LexicalIndex,
     VectorDocument,
@@ -166,15 +166,8 @@ def _build_doc_metadata(plugin: PluginInfo) -> dict[str, bool]:
     target_capable = False
     image_capable = False
     self_only = False
-    adapter_policy = get_target_policy(
-        plugin_module=plugin.module,
-        plugin_name=plugin.name,
-    )
     for meta in plugin.command_meta:
-        policy = resolve_command_target_policy(
-            meta,
-            adapter_policy=adapter_policy,
-        )
+        policy = resolve_command_target_policy(meta)
         if policy.allow_at or bool(policy.target_sources & {"at", "reply", "nickname"}):
             target_capable = True
         image_min = getattr(meta, "image_min", None)
@@ -321,7 +314,12 @@ class PluginRAGRetrievalMixin:
     _embedding_supported: ClassVar[bool | None] = None
     _index_meta: ClassVar[dict[str, str]] = {}
     _cache_version: ClassVar[int] = 0
-    _query_cache: ClassVar[dict[str, tuple[float, list[str]]]] = {}
+    _query_cache: ClassVar[BoundedTTLCache[str, list[str]]] = BoundedTTLCache(
+        "chatinter_plugin_rag_queries",
+        ttl_seconds=_QUERY_CACHE_TTL,
+        max_items=_QUERY_CACHE_MAX_SIZE,
+        sizeof=lambda modules: sum(len(module.encode("utf-8")) for module in modules),
+    )
     _vector_store: ClassVar[VectorStore] = create_vector_store("plugin_rag")
     _lexical_index: ClassVar[BM25LexicalIndex] = BM25LexicalIndex()
 
@@ -378,30 +376,17 @@ class PluginRAGRetrievalMixin:
         return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
     @classmethod
-    def _get_cached_modules(cls, cache_key: str) -> list[str] | None:
-        cached = cls._query_cache.get(cache_key)
-        if not cached:
-            return None
-        ts, modules = cached
-        if (time.monotonic() - ts) > _QUERY_CACHE_TTL:
-            cls._query_cache.pop(cache_key, None)
-            return None
-        return modules[:]
+    async def _get_cached_modules(cls, cache_key: str) -> list[str] | None:
+        modules = await cls._query_cache.get(cache_key)
+        return modules[:] if modules else None
 
     @classmethod
-    def _set_cached_modules(cls, cache_key: str, modules: list[str]) -> None:
-        cls._query_cache[cache_key] = (time.monotonic(), modules[:])
-        if len(cls._query_cache) <= _QUERY_CACHE_MAX_SIZE:
-            return
-        stale_keys = sorted(cls._query_cache.items(), key=lambda item: item[1][0])[
-            : max(8, _QUERY_CACHE_MAX_SIZE // 8)
-        ]
-        for key, _ in stale_keys:
-            cls._query_cache.pop(key, None)
+    async def _set_cached_modules(cls, cache_key: str, modules: list[str]) -> None:
+        await cls._query_cache.set(cache_key, modules[:])
 
     @classmethod
-    def _clear_query_cache(cls) -> None:
-        cls._query_cache.clear()
+    async def _clear_query_cache(cls) -> None:
+        await cls._query_cache.clear()
 
     @classmethod
     async def _load_persisted_index(cls) -> None:
@@ -585,7 +570,7 @@ class PluginRAGRetrievalMixin:
 
         if changed:
             cls._cache_version += 1
-            cls._clear_query_cache()
+            await cls._clear_query_cache()
             cls._index_meta = {
                 "cache_version": str(cls._cache_version),
                 "updated_at": str(int(time.time())),
@@ -744,7 +729,7 @@ class PluginRAGRetrievalMixin:
                 session_id=session_id,
                 options=options,
             )
-            cached_modules = cls._get_cached_modules(cache_key)
+            cached_modules = await cls._get_cached_modules(cache_key)
             if cached_modules:
                 selected_plugins: list[PluginInfo] = []
                 for module in cached_modules:
@@ -893,7 +878,7 @@ class PluginRAGRetrievalMixin:
                     continue
                 selected.append(doc.plugin)
             if selected:
-                cls._set_cached_modules(
+                await cls._set_cached_modules(
                     cache_key,
                     [plugin.module for plugin in selected if plugin.module],
                 )

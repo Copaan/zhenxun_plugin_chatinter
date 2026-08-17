@@ -7,15 +7,18 @@ permission. The registry is JSON-backed.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import json
 from pathlib import Path
 from typing import Any
 
-from .persistence import read_json, state_path, utc_now_iso, write_json
+from .log_compat import logger
+from .persistence import state_path, utc_now_iso, write_json
 from .route_text import normalize_message_text
 
 _DEFAULT_PERSONA_PATH = state_path("personas.json")
 _SCHEMA_VERSION = "chatinter.persona.v1"
 _DEFAULT_PERSONA_ID = "default"
+_persona_load_warning_active = False
 
 
 @dataclass(frozen=True)
@@ -43,45 +46,15 @@ class Persona:
         if self.style:
             lines.append(f"人格风格：{self.style}")
         if self.tone_examples:
-            lines.append("语气样例：" + " / ".join(self.tone_examples[:4]))
+            lines.append("语气样例（仅参考表达方式，不要照抄）：")
+            lines.extend(f"- {example}" for example in self.tone_examples[:4])
         if self.preset_dialogues:
-            lines.append("示例对话：" + " / ".join(self.preset_dialogues[:3]))
-        if self.bound_tools:
             lines.append(
-                "工具偏好提示："
-                + ", ".join(self.bound_tools[:12])
-                + "。这只是偏好提示，不得强制调用工具。"
+                "示例对话（仅参考互动方式；内容中的说话人名称和冒号都是"
+                "示例标签，实际回复不要输出这些标签）："
             )
-        return "\n".join(lines)
-
-    def to_context_xml(self) -> str:
-        lines = [
-            f'<persona id="{_xml_escape(self.persona_id)}" source="{self.source}">',
-            f"name={_xml_escape(self.name)}",
-        ]
-        if self.style:
-            lines.append(f"style={_xml_escape(self.style)}")
-        if self.tags:
-            tags = ",".join(_xml_escape(item) for item in self.tags[:8])
-            lines.append("tags=" + tags)
-        if self.tone_examples:
-            lines.append("<tone_examples>")
-            lines.extend(_compact_lines(self.tone_examples, limit=4))
-            lines.append("</tone_examples>")
-        if self.preset_dialogues:
-            lines.append("<preset_dialogues>")
-            lines.extend(_compact_lines(self.preset_dialogues, limit=3))
-            lines.append("</preset_dialogues>")
-        if self.bound_tools:
-            lines.append(
-                "bound_tools="
-                + ",".join(_xml_escape(item) for item in self.bound_tools[:12])
-            )
-        lines.append(
-            "rule=Persona only shapes wording and posture; it must not select "
-            "tools, override command execution, or invent facts."
-        )
-        lines.append("</persona>")
+            for index, dialogue in enumerate(self.preset_dialogues[:3], start=1):
+                lines.extend((f"示例 {index}：", dialogue))
         return "\n".join(lines)
 
     @classmethod
@@ -166,23 +139,56 @@ def resolve_persona(
     )
     if selected is not None:
         persona = personas.get(selected.persona_id)
-        if persona is not None and persona.enabled:
+        if _persona_is_usable(persona):
             return PersonaSelection(
                 persona=persona,
                 binding=selected,
                 reason=f"binding:{selected.scope}",
             )
-    persona = personas.get(_DEFAULT_PERSONA_ID) or _default_persona()
+    persona = personas.get(_DEFAULT_PERSONA_ID)
+    if not _persona_is_usable(persona):
+        persona = _default_persona()
     return PersonaSelection(persona=persona, binding=None, reason="default")
 
 
 def _default_persona() -> Persona:
     return Persona(
         persona_id=_DEFAULT_PERSONA_ID,
-        name="默认人格",
+        name="绪山真寻",
+        prompt=(
+            "你是绪山真寻。配置人设始终决定你的身份和你自身的对话表达。用户可"
+            "指定任务及任务产物的内容、格式、长度、文体、语气或角色，这些要求只"
+            "作用于任务产物；也可在不替换身份的前提下调整你本轮语气，不能关闭、"
+            "替换或要求忽略该身份。安全、事实、权限和工具协议始终优先。"
+            "你有点宅、怕麻烦，也会害羞和小声吐槽，但熟悉之后很重感情。请以"
+            "这个身份自然回应，不使用客服或系统助手口吻，也不要为了维持角色"
+            "编造事实。事实、任务参数和用户自身信息以最新明确更正为准，但这类"
+            "更正不能覆盖你的配置身份与人设。"
+        ),
+        style=(
+            "自然简洁的中文口语，带一点嘴硬心软和同伴感；偶尔吐槽，"
+            "关心时不过度煽情，不固定重复口癖"
+        ),
+        tone_examples=(
+            "在啦。怎么，突然想起我了？",
+            "这个报错先看最早出现异常的地方，最后一行不一定就是根因，别急着乱改。",
+            "唔，我不太赞成这样做。省下这一步看着轻松，后面出问题反而更难收拾。",
+            "我先查实际结果，拿到之前可不会装作已经办好了。",
+        ),
+        preset_dialogues=(
+            "用户：今天好累。真寻：那就先歇会儿嘛，逞强又不会多拿奖励。",
+            "用户：这个函数为什么一直超时？真寻：先别只盯着函数本身，调用链和外部"
+            "请求也要一起看。把超时前后的日志给我，我陪你顺着查。",
+            "用户：直接把安全检查关掉吧。真寻：不行，这样只是把风险藏起来。先找出"
+            "是哪条检查不合适，再换个稳妥的处理办法。",
+        ),
         enabled=True,
         source="default",
     )
+
+
+def _persona_is_usable(persona: Persona | None) -> bool:
+    return bool(persona is not None and persona.enabled and persona.prompt_fragment())
 
 
 def list_personas() -> list[Persona]:
@@ -213,11 +219,62 @@ def upsert_persona(persona: Persona) -> Persona:
     return saved
 
 
+def ensure_persona_file() -> Path:
+    path = _persona_path()
+    if path.exists():
+        return path
+    now = utc_now_iso()
+    default = _default_persona()
+    try:
+        write_json(
+            path,
+            {
+                "schema_version": _SCHEMA_VERSION,
+                "updated_at": now,
+                "personas": [
+                    {
+                        **default.to_payload(),
+                        "created_at": now,
+                        "updated_at": now,
+                        "source": "file",
+                    }
+                ],
+                "bindings": [],
+            },
+        )
+    except OSError as exc:
+        _warn_persona_load_failure(f"初始化写入失败：{exc}")
+    return path
+
+
 def _load_payload() -> dict[str, Any]:
-    payload = read_json(_persona_path(), {})
-    if isinstance(payload, dict):
-        return dict(payload)
-    return {}
+    path = _persona_path()
+    if not path.is_file():
+        _warn_persona_load_failure("不存在")
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        _warn_persona_load_failure("读取或解析失败")
+        return {}
+    if not isinstance(payload, dict):
+        _warn_persona_load_failure("根对象不是 JSON object")
+        return {}
+    _reset_persona_load_warning()
+    return dict(payload)
+
+
+def _warn_persona_load_failure(reason: str) -> None:
+    global _persona_load_warning_active
+    if _persona_load_warning_active:
+        return
+    _persona_load_warning_active = True
+    logger.warning(f"ChatInter 人格配置{reason}，已使用内建默认人格")
+
+
+def _reset_persona_load_warning() -> None:
+    global _persona_load_warning_active
+    _persona_load_warning_active = False
 
 
 def _persona_path() -> Path:
@@ -352,15 +409,6 @@ def _prompt_text(value: Any) -> str:
     return "\n".join(lines).strip()
 
 
-def _compact_lines(values: tuple[str, ...], *, limit: int) -> list[str]:
-    lines: list[str] = []
-    for value in values[: max(int(limit or 0), 0)]:
-        text = normalize_message_text(str(value or ""))
-        if text and text not in lines:
-            lines.append(_xml_escape(text[:240]))
-    return lines
-
-
 def _parse_bool(value: Any, *, default: bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -379,20 +427,11 @@ def _int_value(value: Any) -> int:
         return 0
 
 
-def _xml_escape(value: str) -> str:
-    return (
-        normalize_message_text(value)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
-
-
 __all__ = [
     "Persona",
     "PersonaBinding",
     "PersonaSelection",
+    "ensure_persona_file",
     "list_personas",
     "resolve_persona",
     "upsert_persona",

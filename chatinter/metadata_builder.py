@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
 from pathlib import Path
 import re
@@ -25,7 +26,7 @@ class AutoMetadataBuilder:
     _module_alias_cache: ClassVar[dict[str, tuple[int, dict[str, list[str]]]]] = {}
     _module_prefix_cache: ClassVar[dict[str, tuple[int, dict[str, list[str]]]]] = {}
     _module_shortcut_render_cache: ClassVar[
-        dict[str, dict[str, list[dict[str, object]]]]
+        dict[str, tuple[int, dict[str, list[dict[str, object]]]]]
     ] = {}
     _module_context_cache: ClassVar[
         dict[str, tuple[int, dict[str, dict[str, bool]]]]
@@ -80,6 +81,7 @@ class AutoMetadataBuilder:
     ) -> list[dict[str, Any]]:
         matcher_commands: list[dict[str, Any]] = []
         if loaded_plugin is not None:
+            await asyncio.to_thread(cls._warm_matcher_source_caches, loaded_plugin)
             matcher_commands.extend(
                 cls._extract_matcher_command_data(
                     loaded_plugin=loaded_plugin,
@@ -101,6 +103,18 @@ class AutoMetadataBuilder:
                     f"ChatInter 自动元数据构建未从插件提取到命令: {module_name}"
                 )
         return cls._merge_command_dicts(extracted)
+
+    @classmethod
+    def _warm_matcher_source_caches(cls, loaded_plugin: object) -> None:
+        cls._build_module_alias_map(loaded_plugin)
+        cls._build_module_prefix_map(loaded_plugin)
+        cls._build_module_shortcut_render_map(loaded_plugin)
+        for matcher in cls._iter_plugin_matchers(loaded_plugin):
+            module_obj = getattr(matcher, "module", None)
+            if module_obj is not None:
+                cls._load_module_access_map(module_obj)
+                cls._load_module_context_map(module_obj)
+            cls._extract_handler_hint(matcher)
 
     @classmethod
     def _extract_matcher_command_data(
@@ -665,10 +679,9 @@ class AutoMetadataBuilder:
         if isinstance(raw_aliases, list | tuple | set | frozenset):
             for alias in raw_aliases:
                 alias_text = cls._normalize_command(str(alias or ""))
-                if (
-                    alias_text.startswith("re:")
-                    and command_head in cls._extract_regex_heads(alias_text[3:])
-                ):
+                if alias_text.startswith(
+                    "re:"
+                ) and command_head in cls._extract_regex_heads(alias_text[3:]):
                     continue
                 if alias_text and alias_text != command_head:
                     aliases.append(alias_text)
@@ -1481,10 +1494,10 @@ class AutoMetadataBuilder:
         except OSError:
             return {}
 
-        cache_key = f"shortcut_render:{path}:{mtime_ns}"
-        cached = getattr(cls, "_module_shortcut_render_cache", {}).get(cache_key)
-        if cached is not None:
-            return cached
+        cache_key = str(path)
+        cached = cls._module_shortcut_render_cache.get(cache_key)
+        if cached is not None and cached[0] == mtime_ns:
+            return cached[1]
 
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -1500,9 +1513,7 @@ class AutoMetadataBuilder:
                 shortcut_aliases,
                 shortcut_args,
                 optional_params,
-            ) = (
-                cls._extract_shortcut_render_from_call_node(node)
-            )
+            ) = cls._extract_shortcut_render_from_call_node(node)
             if not shortcut_command or not shortcut_aliases:
                 continue
             entries = render_map.setdefault(shortcut_command.casefold(), [])
@@ -1520,7 +1531,7 @@ class AutoMetadataBuilder:
         render_map = {
             key: cls._merge_shortcut_renders(value) for key, value in render_map.items()
         }
-        cls._module_shortcut_render_cache[cache_key] = render_map
+        cls._module_shortcut_render_cache[cache_key] = (mtime_ns, render_map)
         return render_map
 
     @classmethod

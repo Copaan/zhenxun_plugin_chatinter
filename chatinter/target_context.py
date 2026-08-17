@@ -11,6 +11,10 @@ from zhenxun.configs.config import BotConfig
 from zhenxun.services import logger
 
 from .member_similarity import (
+    ALIAS_AMBIGUOUS_GAP,
+    ALIAS_AMBIGUOUS_TOP,
+    ALIAS_MATCH_THRESHOLD,
+    ALIAS_MEMORY_WRITE_THRESHOLD,
     MemberAliasEntry,
     build_member_alias_entries,
     score_member_alias,
@@ -52,7 +56,6 @@ _FUZZY_TARGET_SUFFIX_PATTERN = re.compile(
     r"(?P<name>[A-Za-z0-9\u4e00-\u9fff]{2,16})(?:\u7684)?"
     r"(?=(?:\u8868\u60c5|\u5934\u50cf|\u56fe\u7247|\u56fe|\u770b\u4e66|\u7b7e\u5230|\u6253\u5361|\u4e00\u76f4|\u6572|\u5403|\u6478|\u62b1|\u6376|\u9876|\u6253|\u8d34|\u6478\u6478|[\s\uff0c,\u3002.!\uff01\uff1f?]|$))"
 )
-_SELF_ONLY_ACTION_KEYWORDS = ("\u7b7e\u5230", "\u6253\u5361", "\u8865\u7b7e")
 _TARGET_REQUIRED_ACTION_HINTS = (
     "\u7ed9",
     "\u5e2e",
@@ -105,7 +108,8 @@ _TARGET_HINT_LEADING_NOISE_PATTERN = re.compile(
     r"^(?:"
     r"给|帮|替|让|叫|喊|请|把|将|用|拿|"
     r"做个|做一个|做一张|做|制作一个|制作一张|制作|"
-    r"整一个|整一张|整|弄一个|弄一张|弄|来个|来一个|来一张|来"
+    r"整一个|整一张|整|弄一个|弄一张|弄|来个|来一个|来一张|来|"
+    r"一下|一把|一个|一张"
     r")+"
 )
 _TARGET_HINT_TRAILING_NOISE_PATTERN = re.compile(
@@ -207,7 +211,7 @@ def _alias_entries_to_keys(
     keys = {
         entry.value
         for entry in entries
-        if entry.kind != "suffix" and len(entry.value) >= 2
+        if entry.kind not in ("suffix", "prefix") and len(entry.value) >= 2
     }
     return tuple(sorted(keys, key=len, reverse=True))
 
@@ -344,9 +348,6 @@ async def _get_group_member_profiles_for_fuzzy(
         ):
             continue
         profiles.append(profile)
-
-
-
 
     for profile in await _get_recent_chat_member_profiles(group_id):
         user_id = str(profile.get("user_id") or "").strip()
@@ -598,7 +599,10 @@ def _pick_fuzzy_target_profile(
         has_exact_full_alias = False
         for alias_entry in _profile_alias_entries(profile):
             best_score = max(best_score, score_member_alias(hint, alias_entry))
-            if alias_entry.kind != "suffix" and hint == alias_entry.value:
+            if (
+                alias_entry.kind not in ("suffix", "prefix")
+                and hint == alias_entry.value
+            ):
                 has_exact_full_alias = True
         if best_score >= match_threshold:
             ranked.append(
@@ -668,8 +672,15 @@ def _profile_alias_entries(
 
 def _fuzzy_match_thresholds(trigger_strength: str) -> tuple[float, float, float, float]:
     if (trigger_strength or "weak").lower() == "strong":
+        # strong-trigger 档位是刻意放宽的独立阈值组，与下方 weak 档的共享常量
+        # 无关联，保持原字面量不变。
         return 0.72, 0.72, 0.86, 0.08
-    return 0.80, 0.86, 0.92, 0.12
+    return (
+        0.80,
+        ALIAS_MATCH_THRESHOLD,
+        ALIAS_AMBIGUOUS_TOP,
+        ALIAS_AMBIGUOUS_GAP,
+    )
 
 
 async def _pick_registered_alias_profile(
@@ -710,8 +721,7 @@ async def _pick_registered_alias_profile(
             (
                 score,
                 bool(
-                    matched_alias
-                    and matched_alias == _normalize_alias_key(target_hint)
+                    matched_alias and matched_alias == _normalize_alias_key(target_hint)
                 ),
                 active_scores.get(user_id, 0.0),
                 _person_profile_to_target_profile(profile),
@@ -767,13 +777,6 @@ def _person_profile_to_target_profile(
     }
 
 
-def _is_self_only_action_message(message_text: str) -> bool:
-    normalized = normalize_message_text(message_text or "")
-    if not normalized:
-        return False
-    return any(keyword in normalized for keyword in _SELF_ONLY_ACTION_KEYWORDS)
-
-
 def _is_technical_request_like(message_text: str) -> bool:
     normalized = normalize_message_text(message_text or "").lower()
     if not normalized:
@@ -817,9 +820,6 @@ def _resolve_fuzzy_trigger_strength(
     ):
         return "strong"
     if command_heads and has_adapter_context_hint(normalized_original, policy):
-
-
-
         if _extract_fuzzy_target_hint(normalized_route, command_heads):
             return "weak"
     if command_heads:
@@ -959,7 +959,7 @@ async def _enrich_route_message_with_fuzzy_target(
                 f"hint='{target_hint}' -> "
                 f"{mention_profiles[user_id].get('display_name')}(@{user_id})"
             )
-            if top_score >= 0.90:
+            if top_score >= ALIAS_MEMORY_WRITE_THRESHOLD:
                 _remember_target_resolution(group_id, target_hint, user_id)
             return enriched_message, mention_profiles, None
 
@@ -1014,7 +1014,7 @@ async def _enrich_route_message_with_fuzzy_target(
         f"hint='{target_hint}' -> "
         f"{mention_profiles[user_id].get('display_name')}(@{user_id})"
     )
-    if top_score >= 0.90:
+    if top_score >= ALIAS_MEMORY_WRITE_THRESHOLD:
         _remember_target_resolution(group_id, target_hint, user_id)
     return enriched_message, mention_profiles, None
 

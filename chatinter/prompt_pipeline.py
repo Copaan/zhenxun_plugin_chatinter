@@ -8,8 +8,6 @@ chat-degrade split no longer exists.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
-
 from nonebot.adapters import Bot, Event
 from nonebot_plugin_uninfo import Uninfo
 
@@ -17,8 +15,9 @@ from .group_plugin_flow import (
     stage_group_capability_hint,
     stage_route_media_context,
 )
-from .middleware import get_middleware_manager
+from .gscore_adapter import get_gscore_adapter
 from .pipeline_stages import (
+    complete_suppressed_turn,
     handle_pipeline_cancelled,
     handle_pipeline_error,
     stage_chat_capability_hint,
@@ -35,8 +34,6 @@ from .pipeline_stages import (
 from .turn_frame import TurnFrame
 from .unified_flow import stage_unified_run
 
-PostGateCallback = Callable[..., Awaitable[None]]
-
 
 class PromptPipeline:
     """ChatLuna-style pipeline over a mutable ``TurnFrame``."""
@@ -50,17 +47,13 @@ class PromptPipeline:
         session: Uninfo,
         message,
         cached_plain_text: str | None,
-        post_gate_callback: PostGateCallback,
     ) -> None:
-        middleware = get_middleware_manager()
         frame.bind_runtime(
             bot=bot,
             event=event,
             session=session,
             message=message,
             cached_plain_text=cached_plain_text,
-            middleware=middleware,
-            post_gate_callback=post_gate_callback,
         )
         await self.run(frame)
 
@@ -68,14 +61,10 @@ class PromptPipeline:
         bot = _require(frame.bot, "bot")
         event = _require(frame.event, "event")
         session = _require(frame.session, "session")
-        middleware = _require(frame.middleware, "middleware")
-        middleware_state = _require(frame.middleware_state, "middleware_state")
 
         await stage_identity(
             frame=frame,
             event=event,
-            middleware_state=middleware_state,
-            middleware=middleware,
         )
         await stage_event_context(
             frame=frame,
@@ -85,6 +74,17 @@ class PromptPipeline:
             message=frame.message,
             cached_plain_text=frame.cached_plain_text,
         )
+        gscore_route = await get_gscore_adapter().route_turn(frame)
+        frame.update_tags(
+            gscore_route=gscore_route.disposition,
+            gscore_matches=float(len(gscore_route.matches)),
+        )
+        if gscore_route.suppress_chatinter:
+            complete_suppressed_turn(
+                frame,
+                reason=f"gscore_{gscore_route.disposition}",
+            )
+            return
         await stage_thread_context(frame=frame)
         if frame.allow_plugin_tools:
             await stage_route_media_context(frame=frame, bot=bot, event=event)
@@ -92,8 +92,6 @@ class PromptPipeline:
                 frame=frame,
                 bot=bot,
                 event=event,
-                middleware_state=middleware_state,
-                middleware=middleware,
                 cached_plain_text=frame.cached_plain_text,
             )
         else:
@@ -101,8 +99,6 @@ class PromptPipeline:
                 frame=frame,
                 bot=bot,
                 event=event,
-                middleware_state=middleware_state,
-                middleware=middleware,
                 cached_plain_text=frame.cached_plain_text,
             )
         await stage_dialogue_state(frame=frame)
@@ -110,15 +106,11 @@ class PromptPipeline:
         await stage_current_user(frame=frame, message=frame.message)
         await stage_scratchpad(
             frame=frame,
-            middleware_state=middleware_state,
-            middleware=middleware,
         )
         await stage_unified_run(
             frame=frame,
             bot=bot,
             event=event,
-            middleware_state=middleware_state,
-            middleware=middleware,
         )
         await stage_send(frame)
         await stage_persist(frame)

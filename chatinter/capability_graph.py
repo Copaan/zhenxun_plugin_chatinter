@@ -58,6 +58,10 @@ _INFRA_MODULE_MARKERS = (
     ".webui",
     ".web_ui",
 )
+_INFRA_MODULE_ROOTS = {
+    "zhenxun.builtin_plugins.admin",
+    "zhenxun.builtin_plugins.superuser",
+}
 _PRIVATE_ACCESS_LEVELS = {"admin", "superuser", "restricted"}
 
 
@@ -90,6 +94,11 @@ def is_public_capability_source(plugin: PluginInfo) -> bool:
         return False
     module_lower = module.lower()
     if _module_tail(module_lower) in _INFRA_MODULE_TAILS:
+        return False
+    if any(
+        module_lower == root or module_lower.startswith(f"{root}.")
+        for root in _INFRA_MODULE_ROOTS
+    ):
         return False
     if any(marker in module_lower for marker in _INFRA_MODULE_MARKERS):
         return False

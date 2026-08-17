@@ -224,6 +224,8 @@ def permission_reason_text(result: PermissionResult) -> str:
     if result.decision == "ask":
         if result.reason == "dangerous_operation":
             return "该命令可能删除、发布或改变系统状态，需要你的确认"
+        if result.reason == "active_task_requires_approval":
+            return "该操作会创建或更改可在未来主动运行的任务，需要你的确认"
         return "该操作会修改文件、进程或外部状态，需要你的确认"
     return "当前权限模式允许该操作"
 
@@ -330,6 +332,44 @@ def decide_file_write(path: str, *, mode: str | None = None) -> PermissionResult
         ask_pattern or value,
     )
     return _apply_conversation_grant(pending)
+
+
+def decide_active_task(
+    action: str,
+    *,
+    mode: str | None = None,
+) -> PermissionResult:
+    normalized_action = _normalize_text(action).casefold()
+    if normalized_action == "list":
+        return PermissionResult("allow", "read_only_operation")
+    if normalized_action not in {
+        "create",
+        "update",
+        "pause",
+        "resume",
+        "delete",
+        "run_now",
+        "rotate_webhook",
+    }:
+        return PermissionResult("deny", "default_deny", section="active_task")
+    permission_mode = _resolve_permission_mode(mode)
+    if permission_mode == "full_access":
+        return PermissionResult(
+            "allow",
+            "full_access_mode_allow",
+            section="active_task",
+        )
+    if permission_mode == "read_only":
+        return PermissionResult(
+            "deny",
+            "read_only_mode_deny",
+            section="active_task",
+        )
+    return PermissionResult(
+        "ask",
+        "active_task_requires_approval",
+        section="active_task",
+    )
 
 
 def _resolve_permission_mode(
@@ -728,6 +768,7 @@ __all__ = [
     "PermissionResult",
     "clear_conversation_permissions",
     "conversation_has_workspace_shell_grant",
+    "decide_active_task",
     "decide_file_read",
     "decide_file_write",
     "decide_shell",

@@ -371,7 +371,10 @@ class ApplyPatchTool:
         return ToolDefinition(
             name=self.name,
             description=(
-                "原子应用一个或多个文件的 V4A 补丁，支持新增、更新、删除和移动。"
+                "原子应用一个或多个文件补丁，支持新增、更新、删除和移动。"
+                "格式为 *** Begin Patch，随后使用 *** Add File、"
+                "*** Update File、*** Delete File 或 *** Move to，"
+                "最后以 *** End Patch 结束。"
             ),
             parameters={
                 "type": "object",

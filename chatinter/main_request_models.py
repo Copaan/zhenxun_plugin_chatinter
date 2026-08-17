@@ -21,6 +21,7 @@ class MainRequestOutput:
     feedback_kind: str = "chat_completed"
     record_chat_feedback: bool = True
     observation_reason: str = "chat_completed"
+    tool_outcome: str = ""
 
 
 @dataclass(frozen=True)

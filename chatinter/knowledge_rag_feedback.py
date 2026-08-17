@@ -198,7 +198,9 @@ class PluginRAGFeedbackMixin:
             cls._session_preference_time[session_id] = now
             clear_query_cache = getattr(cls, "_clear_query_cache", None)
             if callable(clear_query_cache):
-                clear_query_cache()
+                cleared = clear_query_cache()
+                if asyncio.iscoroutine(cleared):
+                    await cleared
 
     @classmethod
     def _session_pref_scores(cls, session_id: str | None) -> dict[str, float]:

@@ -27,8 +27,18 @@ _USAGE_LINE_PREFIX_PATTERN = re.compile(
 )
 _HELP_ROLE_TERMS = ("帮助", "说明", "用法", "教程", "参数", "示例", "文档", "列表")
 _RANDOM_ROLE_TERMS = ("随机", "抽", "roll", "掷", "选择", "塔罗")
-_TEMPLATE_ROLE_TERMS = ("生成", "制作", "做", "表情", "模板", "绘制", "画图", "图片")
-_QUERY_ROLE_TERMS = ("查询", "查看", "搜索", "识别", "解析", "翻译", "统计", "排行")
+_TEMPLATE_ROLE_TERMS = ("生成", "制作", "做", "绘制", "画图")
+_QUERY_ROLE_TERMS = (
+    "查询",
+    "查看",
+    "搜索",
+    "识别",
+    "解析",
+    "翻译",
+    "统计",
+    "排行",
+    "详情",
+)
 _SELF_SCOPE_TERMS = ("我的", "自己", "本人", "个人", "我")
 _ASCII_TARGET_TERMS = {"at", "user", "member", "target", "nickname"}
 _CJK_TARGET_TERMS = ("用户", "成员", "群友", "目标", "对象", "昵称")
@@ -65,6 +75,7 @@ def _schema(
     render: str | None = None,
     requires: dict[str, bool] | None = None,
     allow_at: bool | None = None,
+    allow_sticky_arg: bool = False,
     actor_scope: str = "allow_other",
     target_requirement: str = "none",
     target_sources: list[str] | None = None,
@@ -110,6 +121,7 @@ def _schema(
             **dict(requires or {}),
         },
         allow_at=allow_at,  # type: ignore[arg-type]
+        allow_sticky_arg=allow_sticky_arg,
         actor_scope=actor_scope,  # type: ignore[arg-type]
         target_requirement=target_requirement,  # type: ignore[arg-type]
         target_sources=list(target_sources or []),  # type: ignore[arg-type]
@@ -654,20 +666,6 @@ def _command_description(
     ]
     if examples:
         parts.append("示例: " + " / ".join(examples))
-    requirement = command.requirement
-    requirement_parts: list[str] = []
-    if requirement.params:
-        requirement_parts.append("参数: " + " ".join(requirement.params))
-    if requirement.text_min > 0:
-        requirement_parts.append(f"至少{requirement.text_min}段文本")
-    if requirement.image_min > 0:
-        requirement_parts.append(f"至少{requirement.image_min}张图片")
-    if requirement.requires_reply:
-        requirement_parts.append("需要回复上下文")
-    if requirement.target_requirement == "required":
-        requirement_parts.append("需要明确目标")
-    if requirement_parts:
-        parts.append("；".join(requirement_parts))
     if include_global_context and usage_lines:
         parts.append("用法: " + " / ".join(usage_lines[:3]))
     if not parts:
@@ -847,6 +845,17 @@ def schema_from_capability(
         plugin_description=plugin_description,
         include_global_context=include_global_context,
     )
+    role_text = normalize_message_text(
+        " ".join(
+            [
+                head,
+                raw_command,
+                command.description,
+                " ".join(command.examples),
+                " ".join(usage_lines),
+            ]
+        )
+    )
     metadata_text = normalize_message_text(
         " ".join(
             [
@@ -861,7 +870,7 @@ def schema_from_capability(
             ]
         )
     )
-    command_role = _command_role_from_text(text=metadata_text, requirement=requirement)
+    command_role = _command_role_from_text(text=role_text, requirement=requirement)
     actor_scope = _actor_scope_from_text(requirement.actor_scope, metadata_text)
     target_requirement = _target_requirement_from_slots(
         _target_requirement_from_capability(command),
@@ -901,6 +910,7 @@ def schema_from_capability(
         requires=requires,
         allow_at=_capability_accepts_at_target(command)
         or any(slot.type == "at" for slot in slots),
+        allow_sticky_arg=command.allow_sticky_arg,
         actor_scope=actor_scope,
         target_requirement=target_requirement,
         target_sources=target_sources,
@@ -1062,7 +1072,12 @@ def build_command_schemas(
                 continue
             seen.add(shortcut_schema.command_id)
             schemas.append(shortcut_schema)
-    return schemas
+    return [
+        schema.model_copy(update={"shortcut_renders": []}, deep=True)
+        if schema.shortcut_renders
+        else schema
+        for schema in schemas
+    ]
 
 
 def complete_slots(

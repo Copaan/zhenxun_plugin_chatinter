@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from html import escape
 import re
-import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from zhenxun.services.cache import BoundedTTLCache
 
 from .memory_feedback_reranker import MemoryFeedbackReranker
 from .memory_recall_context import (
@@ -24,7 +27,7 @@ _GROUP_RECALL_THRESHOLD = 0.38
 _GROUP_CONTEXT_RECALL_THRESHOLD = 0.26
 _RECENT_WRITE_CACHE_TTL = 60.0
 _RECENT_WRITE_CACHE_MAX = 512
-_recent_writes: dict[str, float] = {}
+_recent_writes: BoundedTTLCache[str, bool] | None = None
 _TEXT_TOKEN_PATTERN = re.compile(r"[a-z0-9_]+|[\u4e00-\u9fff]+", re.IGNORECASE)
 _PROFILE_MEMORY_TYPES = {
     "nickname",
@@ -106,7 +109,7 @@ class LayeredMemoryRecall:
             if not values:
                 continue
             lines.append(f"<{tag}>")
-            lines.extend(values)
+            lines.extend(escape(str(value), quote=False) for value in values)
             lines.append(f"</{tag}>")
         return lines
 
@@ -154,18 +157,25 @@ def _write_cache_key(
     )
 
 
-def _remember_recent_write(key: str) -> bool:
-    now = time.monotonic()
-    expired = [item for item, deadline in _recent_writes.items() if deadline <= now]
-    for item in expired:
-        _recent_writes.pop(item, None)
-    if key in _recent_writes:
+async def _remember_recent_write(key: str) -> bool:
+    cache = _recent_write_cache()
+    if await cache.get(key):
         return False
-    if len(_recent_writes) >= _RECENT_WRITE_CACHE_MAX:
-        for item in list(_recent_writes)[:64]:
-            _recent_writes.pop(item, None)
-    _recent_writes[key] = now + _RECENT_WRITE_CACHE_TTL
-    return True
+    return await cache.set(key, True)
+
+
+def _recent_write_cache() -> BoundedTTLCache[str, bool]:
+    global _recent_writes
+
+    if _recent_writes is None:
+        from zhenxun.services.cache import BoundedTTLCache
+
+        _recent_writes = BoundedTTLCache(
+            "chatinter_recent_memory_writes",
+            ttl_seconds=_RECENT_WRITE_CACHE_TTL,
+            max_items=_RECENT_WRITE_CACHE_MAX,
+        )
+    return _recent_writes
 
 
 async def _upsert_vector_if_needed(
@@ -597,7 +607,7 @@ class ChatMemoryStore:
                 user_id=user_id,
                 candidate=candidate,
             )
-            if not _remember_recent_write(cache_key):
+            if not await _remember_recent_write(cache_key):
                 continue
             try:
                 row = await memory_model.upsert_memory(

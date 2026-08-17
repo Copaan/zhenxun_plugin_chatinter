@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+import copy
 from datetime import datetime, timezone
 import threading
 import time
@@ -11,6 +12,7 @@ import uuid
 
 from ..artifact_store import get_artifact_store
 from ..llm_compat import (
+    LLMContentPart,
     LLMMessage,
     LLMToolCall,
     LLMToolFunction,
@@ -23,10 +25,13 @@ from ..persistence import (
     utc_now_iso,
     write_json,
 )
+from .context import migrate_legacy_context_summaries
 from .permission_policy import get_default_permission_mode, resolve_permission_mode
 from .state import (
     AgentBudgetState,
+    AgentObservation,
     AgentRunState,
+    AgentRuntimeMetric,
     ToolExecutionRecord,
     append_artifact_refs,
 )
@@ -43,6 +48,7 @@ _IMPORTANT_PERSIST_STAGES = frozenset(
         "tool_execution_completed",
         "tool_execution_reconciled",
         "tool_protocol_repaired",
+        "read_only_tool_observation",
         "semantic_compression_failed",
         "semantic_context_compressed",
         "plan_updated",
@@ -61,6 +67,79 @@ _SNAPSHOT_RETENTION_SECONDS = 30 * 24 * 60 * 60
 _TRACE_ALIAS_RETENTION_SECONDS = 24 * 60 * 60
 _LAST_RETENTION_AT = 0.0
 _TRACE_ALIAS_KIND = "agent_run_trace_alias"
+_OBSERVABILITY_CHECKPOINT_MAX_ITEMS = 160
+_OBSERVABILITY_KINDS = frozenset(
+    {
+        "agent_cancelled",
+        "agent_paused",
+        "agent_resumed",
+        "agent_run_budget",
+        "context_tool_results_pruned",
+        "context_window_blocked",
+        "model_request",
+        "model_usage",
+        "provider_capability",
+        "provider_failover",
+        "recovery_action",
+        "runtime_guardrail",
+        "semantic_compression_failed",
+        "semantic_context_compression",
+        "subagent_batch",
+        "tool_call",
+        "tool_execution_started",
+        "tool_result",
+    }
+)
+_OBSERVABILITY_METADATA_KEYS = frozenset(
+    {
+        "after_tokens",
+        "appended_message_tokens",
+        "appended_tool_result_tokens",
+        "before_tokens",
+        "cache_phase",
+        "chain",
+        "compression_failure_count",
+        "dropped_rounds",
+        "environment_hash",
+        "estimate_ratio",
+        "estimate_source",
+        "estimated_prompt_tokens",
+        "generation_config_hash",
+        "low_savings",
+        "main_model_calls",
+        "message_count",
+        "model",
+        "native_web_search_exposed",
+        "ok",
+        "provider",
+        "provider_cache_observed",
+        "provider_cached_prompt_tokens",
+        "provider_prompt_tokens",
+        "prompt_cache_hit_rate",
+        "request_kind",
+        "result_status",
+        "run_id_hash",
+        "schema_chars",
+        "selected_tool_count",
+        "status",
+        "step",
+        "subagent_completed",
+        "subagent_failed",
+        "subagent_input_tokens",
+        "subagent_output_tokens",
+        "subagent_tasks",
+        "subagent_wall_ms",
+        "summary_input_dropped_rounds",
+        "summary_savings_ratio",
+        "summary_savings_tokens",
+        "system_hash",
+        "tool_count",
+        "tool_schema_hash",
+        "update_context",
+        "web_citation_count",
+        "web_search_used",
+    }
+)
 
 
 def get_agent_session(session_key: str) -> dict[str, Any]:
@@ -839,6 +918,7 @@ def _state_payload(
         "tool_executions": to_jsonable(getattr(state, "tool_executions", [])),
         "budget": to_jsonable(getattr(state, "budget", None)),
         "messages": to_jsonable(getattr(state, "messages", [])),
+        "observability_checkpoint": _observability_checkpoint(state),
     }
 
 
@@ -965,7 +1045,11 @@ def _activity_from_snapshot(
     activity = snapshot.get("activity")
     activity = activity if isinstance(activity, dict) else {}
     tool_name = str(activity.get("tool_name", "") or "")
-    if stage in {"tool_calls", "tool_observation"} and tool_name:
+    if stage in {
+        "tool_calls",
+        "tool_observation",
+        "read_only_tool_observation",
+    } and tool_name:
         return _activity_payload(
             snapshot,
             stage=stage,
@@ -1022,22 +1106,128 @@ def _compact_run_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _observability_checkpoint(state: Any) -> dict[str, Any]:
+    metrics: list[dict[str, Any]] = []
+    for sequence, metric in enumerate(list(getattr(state, "metrics", []) or [])):
+        kind = str(getattr(metric, "kind", "") or "")
+        if kind not in _OBSERVABILITY_KINDS:
+            continue
+        metadata = getattr(metric, "metadata", None)
+        metadata = metadata if isinstance(metadata, dict) else {}
+        payload: dict[str, Any] = {
+            "sequence": sequence,
+            "role": str(getattr(metric, "role", "") or ""),
+            "kind": kind,
+            "tool_name": str(getattr(metric, "tool_name", "") or ""),
+            "metadata": to_jsonable(
+                {
+                    key: metadata[key]
+                    for key in _OBSERVABILITY_METADATA_KEYS
+                    if key in metadata
+                }
+            ),
+        }
+        observation = getattr(metric, "observation", None)
+        if observation is not None:
+            output = getattr(observation, "output", None)
+            output = output if isinstance(output, dict) else {}
+            payload["observation"] = {
+                "tool_call_id": str(
+                    getattr(observation, "tool_call_id", "") or ""
+                ),
+                "tool_name": str(getattr(observation, "tool_name", "") or ""),
+                "command_id": str(getattr(observation, "command_id", "") or ""),
+                "ok": bool(getattr(observation, "ok", False)),
+                "need_continue": bool(
+                    getattr(observation, "need_continue", False)
+                ),
+                "artifacts": [
+                    {"artifact_id": str(item.get("artifact_id", "") or "")}
+                    for item in list(getattr(observation, "artifacts", ()) or [])
+                    if isinstance(item, dict) and item.get("artifact_id")
+                ][:20],
+                "step": max(int(getattr(observation, "step", 0) or 0), 0),
+                "output": {
+                    key: output[key]
+                    for key in ("ok", "status", "result_status")
+                    if key in output
+                },
+            }
+        metrics.append(payload)
+    return {
+        "trace_id": str(getattr(state, "trace_id", "") or ""),
+        "metrics": metrics[-_OBSERVABILITY_CHECKPOINT_MAX_ITEMS:],
+    }
+
+
+def _metrics_from_observability_checkpoint(
+    value: Any,
+    *,
+    trace_id: str,
+) -> list[AgentRuntimeMetric]:
+    if not isinstance(value, dict) or str(value.get("trace_id", "") or "") != trace_id:
+        return []
+    raw_metrics = value.get("metrics")
+    if not isinstance(raw_metrics, list):
+        return []
+    metrics: list[AgentRuntimeMetric] = []
+    for item in raw_metrics[-_OBSERVABILITY_CHECKPOINT_MAX_ITEMS:]:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind", "") or "")
+        if kind not in _OBSERVABILITY_KINDS:
+            continue
+        raw_observation = item.get("observation")
+        observation = None
+        if isinstance(raw_observation, dict):
+            raw_output = raw_observation.get("output")
+            observation = AgentObservation(
+                tool_call_id=str(raw_observation.get("tool_call_id", "") or ""),
+                tool_name=str(raw_observation.get("tool_name", "") or ""),
+                command_id=str(raw_observation.get("command_id", "") or ""),
+                ok=bool(raw_observation.get("ok", False)),
+                need_continue=bool(raw_observation.get("need_continue", False)),
+                artifacts=tuple(
+                    item
+                    for item in raw_observation.get("artifacts", [])
+                    if isinstance(item, dict) and item.get("artifact_id")
+                ),
+                step=max(int(raw_observation.get("step", 0) or 0), 0),
+                output=dict(raw_output) if isinstance(raw_output, dict) else {},
+            )
+        metadata = item.get("metadata")
+        metrics.append(
+            AgentRuntimeMetric(
+                role=str(item.get("role", "") or ""),
+                kind=kind,
+                tool_name=str(item.get("tool_name", "") or ""),
+                metadata=dict(metadata) if isinstance(metadata, dict) else {},
+                observation=observation,
+            )
+        )
+    return metrics
+
+
 def _state_from_snapshot(
     snapshot: dict[str, Any],
     *,
     tool_map: dict[str, ToolExecutable],
 ) -> AgentRunState | None:
+    artifact_refs = _text_list(snapshot.get("artifact_refs"))
     try:
         state = AgentRunState(
             trace_id=str(snapshot.get("trace_id", "") or snapshot.get("run_id", "")),
             run_id=str(snapshot.get("run_id", "") or snapshot.get("trace_id", "")),
             session_key=str(snapshot.get("session_key", "") or "") or None,
-            messages=_messages_from_payload(snapshot.get("messages", [])),
+            messages=_messages_from_payload(
+                snapshot.get("messages", []),
+                artifact_refs=artifact_refs,
+            ),
             tool_map=dict(tool_map),
             status=str(snapshot.get("status", "") or "running"),
             paused_reason=str(snapshot.get("paused_reason", "") or ""),
             pending_approval=_pending_approval_from_snapshot(snapshot),
-            artifact_refs=_text_list(snapshot.get("artifact_refs")),
+            artifact_refs=artifact_refs,
             plan_items=_plan_items_from_payload(snapshot.get("plan_items", [])),
             tool_executions=_tool_executions_from_payload(
                 snapshot.get("tool_executions", [])
@@ -1060,6 +1250,12 @@ def _state_from_snapshot(
                 0,
             ),
             budget=_budget_from_payload(snapshot.get("budget", {})),
+            metrics=_metrics_from_observability_checkpoint(
+                snapshot.get("observability_checkpoint"),
+                trace_id=str(
+                    snapshot.get("trace_id", "") or snapshot.get("run_id", "")
+                ),
+            ),
             final_text=str(snapshot.get("final_text", "") or ""),
             delivery_complete=bool(snapshot.get("delivery_complete", False)),
             final_source=str(snapshot.get("final_source", "") or ""),
@@ -1079,17 +1275,26 @@ def _plan_items_from_payload(value: Any) -> list[dict[str, str]]:
         item_id = str(item.get("id", "") or "").strip()[:64]
         content = str(item.get("content", "") or "").strip()[:500]
         status = str(item.get("status", "") or "").strip()
-        if item_id and content and status in {
-            "pending",
-            "in_progress",
-            "completed",
-            "cancelled",
-        }:
+        if (
+            item_id
+            and content
+            and status
+            in {
+                "pending",
+                "in_progress",
+                "completed",
+                "cancelled",
+            }
+        ):
             items.append({"id": item_id, "content": content, "status": status})
     return items
 
 
-def _messages_from_payload(value: Any) -> list[LLMMessage]:
+def _messages_from_payload(
+    value: Any,
+    *,
+    artifact_refs: list[str] | tuple[str, ...] = (),
+) -> list[LLMMessage]:
     messages: list[LLMMessage] = []
     if not isinstance(value, list | tuple):
         return messages
@@ -1098,13 +1303,35 @@ def _messages_from_payload(value: Any) -> list[LLMMessage]:
             continue
         try:
             payload = dict(item)
+            content = payload.get("content")
+            if isinstance(content, list):
+                payload["content"] = [
+                    LLMContentPart(
+                        type=str(part.get("type", "text") or "text"),
+                        text=part.get("text"),
+                        thought_text=part.get("thought_text"),
+                        image_source=part.get("image_source"),
+                        mime_type=part.get("mime_type"),
+                        metadata=(
+                            dict(part["metadata"])
+                            if isinstance(part.get("metadata"), dict)
+                            else None
+                        ),
+                    )
+                    if isinstance(part, dict)
+                    else part
+                    for part in content
+                ]
             payload["tool_calls"] = _tool_calls_from_payload(
                 payload.get("tool_calls", [])
             )
+            content_parts = payload.get("content_parts")
+            if isinstance(content_parts, list):
+                payload["content_parts"] = _content_parts_from_payload(content_parts)
             messages.append(LLMMessage(**payload))
         except Exception:
             continue
-    return messages
+    return migrate_legacy_context_summaries(messages, artifact_refs=artifact_refs)
 
 
 def _tool_executions_from_payload(value: Any) -> list[ToolExecutionRecord]:
@@ -1149,11 +1376,32 @@ def _tool_calls_from_payload(value: Any) -> list[LLMToolCall]:
                         arguments=str((function or {}).get("arguments", "") or ""),
                     ),
                     thought_signature=item.get("thought_signature"),
+                    metadata=(
+                        copy.deepcopy(item["metadata"])
+                        if isinstance(item.get("metadata"), dict)
+                        else None
+                    ),
                 )
             )
         except Exception:
             continue
     return calls
+
+
+def _content_parts_from_payload(value: list[Any]) -> list[Any]:
+    from zhenxun.services.ai.core.messages import LLMContentPart as HostContentPart
+    from zhenxun.utils.pydantic_compat import parse_as
+
+    parts: list[Any] = []
+    for item in value:
+        if not isinstance(item, dict):
+            parts.append(item)
+            continue
+        try:
+            parts.append(parse_as(HostContentPart, copy.deepcopy(item)))
+        except Exception:
+            parts.append(copy.deepcopy(item))
+    return parts
 
 
 def _budget_from_payload(value: Any) -> AgentBudgetState:

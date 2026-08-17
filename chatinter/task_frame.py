@@ -14,6 +14,7 @@ from .route_text import normalize_message_text
 
 TASK_TEXT_FIELD = "task_text"
 TARGET_HINT_FIELD = "target_hint"
+TARGET_REF_FIELD = "target_ref"
 PAYLOAD_HINT_FIELD = "payload_hint"
 _MAX_TASK_TEXT_LEN = 240
 _MAX_HINT_LEN = 180
@@ -51,32 +52,41 @@ def normalize_task_text(task_text: str) -> str:
 def pop_task_text(raw_slots: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     """Remove ChatInter-only task text from raw tool arguments."""
 
-    task_text, _target_hint, _payload_hint, slots = pop_task_context(raw_slots)
+    task_text, _target_hint, _target_ref, _payload_hint, slots = pop_task_context(
+        raw_slots
+    )
     return task_text, slots
 
 
-def pop_task_context(raw_slots: dict[str, Any]) -> tuple[str, str, str, dict[str, Any]]:
+def pop_task_context(
+    raw_slots: dict[str, Any],
+) -> tuple[str, str, str, str, dict[str, Any]]:
     """Remove ChatInter-only execution hints from raw tool arguments."""
 
     copied = dict(raw_slots or {})
     raw_task_text = copied.pop(TASK_TEXT_FIELD, None)
     raw_target_hint = copied.pop(TARGET_HINT_FIELD, None)
+    raw_target_ref = copied.pop(TARGET_REF_FIELD, None)
     raw_payload_hint = copied.pop(PAYLOAD_HINT_FIELD, None)
     task_text = normalize_task_text(str(raw_task_text or ""))
     if len(task_text) > _MAX_TASK_TEXT_LEN:
         task_text = task_text[:_MAX_TASK_TEXT_LEN].rstrip()
     target_hint = normalize_task_text(str(raw_target_hint or ""))
+    target_ref = normalize_task_text(str(raw_target_ref or ""))
     payload_hint = normalize_task_text(str(raw_payload_hint or ""))
     if len(target_hint) > _MAX_HINT_LEN:
         target_hint = target_hint[:_MAX_HINT_LEN].rstrip()
+    if len(target_ref) > _MAX_HINT_LEN:
+        target_ref = target_ref[:_MAX_HINT_LEN].rstrip()
     if len(payload_hint) > _MAX_HINT_LEN:
         payload_hint = payload_hint[:_MAX_HINT_LEN].rstrip()
-    return task_text, target_hint, payload_hint, copied
+    return task_text, target_hint, target_ref, payload_hint, copied
 
 
 __all__ = [
     "PAYLOAD_HINT_FIELD",
     "TARGET_HINT_FIELD",
+    "TARGET_REF_FIELD",
     "TASK_TEXT_FIELD",
     "TaskFrame",
     "normalize_task_text",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import copy
 from datetime import datetime
 import time
 from typing import Any
@@ -13,13 +14,17 @@ from zhenxun.utils.message import MessageUtils
 
 from ..config import (
     SUPERUSER_MODEL_TIMEOUT_SECONDS,
-    build_agent_generation_config,
+    get_agent_context_window_tokens,
     get_agent_model,
+    get_fallback_models,
     get_superuser_max_output_tokens,
 )
 from ..event_runtime import event_is_private, resolve_superuser
+from ..host_llm import resolve_host_model_candidates
 from ..llm_compat import AI
+from ..provider_capability import ProviderCapabilityAdapter
 from ..route_text import normalize_message_text
+from ..web_access import tools_for_web_candidate
 from .approval_store import list_pending_approvals, reject_pending_approval
 from .permission_policy import (
     clear_conversation_permissions,
@@ -30,10 +35,18 @@ from .permission_policy import (
 from .progress import progress_phase
 from .runtime import (
     SuperuserSessionBusyError,
+    _calculate_tool_schema_metrics,
+    _estimate_prompt_tokens,
+    _semantic_summary_generation_config,
+    _superuser_prompt_cache_key,
+    _tool_schema_hash,
     cancel_superuser_session_execution,
+    record_superuser_model_usage,
+    request_superuser_semantic_summary,
     superuser_session_execution,
     superuser_session_is_executing,
 )
+from .state import append_artifact_refs
 from .store import (
     activate_agent_session,
     archive_conversation,
@@ -47,17 +60,20 @@ from .store import (
     get_agent_session,
     list_agent_run_activities,
     list_conversations,
-    persist_agent_run_messages,
+    load_agent_run_state,
+    persist_agent_run_state,
     rename_conversation,
     restore_conversation,
     set_conversation_permission_mode,
     switch_conversation,
     update_agent_run_status,
 )
+from .tools import build_superuser_tools
 from .tools.shell_tools import (
     has_running_background_shell_tasks,
     stop_background_shell_tasks,
 )
+from .trajectory import record_agent_control_trajectory
 
 _ACTIVE_STATUSES = {"running", "paused"}
 _ACTIVE_BLOCKED_INTENTS = {
@@ -123,8 +139,12 @@ async def try_handle_runtime_control(
     is_active = bool(session_state.get("active"))
     snapshot = get_agent_run_snapshot(run_id) if run_id else None
     is_executing = superuser_session_is_executing(session_key)
-    is_running = is_executing or has_running_background_shell_tasks(run_id) or bool(
-        isinstance(snapshot, dict) and str(snapshot.get("status", "")) == "running"
+    is_running = (
+        is_executing
+        or has_running_background_shell_tasks(run_id)
+        or bool(
+            isinstance(snapshot, dict) and str(snapshot.get("status", "")) == "running"
+        )
     )
     is_waiting_approval = (
         False
@@ -158,12 +178,50 @@ async def try_handle_runtime_control(
         )
         return True
     if intent in _CONVERSATION_INTENTS:
+        conversations_before = {
+            str(item.get("id", "") or ""): item
+            for item in list_conversations(session_key, archived=None)
+        }
         text = _handle_conversation_control(
             intent=intent,
             argument=argument,
             session_key=session_key,
             user_id=user_id,
         )
+        conversations_after = {
+            str(item.get("id", "") or ""): item
+            for item in list_conversations(session_key, archived=None)
+        }
+        try:
+            from .active_tasks import (
+                delete_active_tasks_for_conversation,
+                pause_active_tasks_for_conversation,
+            )
+
+            deleted_ids = conversations_before.keys() - conversations_after.keys()
+            archived_ids = {
+                conversation_id
+                for conversation_id, item in conversations_after.items()
+                if bool(item.get("archived"))
+                and not bool(
+                    conversations_before.get(conversation_id, {}).get("archived")
+                )
+            }
+            for conversation_id in deleted_ids:
+                await delete_active_tasks_for_conversation(
+                    session_key,
+                    conversation_id,
+                )
+            for conversation_id in archived_ids:
+                await pause_active_tasks_for_conversation(
+                    session_key,
+                    conversation_id,
+                )
+        except Exception as exc:
+            from zhenxun.services import logger
+
+            logger.error("ChatInter 主动任务会话同步失败", e=exc)
+            text += "\n关联主动任务同步失败，请检查任务列表。"
         await _send_runtime_reply(bot=bot, event=event, text=text)
         return True
     if intent == "help":
@@ -249,13 +307,19 @@ async def try_handle_runtime_control(
                 text="当前没有正在执行的 Agent 任务。",
             )
             return True
-        update_agent_run_status(
-            run_id,
-            status="cancelled",
-            reason="cancelled_by_runtime_control",
-            metadata={"cancelled_by": user_id},
-            clear_pending_approval=True,
-        )
+        proactive_kind = ""
+        if is_executing:
+            from .proactive_tasks import proactive_session_execution_kind
+
+            proactive_kind = proactive_session_execution_kind(session_key)
+        if is_waiting_approval or proactive_kind not in {"notify", "script"}:
+            update_agent_run_status(
+                run_id,
+                status="cancelled",
+                reason="cancelled_by_runtime_control",
+                metadata={"cancelled_by": user_id},
+                clear_pending_approval=True,
+            )
         _discard_pending_approvals(
             run_id,
             user_id=user_id,
@@ -273,6 +337,10 @@ def has_runtime_control_intent(raw_message: str, *, session_key: str = "") -> bo
         _control_request(raw_message)[0]
         or _pending_switch_selection(session_key, raw_message)
     )
+
+
+def parse_runtime_control_command(raw_message: str) -> tuple[str, str]:
+    return _control_request(raw_message)
 
 
 def _control_request(raw_message: str) -> tuple[str, str]:
@@ -436,6 +504,12 @@ def _handle_conversation_control(
         result = restore_conversation(session_key, conversation_id)
         return f"会话 {result['id']} 已恢复。" if result else "恢复会话失败。"
     if intent == "delete_conversation":
+        target_run_id = str(conversation.get("run_id", "") or "")
+        target_snapshot = (
+            get_agent_run_snapshot(target_run_id) if target_run_id else None
+        )
+        if _has_uncertain_side_effect(target_snapshot):
+            return "目标会话存在执行结果不确定的操作，不能删除该会话。"
         result = delete_conversation(session_key, conversation_id)
         if result is None:
             return "删除会话失败。"
@@ -591,35 +665,105 @@ def _approval_run_id(approval: Any) -> str:
 async def _compact_conversation(run_id: str) -> str:
     from .context import (
         compact_messages,
-        resolve_superuser_max_input_tokens,
-        semantic_summary_output_tokens,
+        context_window_budget,
+        estimate_prompt_tokens_with_baseline,
     )
 
     if not run_id:
         return "当前没有可精简的 Agent 对话。"
+    started_at = time.time()
+    started_perf = time.perf_counter()
     snapshot = get_agent_run_snapshot(run_id)
     if not isinstance(snapshot, dict):
         return "当前 Agent 对话不存在。"
     messages = get_agent_run_messages(run_id)
+    budget = snapshot.get("budget")
+    budget = budget if isinstance(budget, dict) else {}
+    prompt_tokens_before = estimate_prompt_tokens_with_baseline(
+        messages,
+        current_context_tokens=budget.get("current_context_tokens", 0),
+        last_usage_message_count=budget.get("last_usage_message_count", 0),
+        last_usage_schema_tokens=budget.get("last_usage_schema_tokens", 0),
+    )
     trace_id = str(snapshot.get("trace_id", "") or run_id)
-    model_name = get_agent_model("superuser")
-    max_input_tokens = resolve_superuser_max_input_tokens(model_name)
+    configured_model = get_agent_model("superuser")
+    candidate = (
+        await resolve_host_model_candidates(
+            configured_model,
+            get_fallback_models(configured_model),
+        )
+    )[0]
+    model_name = candidate.name
+    max_input_tokens = candidate.context_window(
+        get_agent_context_window_tokens("superuser")
+    )
     ai: AI | None = None
+    source_tools = tools_for_web_candidate(
+        build_superuser_tools(),
+        candidate=candidate,
+        scope="superuser",
+    )
+    provider_adapter = ProviderCapabilityAdapter.for_model(
+        model_name,
+        capabilities=candidate.capabilities,
+        api_type=candidate.api_type,
+    )
+    tools = provider_adapter.prepare_tool_map_for_request(source_tools)
+    state = load_agent_run_state(run_id, tool_map=source_tools)
+    if state is None:
+        return "当前 Agent 对话无法恢复。"
+    _, schema_tokens = await _calculate_tool_schema_metrics(tools)
+    tool_schema_hash = await _tool_schema_hash(tools)
+    prompt_cache_key = await _superuser_prompt_cache_key(
+        run_id=run_id,
+        model_name=model_name,
+        tool_schema_hash=tool_schema_hash,
+    )
+    output_reserve_tokens = get_superuser_max_output_tokens()
+    failure_reasons: list[str] = []
+    usage_recorded = False
+    budget_before = (
+        state.budget.run_input_tokens,
+        state.budget.run_output_tokens,
+        state.budget.model_calls,
+    )
+
+    def record_failure(_fingerprint: str, metadata: dict[str, Any]) -> None:
+        reason = _manual_compression_failure_code(metadata.get("error"))
+        if reason not in failure_reasons:
+            failure_reasons.append(reason)
 
     async def summarize(request_messages) -> str:
-        nonlocal ai
-        ai = ai or AI(session_id=f"chatinter-superuser-compact:{run_id}")
-        response = await ai.generate_internal(
-            request_messages,
-            model=model_name or None,
-            config=build_agent_generation_config(
-                "superuser",
-                max_output_tokens=semantic_summary_output_tokens(max_input_tokens),
-            ),
-            tools=None,
-            tool_choice=None,
+        nonlocal ai, usage_recorded
+        ai = ai or AI(session_id=f"chatinter-superuser:{run_id}")
+        response = await request_superuser_semantic_summary(
+            ai=ai,
+            messages=request_messages,
+            model_name=model_name or None,
+            candidate=candidate,
+            max_input_tokens=max_input_tokens,
             timeout=SUPERUSER_MODEL_TIMEOUT_SECONDS,
+            prompt_cache_key=prompt_cache_key,
         )
+        record_superuser_model_usage(
+            state,
+            response,
+            estimated_input_tokens=_estimate_prompt_tokens(request_messages),
+            schema_tokens=0,
+            update_context=False,
+            request_kind="summary",
+            model_name=model_name,
+            tool_schema_hash="",
+            request_message_count=len(request_messages),
+            request_generation_config=_semantic_summary_generation_config(
+                max_input_tokens
+            ),
+            cache_phase="compaction_request",
+            visible_messages=request_messages,
+        )
+        usage_recorded = True
+        if getattr(response, "tool_calls", None):
+            raise ValueError("semantic_summary_returned_tool_calls")
         return str(response.text or "")
 
     result = await compact_messages(
@@ -627,16 +771,55 @@ async def _compact_conversation(run_id: str) -> str:
         trace_id=trace_id,
         max_input_tokens=max_input_tokens,
         summarize=summarize,
-        output_reserve_tokens=get_superuser_max_output_tokens(),
+        schema_tokens=schema_tokens,
+        output_reserve_tokens=output_reserve_tokens,
+        force=True,
+        blocked_source_fingerprint="",
+        on_failure=record_failure,
+        prompt_tokens_before=prompt_tokens_before,
     )
     if not result.changed:
-        return "上下文精简失败或当前没有可安全精简的旧内容。"
-    persist_agent_run_messages(
-        run_id,
-        messages=result.messages,
-        current_context_tokens=result.after_tokens,
+        if usage_recorded and not persist_agent_run_state(
+            state,
+            stage="context_compression_attempt",
+        ):
+            _record_manual_compression_trajectory(
+                state,
+                started_at=started_at,
+                started_perf=started_perf,
+                budget_before=budget_before,
+                outcome="failed",
+                failure_reason="persistence_failed",
+            )
+            return "上下文压缩记录保存失败；原上下文已保留。"
+        if usage_recorded:
+            _record_manual_compression_trajectory(
+                state,
+                started_at=started_at,
+                started_perf=started_perf,
+                budget_before=budget_before,
+                outcome="failed" if failure_reasons else "no_change",
+                failure_reason=(
+                    failure_reasons[0] if failure_reasons else "no_safe_middle"
+                ),
+            )
+        if failure_reasons:
+            details = "；".join(
+                _MANUAL_COMPRESSION_FAILURE_MESSAGES[reason]
+                for reason in failure_reasons
+            )
+            return f"上下文压缩失败：{details}。原上下文已保留。"
+        return "当前没有可安全压缩的旧内容；原上下文未修改。"
+    state.messages = list(result.messages)
+    append_artifact_refs(state.artifact_refs, result.artifact_ids)
+    state.compression_failure_fingerprint = ""
+    state.compression_failure_count = 0
+    state.budget.current_context_tokens = max(int(result.after_tokens or 0), 0)
+    state.budget.last_usage_message_count = len(state.messages)
+    state.budget.last_usage_schema_tokens = 0
+    if not persist_agent_run_state(
+        state,
         stage="context_compacted",
-        artifact_ids=result.artifact_ids,
         metadata={
             "before_tokens": result.before_tokens,
             "after_tokens": result.after_tokens,
@@ -644,8 +827,115 @@ async def _compact_conversation(run_id: str) -> str:
             "summary_savings_ratio": result.summary_savings_ratio,
             "low_savings": result.low_savings,
         },
+    ):
+        if usage_recorded:
+            _record_manual_compression_trajectory(
+                state,
+                started_at=started_at,
+                started_perf=started_perf,
+                budget_before=budget_before,
+                outcome="failed",
+                failure_reason="persistence_failed",
+            )
+        return "上下文压缩结果保存失败；原上下文已保留。"
+    if usage_recorded:
+        _record_manual_compression_trajectory(
+            state,
+            started_at=started_at,
+            started_perf=started_perf,
+            budget_before=budget_before,
+            outcome="completed",
+            failure_reason="",
+        )
+    post_compression_budget = context_window_budget(
+        max_input_tokens=max_input_tokens,
+        prompt_tokens=result.after_tokens,
+        schema_tokens=schema_tokens,
+        output_reserve_tokens=output_reserve_tokens,
     )
-    return f"上下文已精简：{result.before_tokens} -> {result.after_tokens} tokens。"
+    if post_compression_budget.prompt_tokens >= post_compression_budget.blocking_limit:
+        return (
+            f"上下文已压缩：{result.before_tokens} -> {result.after_tokens} tokens，"
+            "但仍超过当前候选模型的可请求窗口"
+            f"（{post_compression_budget.prompt_tokens} >= "
+            f"{post_compression_budget.blocking_limit}）；"
+            "请使用 /新增会话 后继续。"
+        )
+    return f"上下文已压缩：{result.before_tokens} -> {result.after_tokens} tokens。"
+
+
+def _record_manual_compression_trajectory(
+    state: Any,
+    *,
+    started_at: float,
+    started_perf: float,
+    budget_before: tuple[int, int, int],
+    outcome: str,
+    failure_reason: str,
+) -> None:
+    try:
+        projection = copy(state)
+        projection.metrics = [
+            metric
+            for metric in state.metrics
+            if metric.kind == "model_usage"
+            and str(metric.metadata.get("request_kind", "")) == "summary"
+        ]
+        projection.tool_executions = []
+        projection.final_text = ""
+        projection.delivery_complete = False
+        projection.final_source = ""
+        projection.status = "failed" if outcome == "failed" else "completed"
+        projection.budget = copy(state.budget)
+        projection.budget.run_input_tokens = max(
+            int(state.budget.run_input_tokens) - int(budget_before[0]),
+            0,
+        )
+        projection.budget.run_output_tokens = max(
+            int(state.budget.run_output_tokens) - int(budget_before[1]),
+            0,
+        )
+        projection.budget.model_calls = max(
+            int(state.budget.model_calls) - int(budget_before[2]),
+            0,
+        )
+        record_agent_control_trajectory(
+            state=projection,
+            input_message="/压缩上下文",
+            started_at=started_at,
+            latency_ms=max(int((time.perf_counter() - started_perf) * 1000), 0),
+            control_action="manual_context_compression",
+            control_outcome=outcome,
+            control_failure_reason=failure_reason,
+        )
+    except Exception:
+        return
+
+
+_MANUAL_COMPRESSION_FAILURE_MESSAGES = {
+    "artifact_persistence_failed": "压缩源保存失败",
+    "compressed_prompt_over_target": "压缩后上下文仍超过目标预算",
+    "compression_attempts_exhausted": "摘要重试次数已用尽",
+    "compression_circuit_open": "自动压缩连续失败熔断已生效",
+    "ineffective_semantic_summary": "摘要没有产生有效 token 收益",
+    "invalid_structured_summary": "摘要模型返回的结构化结果无效",
+    "protected_context_exceeds_target": "必须保留的上下文已超过目标预算",
+    "semantic_summary_returned_tool_calls": "摘要模型错误地返回了工具调用",
+    "summary_repair_request_too_large": "摘要格式修复请求超过候选模型窗口",
+    "summary_request_failed": "摘要模型请求失败",
+    "summary_request_timed_out": "摘要模型请求超时",
+    "summary_request_too_large": "摘要请求仍超过候选模型窗口",
+}
+
+
+def _manual_compression_failure_code(error: Any) -> str:
+    text = normalize_message_text(str(error or "")).casefold()
+    for code in _MANUAL_COMPRESSION_FAILURE_MESSAGES:
+        if code in text:
+            return code
+    if "timeout" in text or "timed out" in text:
+        return "summary_request_timed_out"
+    return "summary_request_failed"
 
 
 def _status_reply(
@@ -724,6 +1014,13 @@ def _status_label(status: str) -> str:
 def _current_action(run_id: str, *, status: str, waiting: bool) -> str:
     if waiting:
         return "等待用户确认"
+    terminal_action = {
+        "completed": "任务已完成",
+        "failed": "任务执行失败",
+        "cancelled": "任务已中断",
+    }.get(normalize_message_text(status))
+    if terminal_action:
+        return terminal_action
     rows = list_agent_run_activities(run_id, limit=1) if run_id else []
     if rows:
         tool_name = normalize_message_text(str(rows[-1].get("tool_name", "") or ""))
@@ -731,9 +1028,6 @@ def _current_action(run_id: str, *, status: str, waiting: bool) -> str:
             return progress_phase(tool_name) or "正在处理任务"
     return {
         "paused": "任务已暂停",
-        "completed": "任务已完成",
-        "failed": "任务执行失败",
-        "cancelled": "任务已中断",
     }.get(normalize_message_text(status), "正在处理任务")
 
 
@@ -749,4 +1043,8 @@ async def _send_runtime_reply(*, bot: Bot, event: Event, text: str) -> None:
         pass
 
 
-__all__ = ["has_runtime_control_intent", "try_handle_runtime_control"]
+__all__ = [
+    "has_runtime_control_intent",
+    "parse_runtime_control_command",
+    "try_handle_runtime_control",
+]
