@@ -19,18 +19,23 @@ _MAX_HANDLED_CACHE = 1000
 _DISABLE_PLUGINS_ATTR = "_chatinter_disable_plugins"
 
 
-def is_already_handled(event: Event) -> bool:
+def _handled_message_key(event: Event, *, session_key: str) -> str:
     message_id = getattr(event, "message_id", None)
-    if not message_id:
-        return False
-    return str(message_id) in _HANDLED_MESSAGE_IDS
+    normalized_session = str(session_key or "").strip()
+    if not message_id or not normalized_session:
+        return ""
+    return f"{normalized_session}\0{message_id}"
 
 
-def mark_as_handled(event: Event) -> None:
-    message_id = getattr(event, "message_id", None)
-    if not message_id:
+def is_already_handled(event: Event, *, session_key: str) -> bool:
+    key = _handled_message_key(event, session_key=session_key)
+    return bool(key and key in _HANDLED_MESSAGE_IDS)
+
+
+def mark_as_handled(event: Event, *, session_key: str) -> None:
+    normalized_id = _handled_message_key(event, session_key=session_key)
+    if not normalized_id:
         return
-    normalized_id = str(message_id)
     if normalized_id in _HANDLED_MESSAGE_IDS:
         return
     _HANDLED_MESSAGE_IDS[normalized_id] = None

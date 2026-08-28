@@ -190,8 +190,6 @@ class AgentRunState:
     step: int = 0
     max_steps: int = 5
     cost_checkpoint_tokens: int = 0
-    compression_failure_fingerprint: str = ""
-    compression_failure_count: int = 0
     budget: AgentBudgetState = field(default_factory=AgentBudgetState)
     metrics: list[AgentRuntimeMetric] = field(default_factory=list)
     final_text: str = ""
@@ -252,8 +250,6 @@ class AgentRunState:
         )
         state.artifact_refs = list(previous.artifact_refs)
         state.plan_items = [dict(item) for item in previous.plan_items]
-        state.compression_failure_fingerprint = previous.compression_failure_fingerprint
-        state.compression_failure_count = previous.compression_failure_count
         state.budget.current_context_tokens = previous.budget.current_context_tokens
         state.budget.last_usage_message_count = previous.budget.last_usage_message_count
         state.budget.last_usage_schema_tokens = previous.budget.last_usage_schema_tokens

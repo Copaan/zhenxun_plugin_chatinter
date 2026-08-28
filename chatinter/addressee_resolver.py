@@ -168,7 +168,10 @@ async def _resolve_alias_addressee(
         )
     if len(candidates) > 1:
         second = candidates[1]
-        if top.score < ALIAS_AMBIGUOUS_TOP or (top.score - second.score) < ALIAS_AMBIGUOUS_GAP:
+        if (
+            top.score < ALIAS_AMBIGUOUS_TOP
+            or (top.score - second.score) < ALIAS_AMBIGUOUS_GAP
+        ):
             names = "、".join(item.profile.display_name for item in candidates[:3])
             return AddresseeResult(
                 None,

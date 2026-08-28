@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
 import hashlib
 import hmac
 import json
+import math
+import re
 import time
 from typing import Any, Literal
 
@@ -14,17 +17,44 @@ import aiohttp
 
 from zhenxun.services.log import logger
 
+from .candidate_exposure import CandidateExposureKey, CandidateExposureLedger
 from .config import get_gscore_bridge_config
 from .llm_compat import RunContext, ToolDefinition, ToolResult
 from .route_text import normalize_message_text
+from .sparse_retrieval import fuse_sparse_rankings, normalize_retrieval_queries
 from .token_compat import estimate_text_tokens
 
 _API_PREFIX = "/api/chatinter-bridge/v1"
 _ROUTE_TIMEOUT_SECONDS = 2.0
 _CAPABILITY_TIMEOUT_SECONDS = 3.0
+_TRANSPORT_BACKOFF_SECONDS = (5.0, 10.0, 20.0, 40.0, 60.0)
 _EXECUTE_TIMEOUT_SECONDS = 4.0
+_EXECUTION_STATUS_TIMEOUT_SECONDS = 4.0
+_EXECUTION_STATUS_WAIT_SECONDS = 60.0
+_EXECUTION_STATUS_INITIAL_INTERVAL_SECONDS = 0.25
+_EXECUTION_STATUS_MAX_INTERVAL_SECONDS = 2.0
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
-_CAPABILITY_SCHEMA_TOKEN_BUDGET = 24_000
+_CAPABILITY_INDEX_CACHE_LIMIT = 8
+_CAPABILITY_INDEX_VERSION = 1
+_GSCORE_SKILL_TOOL_PREFIX = "ci_gscore_skill_"
+_CAPABILITY_FIELD_WEIGHTS = {
+    "trigger": 6.0,
+    "alias": 5.0,
+    "service": 4.5,
+    "name": 4.0,
+    "example": 3.5,
+    "context_tag": 3.5,
+    "summary": 5.5,
+    "fallback": 2.0,
+    "domain": 3.0,
+    "plugin": 2.0,
+    "schema": 1.0,
+}
+_ASCII_SEARCH_TERM_PATTERN = re.compile(r"[0-9a-z][0-9a-z_.:/-]*", re.IGNORECASE)
+_CJK_SEARCH_CHUNK_PATTERN = re.compile(r"[\u4e00-\u9fff]+")
+_CAPABILITY_SEARCH_STOP_CHARS = frozenset(
+    "我你他她它的了呢啊呀吧吗嘛请用这张这个那个一下一个一条给看查帮寻真"
+)
 _LEGAL_TRIGGER_TYPES = frozenset(
     {"command", "fullmatch", "keyword", "prefix", "regex", "suffix"}
 )
@@ -57,6 +87,8 @@ class GScoreCapability:
     name: str
     description: str = ""
     plugin: str = ""
+    service: str = ""
+    retrieval_summary: str = ""
     metadata_sources: tuple[str, ...] = ()
     aliases: tuple[str, ...] = ()
     examples: tuple[str, ...] = ()
@@ -111,6 +143,7 @@ class GScoreCapability:
             payload,
             has_trigger=bool(trigger_patterns),
         )
+        raw_description = str(payload.get("description") or service_name or "")
         return cls(
             capability_id=capability_id,
             name=normalize_message_text(
@@ -121,10 +154,13 @@ class GScoreCapability:
                     or capability_id
                 )
             ),
-            description=normalize_message_text(
-                str(payload.get("description") or service_name or "")
-            ),
+            description=normalize_message_text(raw_description),
             plugin=plugin_name,
+            service=service_name,
+            retrieval_summary=_payload_retrieval_summary(
+                payload,
+                raw_description,
+            ),
             metadata_sources=metadata_sources,
             aliases=_string_tuple(
                 payload.get("aliases") or plugin_mapping.get("aliases")
@@ -144,6 +180,85 @@ class GScoreCapability:
             trigger_to_me=primary_trigger.to_me,
             command_starts=command_starts,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _CapabilitySearchDocument:
+    capability: GScoreCapability
+    field_counts: dict[str, dict[str, int]]
+    field_lengths: dict[str, int]
+    identities: tuple[tuple[str, float], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _CapabilitySearchIndex:
+    documents: tuple[_CapabilitySearchDocument, ...]
+    idf: dict[str, float]
+    average_field_lengths: dict[str, float]
+    identity_document_frequency: dict[str, int]
+
+    def rank(
+        self,
+        query: str,
+        *,
+        context_text: str = "",
+    ) -> list[tuple[float, GScoreCapability]]:
+        primary_terms = set(_capability_search_terms(query))
+        query_term_weights = {term: 1.0 for term in primary_terms}
+        for term in _capability_search_terms(context_text):
+            query_term_weights.setdefault(term, 0.3)
+        query_identity = _search_normalize(query)
+        if not query_term_weights and not query_identity:
+            return []
+        ranked: list[tuple[float, GScoreCapability]] = []
+        document_count = max(len(self.documents), 1)
+        for document in self.documents:
+            score = 0.0
+            primary_evidence = 0.0
+            for field, counts in document.field_counts.items():
+                if not counts:
+                    continue
+                field_score = 0.0
+                primary_field_score = 0.0
+                field_length = document.field_lengths.get(field, 0)
+                average_length = max(
+                    self.average_field_lengths.get(field, 0.0),
+                    1.0,
+                )
+                for term, query_weight in query_term_weights.items():
+                    term_count = counts.get(term, 0)
+                    if term_count <= 0:
+                        continue
+                    term_score = (
+                        self.idf.get(term, 0.0)
+                        * (term_count * 2.2)
+                        / (
+                            term_count
+                            + 1.2 * (0.45 + 0.55 * field_length / average_length)
+                        )
+                    )
+                    field_score += query_weight * term_score
+                    if term in primary_terms:
+                        primary_field_score += term_score
+                field_weight = _CAPABILITY_FIELD_WEIGHTS.get(field, 1.0)
+                score += field_score * field_weight
+                primary_evidence += primary_field_score * field_weight
+            for identity, weight in document.identities:
+                if not identity or not query_identity:
+                    continue
+                frequency = self.identity_document_frequency.get(identity, 1)
+                rarity = math.log1p(document_count / max(frequency, 1))
+                if identity == query_identity:
+                    identity_score = weight * rarity * 8.0
+                    score += identity_score
+                    primary_evidence += identity_score
+            if score > 0 and primary_evidence > 0:
+                ranked.append((score, document.capability))
+        ranked.sort(key=lambda item: (-item[0], item[1].capability_id))
+        return ranked
+
+
+_CAPABILITY_INDEX_CACHE: OrderedDict[str, _CapabilitySearchIndex] = OrderedDict()
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,7 +297,10 @@ class GScoreExecutionTool:
         source_request_id: str,
     ) -> None:
         self._adapter = adapter
-        self._capabilities = _merge_capabilities(capabilities)
+        self._capabilities = _merge_capabilities_preserving_order(capabilities)
+        self._capabilities_by_id = {
+            item.capability_id: item for item in self._capabilities
+        }
         self._capability_ids = frozenset(
             item.capability_id for item in self._capabilities
         )
@@ -194,12 +312,6 @@ class GScoreExecutionTool:
     @property
     def capability_count(self) -> int:
         return len(self._capabilities)
-
-    @property
-    def candidate_context(self) -> str:
-        return "GScore 外部插件候选能力：\n" + "\n".join(
-            _capability_card(item) for item in self._capabilities
-        )
 
     async def get_definition(self) -> ToolDefinition:
         return ToolDefinition(
@@ -237,7 +349,16 @@ class GScoreExecutionTool:
         del context
         capability_id = normalize_message_text(str(kwargs.get("capability_id") or ""))
         command_text = normalize_message_text(str(kwargs.get("command_text") or ""))
-        if capability_id not in self._capability_ids or not command_text:
+        capability = self._capabilities_by_id.get(capability_id)
+        if (
+            capability is None
+            or not command_text
+            or not _command_matches_capability(
+                capability,
+                command_text,
+                message=self._message_payload,
+            )
+        ):
             return ToolResult(
                 output={
                     "status": "invalid_arguments",
@@ -259,15 +380,44 @@ class GScoreExecutionTool:
             "revision": self._revision,
             "command_text": command_text,
         }
+        request_id = str(execute_payload["request_id"])
+        log_context = {
+            "request_id": request_id,
+            "capability_id": capability_id,
+            "message_id": normalize_message_text(
+                str(self._message_payload.get("msg_id") or "")
+            ),
+        }
         try:
             response = await self._adapter.execute(execute_payload)
         except asyncio.TimeoutError as exc:
-            logger.warning(f"ChatInter GScore execute result unknown: {exc}")
-            return _external_delivery_result("unknown", uncertain=True)
+            _log_execution_event(
+                "warning",
+                "execute_unknown",
+                **log_context,
+                error_type=type(exc).__name__,
+            )
+            return await self._poll_execution_status(
+                request_id=request_id,
+                capability_id=capability_id,
+                message_id=log_context["message_id"],
+                submission_confirmed=False,
+            )
         except GScoreBridgeError as exc:
-            logger.warning(f"ChatInter GScore execute failed: {exc}")
+            _log_execution_event(
+                "warning",
+                "execute_failed",
+                **log_context,
+                error_type=type(exc).__name__,
+                execution_uncertain=exc.uncertain,
+            )
             if exc.uncertain:
-                return _external_delivery_result("unknown", uncertain=True)
+                return await self._poll_execution_status(
+                    request_id=request_id,
+                    capability_id=capability_id,
+                    message_id=log_context["message_id"],
+                    submission_confirmed=False,
+                )
             return ToolResult(
                 output={
                     "status": "unavailable",
@@ -283,15 +433,43 @@ class GScoreExecutionTool:
         ).casefold()
         if disposition in {"accepted", "duplicate"}:
             delivery_state, delivery_observed = _delivery_observation(response)
-            return _external_delivery_result(
-                disposition,
-                submitted=True,
-                uncertain=not delivery_observed,
+            _log_execution_event(
+                "info",
+                "execute_accepted",
+                **log_context,
+                disposition=disposition,
                 delivery_state=delivery_state,
                 delivery_observed=delivery_observed,
             )
+            if delivery_observed:
+                return _external_delivery_result(
+                    disposition,
+                    submitted=True,
+                    uncertain=False,
+                    delivery_state=delivery_state,
+                    delivery_observed=True,
+                )
+            return await self._poll_execution_status(
+                request_id=request_id,
+                capability_id=capability_id,
+                message_id=log_context["message_id"],
+            )
         if disposition == "unknown":
+            _log_execution_event(
+                "warning",
+                "execute_unknown",
+                **log_context,
+                disposition=disposition,
+                execution_uncertain=True,
+            )
             return _external_delivery_result("unknown", uncertain=True)
+        _log_execution_event(
+            "warning",
+            "execute_rejected",
+            **log_context,
+            disposition=disposition or "rejected",
+            execution_uncertain=False,
+        )
         return ToolResult(
             output={
                 "status": disposition or "rejected",
@@ -300,6 +478,471 @@ class GScoreExecutionTool:
             },
             is_error=disposition not in {"rejected", "blocked", "unavailable"},
             is_retryable=False,
+        )
+
+    async def _poll_execution_status(
+        self,
+        *,
+        request_id: str,
+        capability_id: str,
+        message_id: str,
+        submission_confirmed: bool = True,
+    ) -> ToolResult:
+        started_at = time.monotonic()
+        deadline = started_at + _EXECUTION_STATUS_WAIT_SECONDS
+        interval = _EXECUTION_STATUS_INITIAL_INTERVAL_SECONDS
+        attempts = 0
+        last_error_type = ""
+        status_observed = submission_confirmed
+
+        while (remaining := deadline - time.monotonic()) > 0:
+            attempts += 1
+            try:
+                response = await asyncio.wait_for(
+                    self._adapter.execution_status(request_id),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError as exc:
+                last_error_type = type(exc).__name__
+            except GScoreBridgeError as exc:
+                last_error_type = type(exc).__name__
+            else:
+                status_observed = True
+                execution_status = _execution_status(response)
+                delivery_state, delivery_observed = _delivery_observation(response)
+                elapsed_ms = int((time.monotonic() - started_at) * 1000)
+                if delivery_observed:
+                    _log_execution_event(
+                        "info",
+                        "execution_delivered",
+                        request_id=request_id,
+                        capability_id=capability_id,
+                        message_id=message_id,
+                        execution_status=execution_status,
+                        delivery_state=delivery_state,
+                        poll_attempts=attempts,
+                        elapsed_ms=elapsed_ms,
+                    )
+                    return _external_delivery_result(
+                        execution_status or "succeeded",
+                        submitted=True,
+                        uncertain=False,
+                        delivery_state=delivery_state,
+                        delivery_observed=True,
+                    )
+                if execution_status == "succeeded" and _execution_has_no_output(
+                    response,
+                    delivery_state=delivery_state,
+                ):
+                    _log_execution_event(
+                        "info",
+                        "execution_succeeded_no_output",
+                        request_id=request_id,
+                        capability_id=capability_id,
+                        message_id=message_id,
+                        execution_status=execution_status,
+                        delivery_state="no_output",
+                        poll_attempts=attempts,
+                        elapsed_ms=elapsed_ms,
+                    )
+                    return _execution_no_output_result()
+                if execution_status == "failed":
+                    _log_execution_event(
+                        "warning",
+                        "execution_failed",
+                        request_id=request_id,
+                        capability_id=capability_id,
+                        message_id=message_id,
+                        execution_status=execution_status,
+                        delivery_state=delivery_state,
+                        poll_attempts=attempts,
+                        elapsed_ms=elapsed_ms,
+                    )
+                    return _execution_failed_result(delivery_state=delivery_state)
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(interval, remaining))
+            interval = min(
+                interval * 2,
+                _EXECUTION_STATUS_MAX_INTERVAL_SECONDS,
+            )
+
+        _log_execution_event(
+            "warning",
+            "execution_status_unknown",
+            request_id=request_id,
+            capability_id=capability_id,
+            message_id=message_id,
+            poll_attempts=attempts,
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
+            error_type=last_error_type or "StatusDeadlineExceeded",
+            execution_uncertain=True,
+        )
+        return _external_delivery_result(
+            "unknown",
+            submitted=status_observed,
+            uncertain=True,
+        )
+
+
+class GScoreSkillDispatchTool:
+    """Stable plugin-scoped discovery tool backed by the GScore executor."""
+
+    chatinter_plugin_tool_kind = "gscore"
+    chatinter_ignore_unknown_top_level_arguments = True
+
+    def __init__(
+        self,
+        *,
+        plugin_key: str,
+        capabilities: tuple[GScoreCapability, ...],
+        executor: GScoreExecutionTool,
+        revision: str,
+        exposure_ledger: CandidateExposureLedger | None = None,
+        result_token_budget: int = 4_096,
+        result_char_budget: int = 12_000,
+    ) -> None:
+        self.plugin_key = plugin_key
+        self.name = _gscore_skill_tool_name(plugin_key)
+        self._capabilities = tuple(
+            sorted(capabilities, key=lambda item: item.capability_id)
+        )
+        self._capabilities_by_id = {
+            item.capability_id: item for item in self._capabilities
+        }
+        self._executor = executor
+        self._revision = revision or _capability_index_fingerprint(self._capabilities)
+        self._exposure_ledger = exposure_ledger or CandidateExposureLedger()
+        self._exposure_key = CandidateExposureKey.build(
+            source="gscore",
+            skill=plugin_key,
+            revision=self._revision,
+        )
+        self._result_token_budget = max(int(result_token_budget), 1)
+        self._result_char_budget = max(int(result_char_budget), 1)
+
+    @property
+    def capability_count(self) -> int:
+        return len(self._capabilities)
+
+    def with_result_budget(
+        self,
+        *,
+        token_budget: int,
+        char_budget: int,
+    ) -> GScoreSkillDispatchTool:
+        return GScoreSkillDispatchTool(
+            plugin_key=self.plugin_key,
+            capabilities=self._capabilities,
+            executor=self._executor,
+            revision=self._revision,
+            exposure_ledger=self._exposure_ledger,
+            result_token_budget=token_budget,
+            result_char_budget=char_budget,
+        )
+
+    async def get_definition(self) -> ToolDefinition:
+        metadata = _gscore_skill_metadata(self.plugin_key, self._capabilities)
+        return ToolDefinition(
+            name=self.name,
+            description=(
+                "GScore 插件级能力契约："
+                + json.dumps(
+                    metadata,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "。未知具体能力时先用 task_text 和 retrieval_queries 检索；"
+                "只有 capability_id 来自返回候选时才能执行。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "task_text": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "当前工具调用对应的用户原话或任务片段",
+                    },
+                    "retrieval_queries": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1, "maxLength": 256},
+                        "maxItems": 6,
+                        "description": (
+                            "可选的本插件内检索改写，仅用于查找候选，不会作为命令执行"
+                        ),
+                    },
+                    "capability_id": {
+                        "type": ["string", "null"],
+                        "description": "仅填写本工具此前返回的真实 capability_id",
+                    },
+                    "command_text": {
+                        "type": ["string", "null"],
+                        "description": (
+                            "选择能力后，按候选 command_forms 构造完整实际命令；"
+                            "literal_head/literal_prefix/literal_suffix 均须原样保留"
+                        ),
+                    },
+                },
+                "required": ["task_text"],
+                "additionalProperties": False,
+            },
+        )
+
+    async def execute(
+        self,
+        context: RunContext | None = None,
+        **kwargs: Any,
+    ) -> ToolResult:
+        task_text = normalize_message_text(str(kwargs.get("task_text") or ""))
+        if not task_text:
+            return self._not_executed("invalid_arguments", reason="missing_task_text")
+        capability_id = normalize_message_text(str(kwargs.get("capability_id") or ""))
+        if capability_id.casefold() in {"null", "none", "nil", "undefined"}:
+            capability_id = ""
+        if capability_id:
+            if capability_id not in self._capabilities_by_id:
+                return self._selection_result(
+                    task_text,
+                    kwargs.get("retrieval_queries"),
+                    reason="capability_out_of_skill",
+                    defer_candidate_exposure=bool(
+                        kwargs.get("_defer_candidate_exposure")
+                    ),
+                )
+            if not self._exposure_ledger.is_exposed(
+                self._exposure_key,
+                capability_id,
+            ):
+                self._exposure_ledger.record_execution(
+                    self._exposure_key,
+                    capability_id,
+                    valid=False,
+                    reason="candidate_identity_not_exposed",
+                )
+                return self._selection_result(
+                    task_text,
+                    _append_retrieval_identity(
+                        kwargs.get("retrieval_queries"),
+                        capability_id,
+                    ),
+                    reason="candidate_identity_not_exposed",
+                    defer_candidate_exposure=bool(
+                        kwargs.get("_defer_candidate_exposure")
+                    ),
+                )
+            command_text = normalize_message_text(str(kwargs.get("command_text") or ""))
+            if not command_text:
+                return self._not_executed(
+                    "invalid_arguments",
+                    capability_id=capability_id,
+                    reason="missing_command_text",
+                )
+            self._exposure_ledger.record_execution(
+                self._exposure_key,
+                capability_id,
+                valid=True,
+                reason="candidate_exposed",
+            )
+            return await self._executor.execute(
+                context,
+                capability_id=capability_id,
+                command_text=command_text,
+            )
+        return self._selection_result(
+            task_text,
+            kwargs.get("retrieval_queries"),
+            defer_candidate_exposure=bool(kwargs.get("_defer_candidate_exposure")),
+        )
+
+    def _selection_result(
+        self,
+        task_text: str,
+        retrieval_queries: object,
+        *,
+        reason: str = "",
+        defer_candidate_exposure: bool = False,
+    ) -> ToolResult:
+        queries = normalize_retrieval_queries(task_text, retrieval_queries)
+        index = _capability_search_index(self._capabilities, revision=self._revision)
+        rankings = [
+            [item.capability_id for _score, item in index.rank(query)]
+            for query in queries
+        ]
+        exact_ids = {
+            capability_id
+            for query in queries
+            for capability_id in _matched_capability_identity_ids(
+                self._capabilities,
+                query,
+            )
+        }
+        fused = fuse_sparse_rankings(queries, rankings, exact_ids=exact_ids)
+        ranked = [
+            self._capabilities_by_id[capability_id]
+            for capability_id in fused.ranked_ids
+            if capability_id in self._capabilities_by_id
+        ]
+        full_listing = not ranked
+        candidate_count = len(ranked) if ranked else len(self._capabilities)
+        recall = (
+            "gscore_full_listing"
+            if full_listing
+            else "gscore_sparse_multi_query"
+            if len(queries) > 1
+            else "gscore_sparse"
+        )
+        base_payload = {
+            "candidate_count": candidate_count,
+            "recall": recall,
+            "reason": reason,
+        }
+        selected = self._fit_candidates(
+            list(self._capabilities) if full_listing else ranked,
+            base_payload=base_payload,
+            candidate_count=candidate_count,
+        )
+        if full_listing and len(selected) < len(self._capabilities):
+            selected = []
+            recall = "gscore_no_recall"
+        if not defer_candidate_exposure:
+            self.expose_candidates(
+                (item.capability_id for item in selected),
+                source=recall,
+                pending=True,
+            )
+            self._exposure_ledger.record_discovery(
+                self._exposure_key,
+                source=recall,
+                query_count=len(queries),
+                candidate_count=candidate_count,
+                displayed_count=len(selected),
+                omitted_count=max(candidate_count - len(selected), 0),
+            )
+        return self._not_executed(
+            "selection_required",
+            candidates=[_capability_candidate_card(item) for item in selected],
+            candidate_count=candidate_count,
+            displayed_candidate_count=len(selected),
+            omitted_candidate_count=max(candidate_count - len(selected), 0),
+            truncated=len(selected) < candidate_count,
+            recall=recall,
+            reason=reason,
+        )
+
+    @property
+    def exposure_key(self) -> CandidateExposureKey:
+        return self._exposure_key
+
+    def owns_candidate_identity(self, identity: object) -> bool:
+        return normalize_message_text(str(identity or "")) in self._capabilities_by_id
+
+    def is_candidate_exposed(self, identity: object) -> bool:
+        return self._exposure_ledger.is_exposed(self._exposure_key, identity)
+
+    def expose_candidates(
+        self,
+        identities: Any,
+        *,
+        source: str,
+        pending: bool,
+        exact_identity: bool = False,
+    ) -> tuple[str, ...]:
+        valid = (
+            identity
+            for value in identities
+            if (
+                identity := normalize_message_text(str(value or ""))
+            ) in self._capabilities_by_id
+        )
+        return self._exposure_ledger.expose(
+            self._exposure_key,
+            valid,
+            discovery_source=source,
+            exact_identity=exact_identity,
+            pending=pending,
+        )
+
+    def record_discovery(
+        self,
+        *,
+        source: str,
+        query_count: int,
+        candidate_count: int,
+        displayed_count: int,
+        omitted_count: int,
+    ) -> None:
+        self._exposure_ledger.record_discovery(
+            self._exposure_key,
+            source=source,
+            query_count=query_count,
+            candidate_count=candidate_count,
+            displayed_count=displayed_count,
+            omitted_count=omitted_count,
+        )
+
+    def _fit_candidates(
+        self,
+        capabilities: list[GScoreCapability],
+        *,
+        base_payload: dict[str, Any],
+        candidate_count: int,
+    ) -> list[GScoreCapability]:
+        selected: list[GScoreCapability] = []
+        cards: list[dict[str, Any]] = []
+        for capability in capabilities:
+            trial_cards = [*cards, _capability_candidate_card(capability)]
+            output = {
+                "status": "selection_required",
+                "plugin_execution": False,
+                "executed": False,
+                "gscore_plugin": self.plugin_key,
+                **base_payload,
+                "candidates": trial_cards,
+                "displayed_candidate_count": len(trial_cards),
+                "omitted_candidate_count": max(
+                    candidate_count - len(trial_cards),
+                    0,
+                ),
+                "truncated": len(trial_cards) < candidate_count,
+            }
+            serialized = json.dumps(
+                {
+                    key: value
+                    for key, value in output.items()
+                    if value not in (None, "")
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+                default=str,
+            )
+            if (
+                estimate_text_tokens(serialized) > self._result_token_budget
+                or len(serialized) > self._result_char_budget
+            ):
+                continue
+            selected.append(capability)
+            cards = trial_cards
+        return selected
+
+    def _not_executed(self, status: str, **payload: Any) -> ToolResult:
+        return ToolResult(
+            output={
+                "status": status,
+                "plugin_execution": False,
+                "executed": False,
+                "gscore_plugin": self.plugin_key,
+                **{
+                    key: value
+                    for key, value in payload.items()
+                    if value not in (None, "")
+                },
+            },
+            display_content=f"{self.name}: {status}",
+            is_retryable=status == "selection_required",
         )
 
 
@@ -313,6 +956,8 @@ class GScoreAdapter:
         self._http_session: aiohttp.ClientSession | None = None
         self._revision_epoch = 0
         self._config_fingerprint = ""
+        self._transport_failure_count = 0
+        self._transport_backoff_until = 0.0
 
     @property
     def enabled(self) -> bool:
@@ -340,6 +985,7 @@ class GScoreAdapter:
             self._capabilities_loaded = False
             self._revision = ""
             self._revision_epoch += 1
+            self._clear_transport_backoff()
         return enabled, changed
 
     async def _prepare(self) -> bool:
@@ -351,6 +997,8 @@ class GScoreAdapter:
     async def route_turn(self, frame: Any) -> GScoreRouteResult:
         if not await self._prepare() or not _mixed_tools_allowed(frame):
             return GScoreRouteResult("disabled")
+        if not self._transport_probe_allowed():
+            return GScoreRouteResult("unknown", reason="transport_backoff")
         message_payload = build_gscore_event_payload(frame)
         if not message_payload:
             return GScoreRouteResult("disabled")
@@ -370,8 +1018,11 @@ class GScoreAdapter:
                 timeout_seconds=_ROUTE_TIMEOUT_SECONDS,
             )
         except (GScoreBridgeError, asyncio.TimeoutError) as exc:
+            self._record_transport_failure()
             logger.warning(f"ChatInter GScore route result unknown: {exc}")
             return GScoreRouteResult("unknown", reason=type(exc).__name__)
+
+        self._clear_transport_backoff()
 
         disposition = normalize_message_text(
             str(response.get("disposition") or "unknown")
@@ -394,33 +1045,46 @@ class GScoreAdapter:
             reason=normalize_message_text(str(response.get("reason") or "")),
         )
 
-    async def build_tool(self, frame: Any) -> GScoreExecutionTool | None:
+    async def build_tools(
+        self,
+        frame: Any,
+        *,
+        route_result: GScoreRouteResult,
+        exposure_ledger: CandidateExposureLedger | None = None,
+    ) -> dict[str, GScoreSkillDispatchTool]:
+        if route_result.disposition != "unmatched":
+            return {}
         if not await self._prepare() or not _mixed_tools_allowed(frame):
-            return None
+            return {}
         message_payload = build_gscore_event_payload(frame)
         if not message_payload:
-            return None
+            return {}
         capabilities = await self.get_capabilities()
         if not capabilities:
-            return None
-        capabilities = _select_capabilities(
-            capabilities,
-            _message_text(message_payload),
-            token_budget=_CAPABILITY_SCHEMA_TOKEN_BUDGET,
+            return {}
+        source_request_id = _route_request_id(
+            frame,
+            str(message_payload.get("msg_id", "") or ""),
         )
-        if not capabilities:
-            return None
-        return GScoreExecutionTool(
-            self,
-            capabilities,
-            message_payload,
-            _gscore_ws_bot_id(),
-            self._revision,
-            _route_request_id(
-                frame,
-                str(message_payload.get("msg_id", "") or ""),
-            ),
-        )
+        tools: dict[str, GScoreSkillDispatchTool] = {}
+        for plugin_key, grouped in _group_gscore_capabilities(capabilities):
+            executor = GScoreExecutionTool(
+                self,
+                grouped,
+                message_payload,
+                _gscore_ws_bot_id(),
+                self._revision,
+                source_request_id,
+            )
+            tool = GScoreSkillDispatchTool(
+                plugin_key=plugin_key,
+                capabilities=grouped,
+                executor=executor,
+                revision=self._revision,
+                exposure_ledger=exposure_ledger,
+            )
+            tools[tool.name] = tool
+        return dict(sorted(tools.items()))
 
     async def get_capabilities(self) -> tuple[GScoreCapability, ...]:
         if not await self._prepare():
@@ -430,6 +1094,8 @@ class GScoreAdapter:
         async with self._capability_lock:
             if self._capabilities_loaded:
                 return self._capabilities
+            if not self._transport_probe_allowed():
+                return ()
             for _attempt in range(2):
                 observed_epoch = self._revision_epoch
                 try:
@@ -440,10 +1106,12 @@ class GScoreAdapter:
                         timeout_seconds=_CAPABILITY_TIMEOUT_SECONDS,
                     )
                 except (GScoreBridgeError, asyncio.TimeoutError) as exc:
+                    self._record_transport_failure()
                     logger.warning(
                         f"ChatInter GScore capability discovery failed: {exc}"
                     )
                     return ()
+                self._clear_transport_backoff()
                 revision = normalize_message_text(str(response.get("revision") or ""))
                 if (
                     self._revision_epoch != observed_epoch
@@ -462,7 +1130,22 @@ class GScoreAdapter:
                 self._capabilities = capabilities
                 self._capabilities_loaded = True
                 return self._capabilities
-            return ()
+        return ()
+
+    def _transport_probe_allowed(self) -> bool:
+        return time.monotonic() >= self._transport_backoff_until
+
+    def _record_transport_failure(self) -> None:
+        self._transport_failure_count = min(
+            self._transport_failure_count + 1,
+            len(_TRANSPORT_BACKOFF_SECONDS),
+        )
+        delay = _TRANSPORT_BACKOFF_SECONDS[self._transport_failure_count - 1]
+        self._transport_backoff_until = time.monotonic() + delay
+
+    def _clear_transport_backoff(self) -> None:
+        self._transport_failure_count = 0
+        self._transport_backoff_until = 0.0
 
     async def execute(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._request_json(
@@ -470,6 +1153,14 @@ class GScoreAdapter:
             "/execute",
             payload,
             timeout_seconds=_EXECUTE_TIMEOUT_SECONDS,
+        )
+
+    async def execution_status(self, request_id: str) -> dict[str, Any]:
+        return await self._request_json(
+            "GET",
+            f"/executions/{request_id}",
+            None,
+            timeout_seconds=_EXECUTION_STATUS_TIMEOUT_SECONDS,
         )
 
     def _observe_revision(self, revision: str) -> None:
@@ -640,6 +1331,94 @@ def _external_delivery_result(
     )
 
 
+def _execution_no_output_result() -> ToolResult:
+    return ToolResult(
+        output={
+            "status": "succeeded",
+            "plugin_execution": True,
+            "submitted": True,
+            "executed": True,
+            "execution_uncertain": False,
+            "external_delivery": False,
+            "delivery_observed": False,
+            "delivery_state": "no_output",
+        },
+        display_content="操作已执行完成。",
+        is_error=False,
+        is_retryable=False,
+    )
+
+
+def _execution_failed_result(*, delivery_state: str) -> ToolResult:
+    return ToolResult(
+        output={
+            "status": "failed",
+            "plugin_execution": True,
+            "submitted": True,
+            "executed": False,
+            "execution_uncertain": False,
+            "external_delivery": False,
+            "delivery_observed": False,
+            "delivery_state": delivery_state,
+        },
+        display_content="外部插件执行失败。",
+        is_error=True,
+        is_retryable=False,
+    )
+
+
+def _execution_status(response: dict[str, Any]) -> str:
+    status = normalize_message_text(
+        str(
+            response.get("execution_state")
+            or response.get("execution_status")
+            or response.get("status")
+            or response.get("disposition")
+            or ""
+        )
+    ).casefold()
+    if status in {"success", "succeeded", "complete", "completed"}:
+        return "succeeded"
+    if status in {"error", "failed", "rejected", "blocked", "cancelled"}:
+        return "failed"
+    if status in {"accepted", "pending", "queued", "running", "processing"}:
+        return "pending"
+    return status
+
+
+def _execution_has_no_output(
+    response: dict[str, Any],
+    *,
+    delivery_state: str,
+) -> bool:
+    output_state = normalize_message_text(
+        str(response.get("output_state") or "")
+    ).casefold()
+    return bool(
+        response.get("no_output") is True
+        or delivery_state == "no_output"
+        or output_state == "no_output"
+    )
+
+
+def _log_execution_event(level: str, event: str, **fields: Any) -> None:
+    payload = {
+        "event": event,
+        **{key: value for key, value in fields.items() if value not in (None, "")},
+    }
+    message = "ChatInter GScore execution " + json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    if level == "warning":
+        logger.warning(message)
+    else:
+        logger.info(message)
+
+
 def _delivery_observation(response: dict[str, Any]) -> tuple[str, bool]:
     state = normalize_message_text(str(response.get("delivery_state") or "unknown"))
     state = state.casefold()
@@ -654,88 +1433,441 @@ def _delivery_observation(response: dict[str, Any]) -> tuple[str, bool]:
 
 
 def _capability_card(capability: GScoreCapability) -> str:
-    fields = [f"[{capability.capability_id}]", capability.name]
-    if capability.description:
-        fields.append(capability.description)
-    if capability.aliases:
-        fields.append("aliases=" + ", ".join(capability.aliases))
-    if capability.examples:
-        fields.append("examples=" + " | ".join(capability.examples))
-    fields.append(
-        "triggers="
-        + " | ".join(
-            _trigger_pattern_projection(pattern)
-            for pattern in capability.trigger_patterns
+    return json.dumps(
+        _capability_candidate_card(capability),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        default=str,
+    )
+
+
+def _capability_candidate_card(capability: GScoreCapability) -> dict[str, Any]:
+    display_name = _capability_display_name(capability)
+    regex_identities = _regex_trigger_identities(capability)
+    aliases = [value for value in capability.aliases if value not in regex_identities]
+    card: dict[str, Any] = {
+        "capability_id": capability.capability_id,
+        "plugin": capability.plugin,
+        "name": display_name,
+        "description": capability.description,
+        "aliases": aliases,
+        "examples": list(capability.examples),
+        "domain": capability.capability_domain,
+        "context_tags": list(capability.context_tags),
+        "parameters": capability.parameters or {},
+        "triggers": _project_trigger_groups(capability.trigger_patterns),
+        "command_forms": _project_command_forms(capability.trigger_patterns),
+    }
+    return {
+        key: value for key, value in card.items() if value not in (None, "", [], (), {})
+    }
+
+
+def _group_gscore_capabilities(
+    capabilities: tuple[GScoreCapability, ...],
+) -> tuple[tuple[str, tuple[GScoreCapability, ...]], ...]:
+    grouped: dict[str, list[GScoreCapability]] = {}
+    labels: dict[str, str] = {}
+    for capability in capabilities:
+        label = normalize_message_text(
+            capability.plugin
+            or capability.capability_domain
+            or capability.service
+            or "GScore"
         )
+        key = label.casefold()
+        labels.setdefault(key, label)
+        grouped.setdefault(key, []).append(capability)
+    return tuple(
+        (
+            labels[key],
+            tuple(sorted(grouped[key], key=lambda item: item.capability_id)),
+        )
+        for key in sorted(grouped)
     )
-    fields.append(
-        "command_text=填写能匹配上述任一 trigger 的完整实际命令；"
-        "regex 需填写实际匹配文本，不要填写正则本身"
-    )
-    return " ; ".join(fields)
 
 
-def _select_capabilities(
+def _gscore_skill_tool_name(plugin_key: str) -> str:
+    normalized = normalize_message_text(plugin_key).casefold()
+    digest = hashlib.blake2s(normalized.encode("utf-8"), digest_size=5).hexdigest()
+    slug = re.sub(r"[^a-z0-9_]+", "_", normalized).strip("_")[:32]
+    return f"{_GSCORE_SKILL_TOOL_PREFIX}{slug or 'plugin'}_{digest}"
+
+
+def _gscore_skill_metadata(
+    plugin_key: str,
+    capabilities: tuple[GScoreCapability, ...],
+) -> dict[str, Any]:
+    domains = _bounded_unique_texts(
+        (item.capability_domain for item in capabilities),
+        total_chars=320,
+    )
+    summaries = _bounded_unique_texts(
+        (
+            item.retrieval_summary or item.description or item.service
+            for item in capabilities
+        ),
+        total_chars=720,
+    )
+    metadata: dict[str, Any] = {
+        "plugin": plugin_key,
+        "capability_count": len(capabilities),
+        "domains": domains,
+        "summaries": summaries,
+    }
+    return {
+        key: value for key, value in metadata.items() if value not in (None, "", [])
+    }
+
+
+def _bounded_unique_texts(
+    values: Any,
+    *,
+    total_chars: int,
+) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    used = 0
+    for value in values:
+        text = normalize_message_text(str(value or ""))
+        key = text.casefold()
+        if not text or key in seen:
+            continue
+        remaining = total_chars - used
+        if remaining <= 0:
+            break
+        clipped = text[:remaining]
+        result.append(clipped)
+        seen.add(key)
+        used += len(clipped)
+    return result
+
+
+def _project_trigger_groups(
+    patterns: tuple[GScoreTriggerPattern, ...],
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str, bool], list[str]] = {}
+    for pattern in patterns:
+        key = (pattern.trigger_type, pattern.keyword, pattern.to_me)
+        prefixes = grouped.setdefault(key, [])
+        if pattern.prefix not in prefixes:
+            prefixes.append(pattern.prefix)
+    return [
+        {
+            "type": trigger_type,
+            "keyword": keyword,
+            "prefixes": prefixes,
+            **({"to_me": True} if to_me else {}),
+        }
+        for (trigger_type, keyword, to_me), prefixes in grouped.items()
+    ]
+
+
+def _project_command_forms(
+    patterns: tuple[GScoreTriggerPattern, ...],
+) -> list[dict[str, Any]]:
+    """Project trigger metadata into complete, copyable command constraints."""
+    forms: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        if pattern.trigger_type == "fullmatch":
+            form: dict[str, Any] = {
+                "type": "fullmatch",
+                "command_text": pattern.command,
+            }
+        elif pattern.trigger_type in {"command", "prefix"}:
+            form = {
+                "type": pattern.trigger_type,
+                "literal_head": pattern.command,
+                "arguments": (
+                    "required_after_head"
+                    if pattern.trigger_type == "prefix"
+                    else "optional_after_head"
+                ),
+            }
+        elif pattern.trigger_type == "keyword":
+            form = {
+                "type": "keyword",
+                "required_keyword": pattern.keyword,
+                **(
+                    {"literal_prefix": pattern.prefix}
+                    if pattern.prefix
+                    else {}
+                ),
+            }
+        elif pattern.trigger_type == "suffix":
+            form = {
+                "type": "suffix",
+                "literal_suffix": pattern.keyword,
+                "arguments": "required_before_suffix",
+                **(
+                    {"literal_prefix": pattern.prefix}
+                    if pattern.prefix
+                    else {}
+                ),
+            }
+        else:
+            form = {
+                "type": "regex",
+                "pattern": pattern.keyword,
+                **(
+                    {"literal_prefix": pattern.prefix}
+                    if pattern.prefix
+                    else {}
+                ),
+            }
+        if pattern.to_me:
+            form["to_me"] = True
+        identity = json.dumps(
+            form,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if identity not in seen:
+            seen.add(identity)
+            forms.append(form)
+    return forms
+
+
+def _matched_capability_identity_ids(
     capabilities: tuple[GScoreCapability, ...],
     message_text: str,
+) -> frozenset[str]:
+    query_identity = _search_normalize(message_text)
+    if not query_identity:
+        return frozenset()
+    return frozenset(
+        capability.capability_id
+        for capability in capabilities
+        if any(
+            identity == query_identity
+            for identity, _weight in _capability_search_identities(capability)
+            if identity
+        )
+    )
+
+
+def _append_retrieval_identity(
+    retrieval_queries: object,
+    identity: str,
+) -> list[object]:
+    values = list(
+        retrieval_queries
+        if isinstance(retrieval_queries, list | tuple)
+        else ()
+    )
+    values.append(identity)
+    return values
+
+
+def _capability_search_index(
+    capabilities: tuple[GScoreCapability, ...],
     *,
-    token_budget: int,
-) -> tuple[GScoreCapability, ...]:
-    query = _search_normalize(message_text)
-    if not query or token_budget <= 0:
-        return ()
-    ranked = sorted(
-        (
-            (_capability_score(capability, query), capability)
-            for capability in capabilities
+    revision: str = "",
+) -> _CapabilitySearchIndex:
+    content_fingerprint = _capability_index_fingerprint(capabilities)
+    cache_key = f"{_CAPABILITY_INDEX_VERSION}:{revision}:{content_fingerprint}"
+    cached = _CAPABILITY_INDEX_CACHE.get(cache_key)
+    if cached is not None:
+        _CAPABILITY_INDEX_CACHE.move_to_end(cache_key)
+        return cached
+
+    raw_documents: list[
+        tuple[
+            GScoreCapability,
+            dict[str, list[str]],
+            tuple[tuple[str, float], ...],
+        ]
+    ] = []
+    document_frequency: Counter[str] = Counter()
+    identity_document_frequency: Counter[str] = Counter()
+    field_length_totals: Counter[str] = Counter()
+    field_document_counts: Counter[str] = Counter()
+    for capability in capabilities:
+        fields = _capability_search_fields(capability)
+        identities = _capability_search_identities(capability)
+        raw_documents.append((capability, fields, identities))
+        document_frequency.update({term for terms in fields.values() for term in terms})
+        identity_document_frequency.update({value for value, _weight in identities})
+        for field, terms in fields.items():
+            if terms:
+                field_length_totals[field] += len(terms)
+                field_document_counts[field] += 1
+
+    document_count = max(len(raw_documents), 1)
+    idf = {
+        term: math.log1p((document_count - frequency + 0.5) / (frequency + 0.5))
+        for term, frequency in document_frequency.items()
+    }
+    documents = tuple(
+        _CapabilitySearchDocument(
+            capability=capability,
+            field_counts={
+                field: dict(Counter(terms)) for field, terms in fields.items()
+            },
+            field_lengths={field: len(terms) for field, terms in fields.items()},
+            identities=identities,
+        )
+        for capability, fields, identities in raw_documents
+    )
+    index = _CapabilitySearchIndex(
+        documents=documents,
+        idf=idf,
+        average_field_lengths={
+            field: field_length_totals[field] / count
+            for field, count in field_document_counts.items()
+            if count > 0
+        },
+        identity_document_frequency=dict(identity_document_frequency),
+    )
+    _CAPABILITY_INDEX_CACHE[cache_key] = index
+    _CAPABILITY_INDEX_CACHE.move_to_end(cache_key)
+    while len(_CAPABILITY_INDEX_CACHE) > _CAPABILITY_INDEX_CACHE_LIMIT:
+        _CAPABILITY_INDEX_CACHE.popitem(last=False)
+    return index
+
+
+def _capability_search_fields(
+    capability: GScoreCapability,
+) -> dict[str, list[str]]:
+    trigger_values = [
+        value
+        for pattern in capability.trigger_patterns
+        if pattern.trigger_type != "regex"
+        for value in (pattern.keyword, pattern.command)
+    ]
+    aliases = [
+        value
+        for value in capability.aliases
+        if value not in _regex_trigger_identities(capability)
+    ]
+    name_values = [_capability_display_name(capability)]
+    summary_field = "summary" if "to_ai" in capability.metadata_sources else "fallback"
+    raw_fields: dict[str, list[str]] = {
+        "trigger": trigger_values,
+        "alias": aliases,
+        "service": [capability.service],
+        "name": name_values,
+        "example": list(capability.examples),
+        "context_tag": list(capability.context_tags),
+        summary_field: [capability.retrieval_summary],
+        "domain": [capability.capability_domain],
+        "plugin": [capability.plugin],
+        "schema": list(_schema_search_fields(capability.parameters)),
+    }
+    return {
+        field: [term for value in values for term in _capability_search_terms(value)]
+        for field, values in raw_fields.items()
+    }
+
+
+def _capability_search_identities(
+    capability: GScoreCapability,
+) -> tuple[tuple[str, float], ...]:
+    weighted_values = [
+        (capability.capability_id, 7.0),
+        *(
+            (pattern.keyword, 6.0)
+            for pattern in capability.trigger_patterns
+            if pattern.trigger_type != "regex"
         ),
-        key=lambda item: (-item[0], item[1].capability_id),
-    )
-    selected: list[GScoreCapability] = []
-    used_tokens = 0
-    for score, capability in ranked:
-        if score <= 0:
-            break
-        card_tokens = estimate_text_tokens(_capability_card(capability)) + 16
-        if used_tokens + card_tokens > token_budget:
+        *(
+            (pattern.command, 6.0)
+            for pattern in capability.trigger_patterns
+            if pattern.trigger_type != "regex"
+        ),
+        *((value, 5.0) for value in capability.aliases),
+        (capability.service, 4.5),
+        (_capability_display_name(capability), 4.0),
+    ]
+    identities: dict[str, float] = {}
+    regex_identities = _regex_trigger_identities(capability)
+    for value, weight in weighted_values:
+        if value in regex_identities:
             continue
-        selected.append(capability)
-        used_tokens += card_tokens
-    return tuple(sorted(selected, key=lambda item: item.capability_id))
+        identity = _search_normalize(value)
+        if identity:
+            identities[identity] = max(identities.get(identity, 0.0), weight)
+    return tuple(sorted(identities.items()))
 
 
-def _capability_score(capability: GScoreCapability, query: str) -> float:
-    weighted_fields = (
-        *((pattern.keyword, 5.0) for pattern in capability.trigger_patterns),
-        *((pattern.command, 5.0) for pattern in capability.trigger_patterns),
-        *((value, 4.0) for value in capability.aliases),
-        (capability.name, 3.5),
-        *((value, 3.0) for value in capability.examples),
-        *((value, 2.5) for value in capability.context_tags),
-        (capability.description, 2.0),
-        (capability.capability_domain, 1.75),
-        (capability.plugin, 1.5),
-        *((value, 1.0) for value in _schema_search_fields(capability.parameters)),
-    )
-    fields: dict[str, float] = {}
-    for value, weight in weighted_fields:
-        normalized = _search_normalize(value)
-        if normalized:
-            fields[normalized] = max(fields.get(normalized, 0.0), weight)
-    query_units = _search_units(query)
-    score = 0.0
-    for value, weight in fields.items():
-        if value in query:
-            score += weight * 2.0
-        value_units = _search_units(value)
-        if not value_units or not query_units:
+def _capability_search_terms(value: object) -> list[str]:
+    normalized = normalize_message_text(str(value or "")).casefold()
+    terms: list[str] = []
+    for match in _ASCII_SEARCH_TERM_PATTERN.findall(normalized):
+        lowered = match.casefold()
+        terms.append(lowered)
+        terms.extend(
+            part for part in re.split(r"[_.:/-]+", lowered) if part and part != lowered
+        )
+    for chunk in _CJK_SEARCH_CHUNK_PATTERN.findall(normalized):
+        chunk = "".join(
+            char for char in chunk if char not in _CAPABILITY_SEARCH_STOP_CHARS
+        )
+        if not chunk:
             continue
-        overlap = len(value_units & query_units)
-        if overlap:
-            precision = overlap / len(query_units)
-            recall = overlap / len(value_units)
-            score += weight * (precision * 0.65 + recall * 0.35)
-    return score
+        if len(chunk) == 1:
+            terms.append(chunk)
+            continue
+        max_size = min(len(chunk), 4)
+        for size in range(2, max_size + 1):
+            terms.extend(
+                chunk[start : start + size] for start in range(len(chunk) - size + 1)
+            )
+    return terms
+
+
+def _regex_trigger_identities(capability: GScoreCapability) -> frozenset[str]:
+    return frozenset(
+        value
+        for pattern in capability.trigger_patterns
+        if pattern.trigger_type == "regex"
+        for value in (pattern.keyword, pattern.command)
+        if value
+    )
+
+
+def _capability_name_contains_regex(capability: GScoreCapability) -> bool:
+    return any(
+        pattern and pattern in capability.name
+        for pattern in _regex_trigger_identities(capability)
+    )
+
+
+def _capability_display_name(capability: GScoreCapability) -> str:
+    if not _capability_name_contains_regex(capability):
+        return capability.name
+    if capability.service:
+        return capability.service
+    name = capability.name
+    for pattern in _regex_trigger_identities(capability):
+        name = name.replace(pattern, " ")
+    normalized = normalize_message_text(name).strip(" -:：")
+    return normalized or capability.plugin
+
+
+def _capability_index_fingerprint(
+    capabilities: tuple[GScoreCapability, ...],
+) -> str:
+    digest = hashlib.blake2s(digest_size=16)
+    for capability in capabilities:
+        payload = {
+            "capability_id": capability.capability_id,
+            "fields": _capability_search_fields(capability),
+            "identities": _capability_search_identities(capability),
+        }
+        digest.update(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _search_normalize(value: object) -> str:
@@ -744,12 +1876,6 @@ def _search_normalize(value: object) -> str:
         for char in normalize_message_text(str(value or ""))
         if char.isalnum()
     )
-
-
-def _search_units(value: str) -> set[str]:
-    if len(value) < 2:
-        return {value} if value else set()
-    return {value[index : index + 2] for index in range(len(value) - 1)}
 
 
 def _message_text(message_payload: dict[str, Any]) -> str:
@@ -761,6 +1887,24 @@ def _message_text(message_payload: dict[str, Any]) -> str:
         for item in content
         if isinstance(item, dict) and str(item.get("type") or "") == "text"
     )
+
+
+def _frame_retrieval_context(frame: Any) -> str:
+    thread = getattr(frame, "thread_context", None)
+    if thread is None:
+        return ""
+    values: list[object] = [getattr(thread, "topic_key", "")]
+    values.extend(getattr(thread, "entity_hints", ()) or ())
+    values.extend(getattr(thread, "pending_entities", ()) or ())
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = normalize_message_text(str(value or ""))
+        key = text.casefold()
+        if text and key not in seen:
+            seen.add(key)
+            normalized.append(text)
+    return " ".join(normalized)
 
 
 def _string_tuple(value: object) -> tuple[str, ...]:
@@ -779,6 +1923,25 @@ def _string_tuple(value: object) -> tuple[str, ...]:
             seen.add(key)
             result.append(text)
     return tuple(result)
+
+
+def _payload_retrieval_summary(
+    payload: dict[str, Any],
+    description: str,
+) -> str:
+    explicit = normalize_message_text(str(payload.get("retrieval_summary") or ""))
+    if explicit:
+        return explicit
+    normalized = str(description or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines: list[str] = []
+    for line in normalized.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if lines:
+                break
+            continue
+        lines.append(stripped)
+    return normalize_message_text(" ".join(lines))
 
 
 def _exact_string_tuple(value: object) -> tuple[str, ...]:
@@ -965,6 +2128,20 @@ def _merge_capabilities(
     )
 
 
+def _merge_capabilities_preserving_order(
+    capabilities: tuple[GScoreCapability, ...],
+) -> tuple[GScoreCapability, ...]:
+    grouped: dict[str, list[GScoreCapability]] = {}
+    for capability in capabilities:
+        grouped.setdefault(capability.capability_id, []).append(capability)
+    return tuple(
+        merged
+        for group in grouped.values()
+        if (merged := _merge_capability_group(group)).metadata_sources
+        and merged.trigger_patterns
+    )
+
+
 def _merge_capability_group(
     capabilities: list[GScoreCapability],
 ) -> GScoreCapability:
@@ -1005,6 +2182,8 @@ def _merge_capability_group(
         name=first_text("name"),
         description=first_text("description"),
         plugin=first_text("plugin"),
+        service=first_text("service"),
+        retrieval_summary=first_text("retrieval_summary"),
         metadata_sources=_merge_string_tuples(item.metadata_sources for item in ranked),
         aliases=_merge_string_tuples(item.aliases for item in ranked),
         examples=_merge_string_tuples(item.examples for item in ranked),
@@ -1235,42 +2414,55 @@ def _cached_native_match(
     )
     if not text:
         return False
+    return any(
+        _command_matches_capability(capability, text, message=message)
+        for capability in capabilities
+    )
+
+
+def _command_matches_capability(
+    capability: GScoreCapability,
+    command_text: str,
+    *,
+    message: dict[str, Any],
+) -> bool:
+    text = normalize_message_text(command_text)
+    if not text:
+        return False
     is_tome = message.get("user_type") == "direct" or any(
         isinstance(item, dict)
         and item.get("type") == "at"
         and str(item.get("data") or "") == str(message.get("bot_self_id") or "")
         for item in message.get("content", ())
     )
-    for capability in capabilities:
-        for pattern in capability.trigger_patterns:
-            if pattern.to_me and not is_tome:
+    for pattern in capability.trigger_patterns:
+        if pattern.to_me and not is_tome:
+            continue
+        prefix = pattern.prefix
+        keyword = pattern.keyword
+        head = pattern.command
+        trigger_type = pattern.trigger_type
+        if trigger_type == "fullmatch" and text == head:
+            return True
+        if trigger_type == "command" and text.startswith(head):
+            return True
+        if trigger_type == "prefix" and text.startswith(head) and text != head:
+            return True
+        if trigger_type == "keyword" and text.startswith(prefix) and keyword in text:
+            return True
+        if (
+            trigger_type == "suffix"
+            and text.startswith(prefix)
+            and text.endswith(keyword)
+            and text != head
+        ):
+            return True
+        if trigger_type == "regex" and text.startswith(prefix):
+            try:
+                if re.search(keyword, text[len(prefix) :]):
+                    return True
+            except re.error:
                 continue
-            prefix = pattern.prefix
-            keyword = pattern.keyword
-            head = pattern.command
-            if pattern.trigger_type == "fullmatch" and text == head:
-                return True
-            if pattern.trigger_type == "command" and text.startswith(head):
-                return True
-            if (
-                pattern.trigger_type == "prefix"
-                and text.startswith(head)
-                and text != head
-            ):
-                return True
-            if (
-                pattern.trigger_type == "keyword"
-                and text.startswith(prefix)
-                and keyword in text
-            ):
-                return True
-            if (
-                pattern.trigger_type == "suffix"
-                and text.startswith(prefix)
-                and text.endswith(keyword)
-                and text != head
-            ):
-                return True
     return False
 
 
@@ -1283,6 +2475,7 @@ __all__ = [
     "GScoreCapability",
     "GScoreExecutionTool",
     "GScoreRouteResult",
+    "GScoreSkillDispatchTool",
     "build_gscore_event_payload",
     "get_gscore_adapter",
 ]

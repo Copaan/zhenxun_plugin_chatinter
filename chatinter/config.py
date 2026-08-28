@@ -1,5 +1,4 @@
 import math
-import os
 from typing import Any, Literal
 
 from zhenxun.configs.config import Config
@@ -30,8 +29,6 @@ ChatWebSearchProvider = Literal[
 ]
 DEFAULT_MODELS_SOURCE = "DEFAULT_MODELS"
 DEFAULT_CHAT_WEB_SEARCH_API_URL = "DEFAULT"
-COMMAND_VECTOR_RECALL_ENV = "CHATINTER_COMMAND_VECTOR_RECALL"
-COMMAND_VECTOR_RECALL_MODEL_ENV = "CHATINTER_COMMAND_VECTOR_RECALL_MODEL"
 _REASONING_EFFORTS = frozenset(
     {"DEFAULT", "NONE", "MINIMAL", "LOW", "MEDIUM", "HIGH", "XHIGH", "MAX"}
 )
@@ -77,6 +74,14 @@ _DEFAULT_REPLY_DELIVERY = {
     "interval_method": "random",
     "interval": "1.5,3.5",
     "log_base": 2.6,
+}
+_DEFAULT_REACTION_IMAGES = {
+    "enabled": False,
+    "directory": "data/chatinter/reactions",
+    "import_directory": "data/chatinter/reaction_import",
+    "semantic_search": True,
+    "auto_caption": True,
+    "auto_discovery": False,
 }
 
 CHATINTER_REGISTER_CONFIGS = (
@@ -160,6 +165,19 @@ CHATINTER_REGISTER_CONFIGS = (
             "log_base 为按下一段长度计算等待时使用的对数底数"
         ),
         default_value=dict(_DEFAULT_REPLY_DELIVERY),
+        type=dict,
+    ),
+    RegisterConfig(
+        module=CHATINTER_GROUP,
+        key="REACTION_IMAGES",
+        value=dict(_DEFAULT_REACTION_IMAGES),
+        help=(
+            "混合聊天本地表情能力；enabled 开启后注入语义发现与发送工具，"
+            "directory 为表情库目录，import_directory 为启动时扫描的导入目录，"
+            "semantic_search/auto_caption 控制语义索引，auto_discovery 控制群聊"
+            "重复图片发现"
+        ),
+        default_value=dict(_DEFAULT_REACTION_IMAGES),
         type=dict,
     ),
     RegisterConfig(
@@ -274,11 +292,8 @@ AGENT_COST_CHECKPOINT_TOKENS: dict[str, int] = {
 }
 
 
-EXPOSE_FALLBACK_SCHEMAS = False
-SCHEMA_FALLBACK_ALLOWLIST: frozenset[str] = frozenset()
 
 
-MEMORY_VECTOR_MAX_ITEMS = 0
 
 SUPERUSER_MODEL_TIMEOUT_SECONDS = 120.0
 
@@ -472,6 +487,47 @@ def get_reply_delivery_interval_settings() -> tuple[str, tuple[float, float], fl
     return method, interval, log_base
 
 
+def get_reaction_image_settings() -> dict[str, Any]:
+    raw = Config.get_config(
+        CHATINTER_GROUP,
+        "REACTION_IMAGES",
+        _DEFAULT_REACTION_IMAGES,
+    )
+    configured = raw if isinstance(raw, dict) else {}
+    directory = str(
+        configured.get("directory") or _DEFAULT_REACTION_IMAGES["directory"]
+    ).strip()
+    if not directory:
+        directory = str(_DEFAULT_REACTION_IMAGES["directory"])
+    import_directory = str(
+        configured.get("import_directory")
+        or _DEFAULT_REACTION_IMAGES["import_directory"]
+    ).strip()
+    if not import_directory:
+        import_directory = str(_DEFAULT_REACTION_IMAGES["import_directory"])
+    return {
+        "enabled": _parse_bool(configured.get("enabled"), False),
+        "directory": directory,
+        "import_directory": import_directory,
+        "semantic_search": _parse_bool(
+            configured.get("semantic_search"),
+            True,
+        ),
+        "auto_caption": _parse_bool(configured.get("auto_caption"), True),
+        "auto_discovery": _parse_bool(
+            configured.get(
+                "auto_discovery",
+                configured.get("auto_collect", False),
+            ),
+            False,
+        ),
+    }
+
+
+def reaction_images_enabled() -> bool:
+    return bool(get_reaction_image_settings()["enabled"])
+
+
 def get_chat_history_limit() -> int:
     raw = Config.get_config(CHATINTER_GROUP, "CHAT_HISTORY_LIMIT", 100)
     try:
@@ -509,27 +565,6 @@ def get_web_access_mode() -> WebAccessMode:
     raw = str(Config.get_config(CHATINTER_GROUP, "WEB_ACCESS_MODE", "agent") or "")
     value = raw.strip().casefold()
     return value if value in {"off", "agent", "all"} else "agent"
-
-
-def command_vector_recall_enabled() -> bool:
-    """命令向量召回（零词法召回时的 embedding 第二通道）是否启用。
-
-    刻意不进 ``CHATINTER_REGISTER_CONFIGS``：该注册表是被测试冻结的最小用户配置
-    面（tests/runtime/test_chatinter_config.py），这是一个内部性能开关而不是用户
-    功能开关，因此走环境变量，默认开启。
-    """
-
-    return _parse_bool(os.environ.get(COMMAND_VECTOR_RECALL_ENV), True)
-
-
-def command_vector_recall_model() -> str:
-    """命令向量召回使用的 embedding 模型名。
-
-    留空表示复用全局默认 embedding 模型，与 knowledge_rag_retrieval 完全一致
-    （后者也是直接调用 ``llm.api.embed`` 不指定 model）。
-    """
-
-    return str(os.environ.get(COMMAND_VECTOR_RECALL_MODEL_ENV) or "").strip()
 
 
 def chat_web_search_enabled() -> bool:
@@ -678,12 +713,19 @@ def build_agent_generation_config(
     max_output_tokens: int | None = None,
 ) -> LLMGenerationConfig:
     config = build_reasoning_generation_config(role) or LLMGenerationConfig()
+    validation_policy = dict(config.validation_policy or {})
+    validation_policy["chatinter_reasoning_transport_policy"] = "capability_gated"
     output_tokens = (
         get_agent_max_output_tokens(role)
         if max_output_tokens is None
         else max(int(max_output_tokens), 1)
     )
-    return config.model_copy(update={"max_tokens": output_tokens})
+    return config.model_copy(
+        update={
+            "max_tokens": output_tokens,
+            "validation_policy": validation_policy,
+        }
+    )
 
 
 def build_superuser_generation_config() -> LLMGenerationConfig:

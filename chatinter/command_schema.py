@@ -7,6 +7,7 @@ command_id + slots，再确定性渲染回原命令文本。
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any
 
@@ -39,9 +40,10 @@ _QUERY_ROLE_TERMS = (
     "排行",
     "详情",
 )
-_SELF_SCOPE_TERMS = ("我的", "自己", "本人", "个人", "我")
 _ASCII_TARGET_TERMS = {"at", "user", "member", "target", "nickname"}
 _CJK_TARGET_TERMS = ("用户", "成员", "群友", "目标", "对象", "昵称")
+_TEXT_POSITIONAL_SLOT_TYPES = {"text", "int", "float", "bool"}
+_LOGGER = logging.getLogger(__name__)
 
 
 def _slot(
@@ -53,6 +55,7 @@ def _slot(
     aliases: list[str] | None = None,
     description: str = "",
     choices: list[str] | None = None,
+    renderer: str = "{value}",
 ) -> CommandSlotSpec:
     return CommandSlotSpec(
         name=name,
@@ -62,6 +65,7 @@ def _slot(
         aliases=list(aliases or []),
         description=description,
         choices=_normalize_choices(choices or []),
+        renderer=renderer,
     )
 
 
@@ -86,6 +90,7 @@ def _schema(
     confidence: float = 0.85,
     matcher_key: str | None = None,
     retrieval_phrases: list[str] | None = None,
+    argument_source: str = "unknown",
 ) -> PluginCommandSchema:
     normalized_head = normalize_message_text(head)
     normalized_aliases = [
@@ -132,6 +137,7 @@ def _schema(
         confidence=confidence,
         matcher_key=matcher_key,
         retrieval_phrases=phrases,
+        argument_source=argument_source,  # type: ignore[arg-type]
     )
 
 
@@ -240,7 +246,7 @@ def _contains_target_term(text: str) -> bool:
     if "@" in normalized or any(term in normalized for term in _CJK_TARGET_TERMS):
         return True
     return any(
-        token in _ASCII_TARGET_TERMS
+        token in _ASCII_TARGET_TERMS or token.rstrip("s") in _ASCII_TARGET_TERMS
         for token in re.findall(r"[a-z]+", normalized)
     )
 
@@ -300,7 +306,14 @@ def _target_sources_from_capability(command: CommandCapability) -> list[str]:
 
 def _is_internal_media_param(name: str, requirement: Any) -> bool:
     normalized = _normalize_param_name(name)
-    media_named = normalized in {"img", "image", "images", "图片"} or (
+    media_named = normalized in {
+        "data",
+        "img",
+        "imgs",
+        "image",
+        "images",
+        "图片",
+    } or (
         _slot_type_from_name(name) == "image"
     )
     aggregate_media = _is_generic_aggregate_param(name)
@@ -366,7 +379,9 @@ def _slot_type_from_name(name: str) -> str:
         return "int"
     if any(token in normalized for token in ("ratio", "rate", "概率", "比例", "倍率")):
         return "float"
-    if any(token in normalized for token in ("image", "图片", "图", "照片")):
+    if normalized in {"img", "imgs"} or any(
+        token in normalized for token in ("image", "图片", "图", "照片")
+    ):
         return "image"
     if _contains_target_term(normalized):
         return "at"
@@ -407,6 +422,22 @@ def _slot_choices_from_requirement(
     return result
 
 
+def _slot_mapping_from_requirement(
+    requirement: CommandRequirement,
+    field: str,
+) -> dict[str, str]:
+    raw = getattr(requirement, field, None)
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, str] = {}
+    for raw_name, raw_value in raw.items():
+        name = normalize_message_text(str(raw_name or ""))
+        value = normalize_message_text(str(raw_value or ""))
+        if name and value:
+            result[name] = value
+    return result
+
+
 def _slot_type_from_examples(name: str, values: list[str]) -> str:
     by_name = _slot_type_from_name(name)
     if by_name != "text":
@@ -437,6 +468,7 @@ def _prepare_schema_param_names(
     *,
     text_min: int,
     requirement: Any,
+    slot_types: dict[str, str] | None = None,
 ) -> list[str]:
     """Convert aggregate parser params into concrete schema slots.
 
@@ -456,13 +488,12 @@ def _prepare_schema_param_names(
     except (TypeError, ValueError):
         text_max = -1
     if text_max == 0:
+        declared_types = slot_types or {}
         params = [
             param
             for param in params
-            if not (
-                _slot_type_from_name(param) == "text"
-                and _is_generic_aggregate_param(param)
-            )
+            if (declared_types.get(param) or _slot_type_from_name(param))
+            not in _TEXT_POSITIONAL_SLOT_TYPES
         ]
     if text_min <= 0:
         return params
@@ -695,13 +726,6 @@ def _command_role_from_text(
     return "execute"
 
 
-def _actor_scope_from_text(default: str, text: str) -> str:
-    normalized = normalize_message_text(text)
-    if normalized.startswith(_SELF_SCOPE_TERMS):
-        return "self_only"
-    return default
-
-
 def _target_requirement_from_slots(
     default: str,
     slots: list[CommandSlotSpec],
@@ -746,41 +770,70 @@ def schema_from_capability(
     )
     slots: list[CommandSlotSpec] = []
     requirement = command.requirement
+    try:
+        text_max = (
+            None
+            if requirement.text_max is None
+            else int(requirement.text_max)
+        )
+    except (TypeError, ValueError):
+        text_max = None
     raw_params = [
         normalize_message_text(str(param or ""))
         for param in requirement.params
         if normalize_message_text(str(param or ""))
     ]
     required_param_names: set[str] = set()
+    placeholder_params: list[str] = []
     for value in [raw_command, *usage_lines]:
         required_param_names.update(_required_placeholder_names(value))
-        raw_params = [
-            *raw_params,
-            *[
-                item
-                for item in _extract_placeholder_names(value)
-                if item and item not in raw_params
-            ],
-        ]
-    text_min = max(int(requirement.text_min or 0), 0)
-    if not raw_params:
-        raw_params = _infer_param_names_from_examples(
+        for item in _extract_placeholder_names(value):
+            if item and item not in raw_params and item not in placeholder_params:
+                placeholder_params.append(item)
+    raw_params.extend(placeholder_params)
+    text_min = 0 if text_max == 0 else max(int(requirement.text_min or 0), 0)
+    inferred_param_names: set[str] = set()
+    if not raw_params and text_max != 0:
+        inferred_params = _infer_param_names_from_examples(
             command,
             head=head,
             usage_lines=usage_lines,
             text_min=text_min,
         )
+        raw_params = inferred_params
+        inferred_param_names.update(inferred_params)
+    parser_slot_types = _slot_mapping_from_requirement(requirement, "slot_types")
+    conflicting_params = [
+        param
+        for param in raw_params
+        if text_max == 0
+        and not _is_internal_media_param(param, requirement)
+        and (parser_slot_types.get(param) or _slot_type_from_name(param))
+        in _TEXT_POSITIONAL_SLOT_TYPES
+    ]
+    if conflicting_params:
+        _LOGGER.warning(
+            "ChatInter command argument contract conflict: "
+            f"module={module}, command={head}, text_max=0, "
+            f"argument_source={requirement.argument_source}, "
+            f"discarded_slots={conflicting_params}"
+        )
     raw_params = _prepare_schema_param_names(
         raw_params,
         text_min=text_min,
         requirement=requirement,
+        slot_types=parser_slot_types,
     )
     slot_choices = _slot_choices_from_requirement(requirement)
+    slot_types = parser_slot_types
+    slot_renderers = _slot_mapping_from_requirement(requirement, "slot_renderers")
     example_rows = _example_argument_rows(command, head=head, usage_lines=usage_lines)
-    inferred_from_examples = bool(example_rows and not requirement.params)
     for index, slot_name in enumerate(raw_params):
         choices = slot_choices.get(normalize_message_text(slot_name), [])
-        slot_type = _slot_type_from_examples(
+        declared_slot_type = slot_types.get(slot_name)
+        if declared_slot_type not in {"text", "int", "float", "bool", "at", "image"}:
+            declared_slot_type = None
+        slot_type = declared_slot_type or _slot_type_from_examples(
             slot_name,
             _example_values_for_slot(example_rows, index),
         )
@@ -789,7 +842,7 @@ def schema_from_capability(
         text_slot_index = sum(
             1
             for previous in raw_params[:index]
-            if _slot_type_from_name(previous) in {"text", "int", "float"}
+            if _slot_type_from_name(previous) in _TEXT_POSITIONAL_SLOT_TYPES
         )
         image_slot_index = sum(
             1
@@ -802,11 +855,13 @@ def schema_from_capability(
                 slot_type,
                 required=(
                     (
-                        slot_type in {"text", "int", "float"}
+                        slot_type in _TEXT_POSITIONAL_SLOT_TYPES
                         and (
                             text_slot_index < text_min
-                            or slot_name in required_param_names
-                            or inferred_from_examples
+                            or (
+                                slot_name in required_param_names
+                                and slot_name not in inferred_param_names
+                            )
                         )
                     )
                     or (
@@ -830,6 +885,7 @@ def schema_from_capability(
                     choices,
                 ),
                 choices=choices,
+                renderer=slot_renderers.get(slot_name, "{value}"),
             )
         )
     render = head
@@ -856,22 +912,8 @@ def schema_from_capability(
             ]
         )
     )
-    metadata_text = normalize_message_text(
-        " ".join(
-            [
-                head,
-                raw_command,
-                description,
-                command.description,
-                " ".join(command.examples),
-                " ".join(usage_lines),
-                plugin_description,
-                " ".join(raw_params),
-            ]
-        )
-    )
     command_role = _command_role_from_text(text=role_text, requirement=requirement)
-    actor_scope = _actor_scope_from_text(requirement.actor_scope, metadata_text)
+    actor_scope = requirement.actor_scope
     target_requirement = _target_requirement_from_slots(
         _target_requirement_from_capability(command),
         slots,
@@ -894,7 +936,9 @@ def schema_from_capability(
     confidence = min(confidence, 0.9)
     aliases = list(command.aliases)
     requires = _requires_from_capability(command)
-    if any(slot.required and slot.type in {"text", "int", "float"} for slot in slots):
+    if any(
+        slot.required and slot.type in _TEXT_POSITIONAL_SLOT_TYPES for slot in slots
+    ):
         requires["text"] = True
     if any(slot.required and slot.type == "image" for slot in slots):
         requires["image"] = True
@@ -933,6 +977,7 @@ def schema_from_capability(
             ]
             if normalize_message_text(phrase)
         ],
+        argument_source=requirement.argument_source,
     )
     schema.shortcut_renders = list(command.shortcut_renders or [])
     return schema
@@ -959,6 +1004,23 @@ def _shortcut_schema_view(
 ) -> PluginCommandSchema | None:
     alias = normalize_message_text(str(shortcut.get("alias", "") or ""))
     if not alias or alias == schema.head:
+        return None
+    shortcut_args = [
+        normalize_message_text(str(item or ""))
+        for item in shortcut.get("args", []) or []
+        if normalize_message_text(str(item or ""))
+    ]
+    shortcut_render = normalize_message_text(str(shortcut.get("render", "") or ""))
+    if (
+        alias.casefold()
+        in {
+            normalize_message_text(item).casefold()
+            for item in schema.aliases
+            if normalize_message_text(item)
+        }
+        and not shortcut_args
+        and shortcut_render.casefold() == schema.head.casefold()
+    ):
         return None
     optional_params = _optional_shortcut_params(shortcut)
     return schema.model_copy(
@@ -1175,13 +1237,36 @@ def _render_slot_value(
 ) -> str:
     """Render slot values so downstream command parsers keep slot boundaries."""
 
+    if slot.type == "bool" and not _coerce_render_bool(value):
+        return ""
     text = normalize_message_text(str(value or ""))
     if not text:
         return ""
-    if not _slot_needs_quoting(schema, slot, text):
-        return text
-    escaped = json.dumps(text, ensure_ascii=False)
-    return escaped
+    rendered_value = (
+        json.dumps(text, ensure_ascii=False)
+        if _slot_needs_quoting(schema, slot, text)
+        else text
+    )
+    renderer = normalize_message_text(slot.renderer or "{value}") or "{value}"
+    if slot.type == "bool" and "{value}" not in renderer:
+        return renderer
+    try:
+        return normalize_message_text(renderer.format(value=rendered_value))
+    except (KeyError, ValueError):
+        return rendered_value
+
+
+def _coerce_render_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int | float):
+        return bool(value)
+    return normalize_message_text(str(value or "")).casefold() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _slot_needs_quoting(

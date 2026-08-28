@@ -90,6 +90,14 @@ class PluginInfo(BaseModel):
             default_factory=dict,
             description="参数枚举约束，key 为参数名，value 为可选值",
         )
+        slot_types: dict[str, str] = Field(
+            default_factory=dict,
+            description="解析器提供的参数类型",
+        )
+        slot_renderers: dict[str, str] = Field(
+            default_factory=dict,
+            description="参数值到原生命令片段的渲染模板",
+        )
         shortcut_renders: list[dict[str, Any]] = Field(
             default_factory=list,
             description="解析器 shortcut 到真实命令的通用渲染映射",
@@ -129,8 +137,17 @@ class PluginInfo(BaseModel):
         )
         allow_sticky_arg: bool = Field(
             default=False,
-            description="是否允许命令头和参数粘连（例如：敲葱葱）",
+            description="命令头与首个参数之间是否允许省略分隔符",
         )
+        argument_source: Literal[
+            "runtime_handler",
+            "runtime_parser",
+            "discovery",
+            "declared",
+            "usage",
+            "identity_fallback",
+            "unknown",
+        ] = Field(default="unknown", description="参数契约的最强事实来源")
         access_level: Literal["public", "admin", "superuser", "restricted"] = Field(
             default="public",
             description="命令访问级别：public=普通用户可见；admin/superuser/restricted=导入时过滤",
@@ -177,6 +194,14 @@ class CommandRequirement(BaseModel):
         default_factory=dict,
         description="参数枚举约束",
     )
+    slot_types: dict[str, str] = Field(
+        default_factory=dict,
+        description="解析器提供的参数类型",
+    )
+    slot_renderers: dict[str, str] = Field(
+        default_factory=dict,
+        description="参数值到原生命令片段的渲染模板",
+    )
     text_min: int = Field(default=0, description="文本参数最小数量")
     text_max: int | None = Field(default=None, description="文本参数最大数量")
     image_min: int = Field(default=0, description="图片参数最小数量")
@@ -197,6 +222,15 @@ class CommandRequirement(BaseModel):
     requires_reply: bool = Field(default=False, description="是否需要回复上下文")
     requires_private: bool = Field(default=False, description="是否仅限私聊")
     requires_to_me: bool = Field(default=False, description="是否需要 @机器人")
+    argument_source: Literal[
+        "runtime_handler",
+        "runtime_parser",
+        "discovery",
+        "declared",
+        "usage",
+        "identity_fallback",
+        "unknown",
+    ] = Field(default="unknown", description="参数契约的最强事实来源")
 
 
 class CommandCapability(BaseModel):
@@ -263,6 +297,10 @@ class CommandSlotSpec(BaseModel):
         default_factory=list,
         description="可选枚举值；来自命令解析器的 Literal/Union 约束",
     )
+    renderer: str = Field(
+        default="{value}",
+        description="槽位存在时生成原生命令片段的模板",
+    )
 
 
 class PluginCommandSchema(BaseModel):
@@ -273,7 +311,7 @@ class PluginCommandSchema(BaseModel):
     aliases: list[str] = Field(default_factory=list, description="自然语言别名")
     description: str = Field(default="", description="命令用途")
     slots: list[CommandSlotSpec] = Field(default_factory=list, description="参数槽位")
-    render: str = Field(description="命令渲染模板，例如：塞红包 {amount} {num}")
+    render: str = Field(description="将参数槽位转换为原生命令文本的模板")
     requires: dict[str, bool] = Field(default_factory=dict, description="命令级需求")
     allow_at: bool | None = Field(default=None, description="@是否可作为目标输入")
     allow_sticky_arg: bool = Field(default=False, description="是否允许粘连参数")
@@ -331,6 +369,15 @@ class PluginCommandSchema(BaseModel):
         default_factory=list,
         description="解析器 shortcut 到真实命令的通用渲染映射",
     )
+    argument_source: Literal[
+        "runtime_handler",
+        "runtime_parser",
+        "discovery",
+        "declared",
+        "usage",
+        "identity_fallback",
+        "unknown",
+    ] = Field(default="unknown", description="参数契约的最强事实来源")
 
 
 class CommandToolSnapshot(BaseModel):

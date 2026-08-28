@@ -13,24 +13,23 @@ from typing import Literal
 
 from nonebot.adapters import Bot
 
-from .member_similarity import ALIAS_AMBIGUOUS_TOP, score_alias_in_message
+from .member_similarity import (
+    ALIAS_AMBIGUOUS_GAP,
+    ALIAS_AMBIGUOUS_TOP,
+    ALIAS_MATCH_THRESHOLD,
+    score_alias_in_message,
+    score_member_alias,
+)
 from .native_route import NativeRouteResult
-from .person_registry import normalize_alias_key
+from .person_registry import AliasCandidate, PersonProfile, normalize_alias_key
 from .route_execution import (
     extract_at_tokens,
     extract_image_tokens,
     find_route_command_schema,
 )
-from .route_text import contains_any, normalize_message_text
+from .route_text import normalize_message_text
 from .schema_policy import CommandTargetPolicy, resolve_command_target_policy
-from .target_context import (
-    _TARGET_REQUIRED_ACTION_HINTS,
-    build_mention_profiles,
-    enrich_route_message_with_fuzzy_target,
-    extract_fuzzy_target_hint,
-    needs_target_for_route,
-)
-from .target_policy import TargetPolicy
+from .target_context import build_mention_profiles
 
 TargetResolveStatus = Literal[
     "not_needed",
@@ -53,79 +52,9 @@ _EXPLICIT_AT_PATTERN = re.compile(
     r"\[@(?P<bracket>[^\]\s]+)\]" r"|(?<![0-9A-Za-z_])@(?P<plain>\d{5,20})(?!\d)"
 )
 
-# Nicknames that double as everyday vocabulary.  A literal hit on one of these
-# is *not* on its own proof that the speaker is naming a person: "番茄炒蛋怎么做"
-# must not bind 番茄 as an execution target.  Whatever their length, these keys
-# additionally require a directive/second-person signal in the message.
-_AMBIENT_WORD_ALIAS_KEYS: frozenset[str] = frozenset(
-    normalize_alias_key(value)
-    for value in (
-        # 食物
-        "番茄",
-        "西红柿",
-        "番茄炒蛋",
-        "西红柿炒蛋",
-        "苹果",
-        "香蕉",
-        "馒头",
-        "包子",
-        "饺子",
-        "蛋糕",
-        "牛奶",
-        "土豆",
-        "茄子",
-        "辣椒",
-        "橙子",
-        "柠檬",
-        "西瓜",
-        "草莓",
-        "樱桃",
-        "面条",
-        "米饭",
-        "火锅",
-        "奶茶",
-        "咖啡",
-        "巧克力",
-        "土豆丝",
-        "红烧肉",
-        "糖醋排骨",
-        # 颜色
-        "红色",
-        "蓝色",
-        "绿色",
-        "黑色",
-        "白色",
-        "粉色",
-        "紫色",
-        "黄色",
-        "橙色",
-        # 通用词
-        "可爱",
-        "宝宝",
-        "大佬",
-        "老板",
-        "机器人",
-        "猫猫",
-        "狗狗",
-        "兔子",
-        "月亮",
-        "星星",
-        "太阳",
-        "天气",
-        "游戏",
-        "音乐",
-        "视频",
-        "图片",
-        "表情",
-        "头像",
-    )
-    if normalize_alias_key(value)
-)
-# Second-person / addressing signals; complements the imported causative verbs
-# (_TARGET_REQUIRED_ACTION_HINTS = 给/帮/替/让/叫 from target_context).
-_SECOND_PERSON_HINTS = ("你", "您", "妳")
 # Characters that, immediately before an alias, mark it as a directive object.
 _ALIAS_DIRECTIVE_PREFIX_CHARS = frozenset("给帮替让叫喊请@")
+_ALIAS_SCRIPT_RUN_PATTERN = re.compile(r"[0-9A-Za-z_]+|[\u4e00-\u9fff]+")
 
 
 @dataclass(frozen=True)
@@ -166,11 +95,10 @@ def resolve_verified_action_target(
     *,
     event_context,
     addressee,
-    alias_candidates,
     speaker_profile=None,
     reply_has_image: bool = False,
 ) -> VerifiedActionTarget:
-    """Bind only current-turn, unambiguous evidence to an execution target."""
+    """Bind structural event evidence; nickname choices use the turn ledger."""
 
     if bool(getattr(event_context, "is_private", False)):
         return VerifiedActionTarget()
@@ -187,14 +115,6 @@ def resolve_verified_action_target(
     )
     if len(member_mentions) == 1:
         mention_id = member_mentions[0]
-        if _has_competing_alias_evidence(
-            event_context=event_context,
-            alias_candidates=alias_candidates,
-            excluded_user_ids={mention_id, current_user_id, bot_id},
-        ):
-            # "@张三 帮小明签到" — the @ and the named member disagree; refuse
-            # rather than silently acting on the wrong person.
-            return VerifiedActionTarget(source="at", ambiguous=True)
         return VerifiedActionTarget(
             user_id=mention_id,
             source="at",
@@ -202,15 +122,6 @@ def resolve_verified_action_target(
         )
     if len(member_mentions) > 1:
         return VerifiedActionTarget(source="at", ambiguous=True)
-
-    alias_target = _resolve_verified_alias_target(
-        event_context=event_context,
-        alias_candidates=alias_candidates,
-        current_user_id=current_user_id,
-        bot_id=bot_id,
-    )
-    if alias_target.is_resolved or alias_target.ambiguous:
-        return alias_target
 
     speaker_target = _resolve_verified_speaker_alias_target(
         event_context=event_context,
@@ -239,6 +150,64 @@ def resolve_verified_action_target(
     return VerifiedActionTarget()
 
 
+def resolve_verified_action_target_from_group_profiles(
+    *,
+    event_context,
+    addressee,
+    group_profiles: tuple[dict[str, str | tuple[str, ...]], ...],
+    speaker_profile=None,
+    reply_has_image: bool = False,
+) -> VerifiedActionTarget:
+    """Verify a target against a live, current-group member snapshot."""
+
+    alias_candidates: list[AliasCandidate] = []
+    for raw_profile in group_profiles:
+        user_id = str(raw_profile.get("user_id") or "").strip()
+        if not user_id:
+            continue
+        nickname = str(raw_profile.get("nickname") or "").strip()
+        group_card = str(
+            raw_profile.get("user_name")
+            or raw_profile.get("display_name")
+            or ""
+        ).strip()
+        aliases: list[str] = []
+        for value in (
+            raw_profile.get("display_name"),
+            raw_profile.get("nickname"),
+            raw_profile.get("user_name"),
+        ):
+            text = str(value or "").strip()
+            if text and text not in aliases:
+                aliases.append(text)
+        alias_entries = raw_profile.get("alias_entries") or ()
+        if isinstance(alias_entries, tuple):
+            for entry in alias_entries:
+                text = str(getattr(entry, "source", "") or "").strip()
+                if text and text not in aliases:
+                    aliases.append(text)
+        profile = PersonProfile(
+            user_id=user_id,
+            group_id=str(getattr(event_context, "group_id", "") or "") or None,
+            nickname=nickname,
+            group_card=group_card,
+            aliases=tuple(aliases),
+            confidence=0.72,
+        )
+        alias_candidates.extend(
+            AliasCandidate(profile=profile, score=1.0, matched_alias=alias)
+            for alias in aliases
+            if len(normalize_alias_key(alias)) >= 2
+        )
+
+    return resolve_verified_action_target(
+        event_context=event_context,
+        addressee=addressee,
+        speaker_profile=speaker_profile,
+        reply_has_image=reply_has_image,
+    )
+
+
 def _has_competing_alias_evidence(
     *,
     event_context,
@@ -257,7 +226,7 @@ def _has_competing_alias_evidence(
         alias_candidates=alias_candidates,
         excluded_user_ids={item for item in excluded_user_ids if item},
     )
-    return any(alias_key not in _AMBIENT_WORD_ALIAS_KEYS for _, _, _, alias_key in hits)
+    return bool(hits)
 
 
 def _resolve_verified_speaker_alias_target(
@@ -341,33 +310,28 @@ def _is_cjk_char(char: str) -> bool:
     return bool(char) and "一" <= char <= "鿿"
 
 
-def _alias_evidence_passes_gate(message_text: str, alias_key: str) -> bool:
+def alias_has_target_evidence(message_text: str, alias_key: str) -> bool:
     """Reject alias hits that are ambient chatter rather than a real callout."""
 
+    alias_key = normalize_alias_key(alias_key)
     if not alias_key:
         return False
-    # Bare name: the whole message is just the nickname -> a 称呼/greeting,
-    # never an execution instruction.
+    # A bare alias is a callout, not an execution target instruction.
     if normalize_alias_key(message_text) == alias_key:
         return False
-    if alias_key not in _AMBIENT_WORD_ALIAS_KEYS:
-        return True
-    # Directive / second-person signal anywhere in the message.
-    if contains_any(message_text, _TARGET_REQUIRED_ACTION_HINTS) or contains_any(
-        message_text, _SECOND_PERSON_HINTS
-    ):
-        return True
     for previous, following in _alias_occurrence_neighbors(message_text, alias_key):
-        # 给番茄 / 帮番茄 / @番茄 -> the alias sits in an explicit target slot.
-        if previous in _ALIAS_DIRECTIVE_PREFIX_CHARS:
-            return True
-        # 番茄的头像 -> possessive use, i.e. a person who owns something.
+        # Possessive syntax is explicit evidence that the alias names a target.
         if following == "的":
             return True
-        # The ambient word is the head of a longer CJK compound
-        # (番茄炒蛋怎么做 / 苹果好吃吗) -> vocabulary, not a callout.
-        if not _is_cjk_char(following):
+        # CJK aliases cannot authorize a prefix inside a longer CJK compound;
+        # transitions between writing systems are natural boundaries.
+        if _is_cjk_char(following) and any(_is_cjk_char(char) for char in alias_key):
+            continue
+        # Directive prefixes place the alias in an explicit target slot.
+        if previous in _ALIAS_DIRECTIVE_PREFIX_CHARS:
             return True
+        # A bounded alias or one at the end of the message is standalone.
+        return True
     return False
 
 
@@ -392,20 +356,102 @@ def _literal_alias_hits(
         user_id = str(getattr(profile, "user_id", "") or "").strip()
         if not user_id or user_id in excluded_user_ids:
             continue
-        if str(getattr(profile, "conflict_state", "") or "").strip():
-            has_conflicted = True
-            continue
         alias_key = normalize_alias_key(
             str(getattr(candidate, "matched_alias", "") or "")
         )
         score = score_alias_in_message(message_text, alias_key)
-        if score <= 0.0:
+        if score <= 0.0 or not alias_has_target_evidence(message_text, alias_key):
+            continue
+        if str(getattr(profile, "conflict_state", "") or "").strip():
+            has_conflicted = True
             continue
         hits.append((len(alias_key), score, user_id, alias_key))
-    # Longest literal match wins: a message containing 小番茄 binds 小番茄, not
-    # the shorter 番茄 it happens to contain, and that is not an ambiguity.
+    # Prefer the longest literal identity so its shorter fragments do not
+    # create artificial ambiguity.
     hits.sort(key=lambda item: (item[0], item[1]), reverse=True)
     return hits, has_conflicted
+
+
+def _fuzzy_alias_spans(message_text: str, alias_key: str) -> tuple[str, ...]:
+    """Return bounded message spans that may be a misspelled alias."""
+
+    alias_key = normalize_alias_key(alias_key)
+    message_key = normalize_alias_key(message_text)
+    if len(alias_key) < 3 or not message_key or message_key == alias_key:
+        return ()
+    alias_has_cjk = any(_is_cjk_char(char) for char in alias_key)
+    spans: list[str] = []
+    for raw_run in _ALIAS_SCRIPT_RUN_PATTERN.findall(message_text):
+        run = normalize_alias_key(raw_run)
+        if len(run) < 2:
+            continue
+        run_has_cjk = any(_is_cjk_char(char) for char in run)
+        if run_has_cjk != alias_has_cjk:
+            continue
+        if not alias_has_cjk:
+            spans.append(run)
+            continue
+        minimum = max(len(alias_key) - 1, 2)
+        maximum = min(len(alias_key) + 1, len(run))
+        for size in range(minimum, maximum + 1):
+            for start in range(0, len(run) - size + 1):
+                spans.append(run[start : start + size])
+    return tuple(dict.fromkeys(spans))
+
+
+def _fuzzy_alias_score(message_text: str, alias_key: str) -> float:
+    """Score a bounded typo without reviving rejected literal compounds."""
+
+    alias_key = normalize_alias_key(alias_key)
+    if not alias_key:
+        return 0.0
+    if score_alias_in_message(message_text, alias_key) > 0.0:
+        return 0.0
+    return max(
+        (
+            score_member_alias(span, alias_key)
+            for span in _fuzzy_alias_spans(message_text, alias_key)
+        ),
+        default=0.0,
+    )
+
+
+def _fuzzy_alias_hits(
+    *,
+    message_text: str,
+    alias_candidates,
+    excluded_user_ids: set[str],
+) -> tuple[list[tuple[float, str]], bool]:
+    """Resolve only a unique, high-confidence approximate member identity."""
+
+    scores_by_user: dict[str, float] = {}
+    conflicted = False
+    for candidate in alias_candidates or ():
+        profile = getattr(candidate, "profile", None)
+        if profile is None:
+            continue
+        user_id = str(getattr(profile, "user_id", "") or "").strip()
+        if not user_id or user_id in excluded_user_ids:
+            continue
+        alias_key = normalize_alias_key(
+            str(getattr(candidate, "matched_alias", "") or "")
+        )
+        try:
+            candidate_score = float(getattr(candidate, "score", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            candidate_score = 0.0
+        score = min(_fuzzy_alias_score(message_text, alias_key), candidate_score)
+        if score < ALIAS_MATCH_THRESHOLD:
+            continue
+        if str(getattr(profile, "conflict_state", "") or "").strip():
+            conflicted = True
+            continue
+        scores_by_user[user_id] = max(scores_by_user.get(user_id, 0.0), score)
+    hits = sorted(
+        ((score, user_id) for user_id, score in scores_by_user.items()),
+        reverse=True,
+    )
+    return hits, conflicted
 
 
 def _resolve_verified_alias_target(
@@ -427,11 +473,37 @@ def _resolve_verified_alias_target(
         excluded_user_ids={current_user_id, bot_id},
     )
     if not hits:
-        if has_conflicted:
+        fuzzy_hits, fuzzy_conflicted = _fuzzy_alias_hits(
+            message_text=message_text,
+            alias_candidates=alias_candidates,
+            excluded_user_ids={current_user_id, bot_id},
+        )
+        if fuzzy_conflicted:
             return VerifiedActionTarget(source="alias", ambiguous=True)
-        return VerifiedActionTarget()
+        if not fuzzy_hits:
+            if has_conflicted:
+                return VerifiedActionTarget(source="alias", ambiguous=True)
+            return VerifiedActionTarget()
+        top_score, top_user_id = fuzzy_hits[0]
+        if len(fuzzy_hits) > 1:
+            second_score, second_user_id = fuzzy_hits[1]
+            if (
+                second_user_id != top_user_id
+                and (
+                    top_score < ALIAS_AMBIGUOUS_TOP
+                    or top_score - second_score < ALIAS_AMBIGUOUS_GAP
+                )
+            ):
+                return VerifiedActionTarget(source="alias", ambiguous=True)
+        return VerifiedActionTarget(
+            user_id=top_user_id,
+            source="alias",
+            confidence=min(top_score, 0.96),
+        )
+    if has_conflicted:
+        return VerifiedActionTarget(source="alias", ambiguous=True)
 
-    top_length, top_score, top_user_id, top_alias_key = hits[0]
+    top_length, top_score, top_user_id, _top_alias_key = hits[0]
     if len(hits) > 1:
         second_length, _, second_user_id, _ = hits[1]
         # Only equally strong literal evidence for two different people is a
@@ -439,8 +511,6 @@ def _resolve_verified_alias_target(
         if second_length == top_length and second_user_id != top_user_id:
             return VerifiedActionTarget(source="alias", ambiguous=True)
     if top_score < ALIAS_AMBIGUOUS_TOP:
-        return VerifiedActionTarget()
-    if not _alias_evidence_passes_gate(message_text, top_alias_key):
         return VerifiedActionTarget()
     return VerifiedActionTarget(
         user_id=top_user_id,
@@ -489,22 +559,6 @@ def _schema_accepts_image_context(schema: object | None) -> bool:
         return int(image_max) > 0
     except Exception:
         return False
-
-
-def _schema_heads(schema: object | None, route_result: NativeRouteResult) -> set[str]:
-    values: list[object] = [
-        getattr(schema, "command", "") if schema is not None else "",
-        getattr(schema, "head", "") if schema is not None else "",
-        route_result.decision.command,
-    ]
-    if schema is not None:
-        values.extend(getattr(schema, "aliases", None) or [])
-    heads: set[str] = set()
-    for value in values:
-        text = normalize_message_text(str(value or ""))
-        if text:
-            heads.add(text.split(" ", 1)[0])
-    return heads
 
 
 def _has_target_or_image_context(*messages: str) -> bool:
@@ -614,6 +668,7 @@ async def _resolve_verified_explicit_targets(
     ambient_message: str,
     target_hint: str,
     mention_profiles: dict[str, dict[str, str]],
+    trusted_target_ids: tuple[str, ...] = (),
 ) -> TargetResolveResult | None:
     hint_ids = _explicit_at_ids(target_hint)
     task_ids = _explicit_at_ids(task_message)
@@ -640,11 +695,18 @@ async def _resolve_verified_explicit_targets(
         )
 
     target_ids = tuple(dict.fromkeys((*hint_ids, *task_ids, *ambient_ids)))
+    trusted_ids = {
+        str(user_id).strip()
+        for user_id in trusted_target_ids
+        if str(user_id).strip() in target_ids
+    }
     verified_profiles = {
         str(user_id).strip(): dict(profile)
         for user_id, profile in mention_profiles.items()
         if str(user_id).strip() and isinstance(profile, dict)
     }
+    for user_id in trusted_ids:
+        verified_profiles.setdefault(user_id, {"user_id": user_id, "uid": user_id})
     unresolved_ids = [
         user_id for user_id in target_ids if user_id not in verified_profiles
     ]
@@ -727,58 +789,6 @@ def _command_can_use_target(
     return _schema_accepts_image_context(schema)
 
 
-async def resolve_pre_route_target(
-    *,
-    group_id: str | None,
-    bot: Bot | None = None,
-    original_message: str,
-    route_message: str,
-    mention_profiles: dict[str, dict[str, str]],
-    target_policy: TargetPolicy,
-    command_heads: set[str] | None = None,
-) -> TargetResolveResult:
-    (
-        enriched_message,
-        enriched_profiles,
-        prompt,
-    ) = await enrich_route_message_with_fuzzy_target(
-        group_id=group_id,
-        bot=bot,
-        original_message=original_message,
-        route_message=route_message,
-        mention_profiles=mention_profiles,
-        target_policy=target_policy,
-        command_heads=command_heads,
-    )
-    if prompt:
-        return TargetResolveResult(
-            status="not_needed",
-            message_text=route_message,
-            mention_profiles=enriched_profiles,
-            target_hint=extract_fuzzy_target_hint(route_message, command_heads),
-        )
-    if enriched_message != route_message:
-        return TargetResolveResult(
-            status="resolved",
-            message_text=enriched_message,
-            mention_profiles=enriched_profiles,
-            target_hint=extract_fuzzy_target_hint(route_message, command_heads),
-            resolved_target_ids=_explicit_at_ids(enriched_message),
-        )
-    if _has_target_or_image_context(route_message):
-        return TargetResolveResult(
-            status="present",
-            message_text=route_message,
-            mention_profiles=enriched_profiles,
-            resolved_target_ids=_explicit_at_ids(route_message),
-        )
-    return TargetResolveResult(
-        status="not_needed",
-        message_text=route_message,
-        mention_profiles=enriched_profiles,
-    )
-
-
 async def resolve_execution_target(
     *,
     group_id: str | None,
@@ -789,6 +799,7 @@ async def resolve_execution_target(
     task_message: str,
     ambient_message: str,
     target_hint: str = "",
+    trusted_target_ids: tuple[str, ...] = (),
     mention_profiles: dict[str, dict[str, str]] | None = None,
     use_ambient_target_context: bool = False,
 ) -> TargetResolveResult:
@@ -796,7 +807,6 @@ async def resolve_execution_target(
         route_result,
         knowledge_plugins,
     )
-    target_policy = command_policy or TargetPolicy()
     mention_profiles = dict(mention_profiles or {})
     if not _command_can_use_target(
         schema=schema,
@@ -847,6 +857,7 @@ async def resolve_execution_target(
             ambient_message=target_ambient_message,
             target_hint=explicit_target_hint,
             mention_profiles=mention_profiles,
+            trusted_target_ids=trusted_target_ids,
         )
         if explicit_resolution is not None:
             return explicit_resolution
@@ -887,103 +898,30 @@ async def resolve_execution_target(
             target_hint=explicit_target_hint,
         )
 
-    command_heads = _schema_heads(schema, route_result)
-    if command_policy is not None and command_policy.allow_at_as_target and bot_id:
-        self_target_message = (
-            target_ambient_message
-            if use_ambient_target_context
-            else target_task_message
-        )
-        self_target = await resolve_pre_route_target(
-            group_id=group_id,
-            bot=bot,
-            original_message=self_target_message,
-            route_message=self_target_message,
-            mention_profiles=mention_profiles,
-            target_policy=target_policy,
-            command_heads=command_heads,
-        )
-        if self_target.status in {"resolved", "present"}:
-            return self_target
-
-    target_lookup_parts = [
-        target_ambient_message if use_ambient_target_context else target_task_message,
-        explicit_target_hint,
-    ]
-    target_lookup_message = normalize_message_text(
-        " ".join(item for item in target_lookup_parts if item)
-    )
-    extracted_target_hint = extract_fuzzy_target_hint(
-        target_lookup_message or target_task_message,
-        command_heads,
-    )
-    resolved_target_hint = explicit_target_hint or extracted_target_hint
-    resolved = await resolve_pre_route_target(
-        group_id=group_id,
-        bot=bot,
-        original_message=target_lookup_message or target_task_message,
-        route_message=target_lookup_message or target_task_message,
-        mention_profiles=mention_profiles,
-        target_policy=target_policy,
-        command_heads=command_heads,
-    )
-    if resolved.status in {"resolved", "ambiguous", "missing"}:
-        if resolved.status == "resolved":
-            resolved_message = _append_unique_context_tokens(
-                target_task_message,
-                resolved.message_text,
-            )
-            return TargetResolveResult(
-                status="resolved",
-                message_text=resolved_message,
-                mention_profiles=resolved.mention_profiles,
-                prompt=resolved.prompt,
-                target_hint=resolved.target_hint or resolved_target_hint,
-                resolved_target_ids=_explicit_at_ids(resolved.message_text),
-            )
-        return resolved
-
     target_required = (
         command_policy is not None and command_policy.target_requirement == "required"
-    )
-    target_required = target_required or needs_target_for_route(
-        target_ambient_message if use_ambient_target_context else target_task_message,
-        target_ambient_message if use_ambient_target_context else target_task_message,
-        target_policy=target_policy,
-    )
-    target_required = target_required or bool(
-        resolved_target_hint
-        and (
-            _schema_accepts_image_context(schema)
-            or (
-                command_policy is not None
-                and (
-                    command_policy.allow_at_as_target
-                    or command_policy.allow_image_as_target
-                )
-            )
-        )
     )
     if target_required:
         return TargetResolveResult(
             status="missing",
             message_text=target_task_message,
             mention_profiles=mention_profiles,
-            target_hint=resolved_target_hint,
+            target_hint=explicit_target_hint,
         )
 
     return TargetResolveResult(
         status="not_needed",
         message_text=target_task_message,
         mention_profiles=mention_profiles,
-        target_hint=resolved_target_hint,
+        target_hint=explicit_target_hint,
     )
 
 
 __all__ = [
     "TargetResolveResult",
     "VerifiedActionTarget",
+    "alias_has_target_evidence",
     "resolve_execution_target",
-    "resolve_pre_route_target",
     "resolve_verified_action_target",
+    "resolve_verified_action_target_from_group_profiles",
 ]

@@ -150,7 +150,6 @@ def load_command_overrides(
         )
         if _cached is None:
             _cached = _EMPTY_OVERRIDES
-        # else: 保留 _cached 不变（上次有效版本）
     _cached_stat = stat_key
     return _cached
 

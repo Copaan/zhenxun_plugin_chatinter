@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from hashlib import sha1
 import re
-from typing import Any
 
 from zhenxun.utils.pydantic_compat import model_dump
 
@@ -39,40 +38,6 @@ def _command_family(schema: PluginCommandSchema, *, plugin_module: str) -> str:
     if schema.command_role in {"catalog", "helper", "usage"}:
         return schema.command_role
     return module.rsplit(".", 1)[-1] or "general"
-
-
-def _infer_task_verbs(
-    schema: PluginCommandSchema,
-) -> list[str]:
-    text = normalize_message_text(
-        " ".join(
-            [
-                schema.head,
-                " ".join(schema.aliases),
-                schema.description,
-                schema.command_role,
-                schema.payload_policy,
-            ]
-        )
-    )
-    verb_groups = {
-        "查询": ("查", "查询", "查看", "搜索", "搜", "找", "识别", "解析", "详情"),
-        "生成": ("生成", "制作", "做", "来", "发送", "随机"),
-        "添加": ("添加", "新增", "创建", "设置", "绑定"),
-        "删除": ("删除", "移除", "取消", "关闭", "退回", "解绑"),
-        "翻译": ("翻译", "语种", "缩写", "简称", "黑话", "解释", "展开"),
-        "播放": ("播放", "点播", "音乐", "歌曲", "点歌", "搜歌"),
-        "统计": ("统计", "排行", "词云", "报告"),
-    }
-    verbs: list[str] = []
-    for verb, keywords in verb_groups.items():
-        if any(keyword in text for keyword in keywords):
-            _append_unique(verbs, verb)
-    if schema.command_role in {"helper", "usage", "catalog"}:
-        _append_unique(verbs, "帮助")
-    if not verbs:
-        _append_unique(verbs, "执行")
-    return verbs
 
 
 def _input_requirements(schema: PluginCommandSchema) -> list[str]:
@@ -108,7 +73,6 @@ def _input_requirements(schema: PluginCommandSchema) -> list[str]:
 def _capability_text(
     *,
     schema: PluginCommandSchema,
-    task_verbs: list[str],
     input_requirements: list[str],
 ) -> str:
     slot_text = " ".join(
@@ -120,7 +84,6 @@ def _capability_text(
         " ".join(schema.aliases),
         schema.description,
         slot_text,
-        "动作:" + "/".join(task_verbs) if task_verbs else "",
         "输入:" + "/".join(input_requirements) if input_requirements else "",
         schema.command_role,
         schema.payload_policy,
@@ -146,7 +109,9 @@ def _schema_signature(
 
 def _schema_meta(schema: PluginCommandSchema) -> dict[str, object]:
     requires = schema.requires or {}
-    text_slots = [slot for slot in schema.slots if slot.type == "text"]
+    text_slots = [
+        slot for slot in schema.slots if slot.type in {"text", "int", "float", "bool"}
+    ]
     image_slots = [slot for slot in schema.slots if slot.type == "image"]
     meta = {
         "text_min": sum(1 for slot in text_slots if slot.required),
@@ -159,6 +124,7 @@ def _schema_meta(schema: PluginCommandSchema) -> dict[str, object]:
         else (1 if requires.get("image") else 0),
         "target_accepts_at": bool(requires.get("at") or schema.allow_at),
         "allow_sticky_arg": schema.allow_sticky_arg,
+        "argument_source": schema.argument_source,
     }
     slot_choices = {
         slot.name: list(slot.choices)
@@ -268,17 +234,6 @@ def build_plugin_references(
     return references
 
 
-def _schema_blocked_by_quality_gate(schema: Any, *, module: str) -> bool:
-    """Keep fallback-source schemas out of the tool pool unless allowlisted."""
-    from .config import EXPOSE_FALLBACK_SCHEMAS, SCHEMA_FALLBACK_ALLOWLIST
-
-    if str(getattr(schema, "source", "") or "") != "fallback":
-        return False
-    if EXPOSE_FALLBACK_SCHEMAS:
-        return False
-    return module not in SCHEMA_FALLBACK_ALLOWLIST
-
-
 def build_command_tool_snapshots(
     graph: CapabilityGraphSnapshot,
     *,
@@ -296,14 +251,11 @@ def build_command_tool_snapshots(
         plugin_usage = normalize_message_text(plugin.usage or "") or None
         multi_command = len(reference.command_schemas) > 1
         for schema in reference.command_schemas:
-            if _schema_blocked_by_quality_gate(schema, module=reference.module):
-                continue
             family = _command_family(schema, plugin_module=reference.module)
-            task_verbs = _infer_task_verbs(schema)
+            task_verbs: list[str] = []
             input_requirements = _input_requirements(schema)
             capability_text = _capability_text(
                 schema=schema,
-                task_verbs=task_verbs,
                 input_requirements=input_requirements,
             )
             global_phrases = (
@@ -318,7 +270,6 @@ def build_command_tool_snapshots(
                 *schema.aliases,
                 schema.description,
                 capability_text,
-                " ".join(task_verbs),
                 " ".join(input_requirements),
                 *global_phrases,
                 *schema.retrieval_phrases,

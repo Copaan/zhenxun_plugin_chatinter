@@ -101,9 +101,34 @@ class RouteObservation:
     final_reason: str
     failure_layer: str = ""
     plugin_outcome: str = ""
-    retrieved_command_ids: str = ""
+    exact_identity_ids: str = ""
+    strict_identity_match_modes: str = ""
     exposed_command_ids: str = ""
+    available_command_count: int = 0
     selected_command_ids: str = ""
+    selected_skill: str = ""
+    discovery_source: str = ""
+    retrieval_query_count: int = 0
+    discovery_candidate_count: int = 0
+    candidate_displayed: int = 0
+    candidate_omitted: int = 0
+    candidate_exposure_count: int = 0
+    selected_command_id: str = ""
+    selected_capability_id: str = ""
+    execution_validation_reason: str = ""
+    identity_spans: str = ""
+    person_candidate_count: int = 0
+    candidate_sources: str = ""
+    selected_target_ref: str = ""
+    target_resolution_mode: str = ""
+    target_validation_reason: str = ""
+    self_identity_candidate: bool = False
+    protocol_argument_retries: int = 0
+    protocol_format_retries: int = 0
+    protocol_text_only_retries: int = 0
+    protocol_text_suppressed: int = 0
+    tool_argument_envelope_repairs: int = 0
+    protocol_tool_name_count: int = 0
     model_requests: int = 0
     tool_executions: int = 0
     response_quality: str = ""
@@ -312,14 +337,90 @@ def record_route_observation(
             final_reason=final_reason,
             failure_layer=str(trace_tags.get("failure_layer", "") or ""),
             plugin_outcome=str(trace_tags.get("plugin_outcome", "") or ""),
-            retrieved_command_ids=str(
-                trace_tags.get("retrieved_command_ids", "") or ""
+            exact_identity_ids=str(trace_tags.get("exact_identity_ids", "") or ""),
+            strict_identity_match_modes=str(
+                trace_tags.get("strict_identity_match_modes", "") or ""
             ),
             exposed_command_ids=str(
                 trace_tags.get("exposed_command_ids", "") or ""
             ),
+            available_command_count=max(
+                int(float(trace_tags.get("available_command_count", 0) or 0)), 0
+            ),
             selected_command_ids=str(
                 trace_tags.get("selected_command_ids", "") or ""
+            ),
+            selected_skill=str(trace_tags.get("selected_skill", "") or ""),
+            discovery_source=str(trace_tags.get("discovery_source", "") or ""),
+            retrieval_query_count=max(
+                int(float(trace_tags.get("retrieval_query_count", 0) or 0)),
+                0,
+            ),
+            discovery_candidate_count=max(
+                int(float(trace_tags.get("candidate_count", 0) or 0)),
+                0,
+            ),
+            candidate_displayed=max(
+                int(float(trace_tags.get("candidate_displayed", 0) or 0)),
+                0,
+            ),
+            candidate_omitted=max(
+                int(float(trace_tags.get("candidate_omitted", 0) or 0)),
+                0,
+            ),
+            candidate_exposure_count=max(
+                int(float(trace_tags.get("candidate_exposure_count", 0) or 0)),
+                0,
+            ),
+            selected_command_id=str(
+                trace_tags.get("selected_command_id", "") or ""
+            ),
+            selected_capability_id=str(
+                trace_tags.get("selected_capability_id", "") or ""
+            ),
+            execution_validation_reason=str(
+                trace_tags.get("execution_validation_reason", "") or ""
+            ),
+            identity_spans=str(trace_tags.get("identity_spans", "") or ""),
+            person_candidate_count=max(
+                int(float(trace_tags.get("person_candidate_count", 0) or 0)),
+                0,
+            ),
+            candidate_sources=str(trace_tags.get("candidate_sources", "") or ""),
+            selected_target_ref=str(
+                trace_tags.get("selected_target_ref", "") or ""
+            ),
+            target_resolution_mode=str(
+                trace_tags.get("target_resolution_mode", "") or ""
+            ),
+            target_validation_reason=str(
+                trace_tags.get("target_validation_reason", "") or ""
+            ),
+            self_identity_candidate=bool(
+                float(trace_tags.get("self_identity_candidate", 0) or 0)
+            ),
+            protocol_argument_retries=max(
+                int(float(trace_tags.get("protocol_argument_retries", 0) or 0)), 0
+            ),
+            protocol_format_retries=max(
+                int(float(trace_tags.get("protocol_format_retries", 0) or 0)), 0
+            ),
+            protocol_text_only_retries=max(
+                int(float(trace_tags.get("protocol_text_only_retries", 0) or 0)), 0
+            ),
+            protocol_text_suppressed=max(
+                int(float(trace_tags.get("protocol_text_suppressed", 0) or 0)), 0
+            ),
+            tool_argument_envelope_repairs=max(
+                int(
+                    float(
+                        trace_tags.get("tool_argument_envelope_repairs", 0) or 0
+                    )
+                ),
+                0,
+            ),
+            protocol_tool_name_count=max(
+                int(float(trace_tags.get("protocol_tool_name_count", 0) or 0)), 0
             ),
             model_requests=max(
                 int(float(trace_tags.get("agent_model_requests", 0) or 0)),

@@ -35,6 +35,15 @@ class AutoMetadataBuilder:
     _handler_hint_cache: ClassVar[dict[str, tuple[int, dict[str, Any]]]] = {}
     _no_command_log_cache: ClassVar[set[str]] = set()
     _sticky_probe_token: ClassVar[str] = "测试"
+    _argument_source_rank: ClassVar[dict[str, int]] = {
+        "unknown": 0,
+        "identity_fallback": 1,
+        "usage": 2,
+        "declared": 3,
+        "discovery": 4,
+        "runtime_parser": 5,
+        "runtime_handler": 6,
+    }
     _command_discovery_entrypoints: ClassVar[tuple[str, ...]] = (
         "chatinter_command_discovery",
         "__chatinter_command_discovery__",
@@ -212,7 +221,10 @@ class AutoMetadataBuilder:
                             prefix_map.get(command_head.casefold(), []),
                         ),
                         "params": parser_schema["params"],
+                        "argument_source": parser_schema["argument_source"],
                         "slot_choices": parser_schema.get("slot_choices", {}),
+                        "slot_types": parser_schema.get("slot_types", {}),
+                        "slot_renderers": parser_schema.get("slot_renderers", {}),
                         "shortcut_renders": runtime_shortcut_renders
                         or cls._merge_shortcut_renders(
                             parser_schema.get("shortcut_renders", []),
@@ -307,6 +319,8 @@ class AutoMetadataBuilder:
         return {
             "params": [],
             "slot_choices": {},
+            "slot_types": {},
+            "slot_renderers": {},
             "shortcut_renders": [],
             "prefixes": [],
             "text_min": 0,
@@ -316,6 +330,7 @@ class AutoMetadataBuilder:
             "allow_at": None,
             "target_sources": [],
             "sample_text": AutoMetadataBuilder._sticky_probe_token,
+            "argument_source": "identity_fallback",
         }
 
     @classmethod
@@ -331,6 +346,7 @@ class AutoMetadataBuilder:
             value = cls._safe_int(runtime_bounds.get(field))
             if value is not None:
                 result[field] = max(value, 0)
+        result["argument_source"] = "runtime_handler"
         cls._normalize_requirement_bounds(result)
         return result
 
@@ -484,7 +500,10 @@ class AutoMetadataBuilder:
             "command": command,
             "prefixes": parser_schema["prefixes"],
             "params": parser_schema["params"],
+            "argument_source": parser_schema["argument_source"],
             "slot_choices": parser_schema.get("slot_choices", {}),
+            "slot_types": parser_schema.get("slot_types", {}),
+            "slot_renderers": parser_schema.get("slot_renderers", {}),
             "shortcut_renders": parser_schema.get("shortcut_renders", []),
             "text_min": parser_schema["text_min"],
             "text_max": parser_schema["text_max"],
@@ -799,6 +818,8 @@ class AutoMetadataBuilder:
         params: list[str] = []
         optional_params: list[str] = []
         slot_choices: dict[str, list[str]] = {}
+        slot_types: dict[str, str] = {}
+        slot_renderers: dict[str, str] = {}
         text_min = 0
         text_max: int | None = 0
         image_min = 0
@@ -819,6 +840,7 @@ class AutoMetadataBuilder:
             arg_name = str(getattr(arg, "name", "") or "").strip()
             if arg_name:
                 params.append(arg_name)
+                slot_types[arg_name] = cls._extract_arg_slot_type(arg)
                 choices = cls._extract_arg_choices(arg)
                 if choices:
                     slot_choices[arg_name] = choices
@@ -855,6 +877,75 @@ class AutoMetadataBuilder:
                 text_max = None if is_variadic else text_max + 1
             sample_text = cls._build_sample_text(arg_name, arg_repr)
 
+        try:
+            options = list(getattr(parser, "options", None) or [])
+        except Exception:
+            options = []
+        for option in options:
+            if type(option).__name__ in {"Help", "Completion"}:
+                continue
+            aliases = sorted(
+                {
+                    cls._normalize_command(str(alias or ""))
+                    for alias in (getattr(option, "aliases", None) or [])
+                    if cls._normalize_command(str(alias or "")).startswith("-")
+                },
+                key=lambda alias: (len(alias), alias.casefold()),
+            )
+            prefix = aliases[0] if aliases else cls._normalize_command(
+                str(getattr(option, "name", "") or "")
+            )
+            if not prefix:
+                continue
+            try:
+                option_args = list(getattr(option, "args", None) or [])
+            except Exception:
+                option_args = []
+            visible_args = [
+                arg for arg in option_args if not bool(getattr(arg, "hidden", False))
+            ]
+            if not visible_args:
+                flag_name = cls._normalize_command(
+                    str(getattr(option, "dest", "") or "")
+                )
+                if flag_name:
+                    params.append(flag_name)
+                    optional_params.append(flag_name)
+                    slot_types[flag_name] = "bool"
+                    slot_renderers[flag_name] = prefix
+                continue
+            for index, arg in enumerate(visible_args):
+                arg_name = cls._normalize_command(
+                    str(getattr(arg, "name", "") or "")
+                )
+                if not arg_name:
+                    continue
+                params.append(arg_name)
+                optional_params.append(arg_name)
+                slot_types[arg_name] = cls._extract_arg_slot_type(arg)
+                slot_renderers[arg_name] = (
+                    f"{prefix} {{value}}" if index == 0 else "{value}"
+                )
+                choices = cls._extract_arg_choices(arg)
+                if choices:
+                    slot_choices[arg_name] = choices
+                arg_repr = f"{arg_name} {getattr(arg, 'value', None)!r}".lower()
+                is_variadic = cls._is_variadic_arg(arg)
+                has_image = cls._contains_any(arg_repr, cls._image_type_hints)
+                has_at = cls._contains_at_hint(arg_repr)
+                if has_image:
+                    if image_max is not None:
+                        image_max = None if is_variadic else image_max + 1
+                    if "reply" not in target_sources:
+                        target_sources.append("reply")
+                elif has_at:
+                    allow_at = True
+                    for source in ("at", "reply", "nickname"):
+                        if source not in target_sources:
+                            target_sources.append(source)
+                elif text_max is not None:
+                    text_max = None if is_variadic else text_max + 1
+
         if not args:
             text_max = 0
             image_max = 0
@@ -862,6 +953,8 @@ class AutoMetadataBuilder:
             "params": cls._merge_unique_strings(params, []),
             "optional_params": cls._merge_unique_strings(optional_params, []),
             "slot_choices": slot_choices,
+            "slot_types": slot_types,
+            "slot_renderers": slot_renderers,
             "shortcut_renders": cls._extract_parser_shortcut_renders(parser),
             "text_min": text_min,
             "text_max": text_max,
@@ -871,7 +964,26 @@ class AutoMetadataBuilder:
             "target_sources": target_sources,
             "prefixes": prefixes,
             "sample_text": sample_text,
+            "argument_source": "runtime_parser",
         }
+
+    @classmethod
+    def _extract_arg_slot_type(cls, arg: object) -> str:
+        value = getattr(arg, "value", None)
+        base = getattr(value, "base", None) or value
+        if base is bool:
+            return "bool"
+        if base is int:
+            return "int"
+        if base is float:
+            return "float"
+        arg_name = str(getattr(arg, "name", "") or "")
+        arg_repr = f"{arg_name} {value!r}".lower()
+        if cls._contains_any(arg_repr, cls._image_type_hints):
+            return "image"
+        if cls._contains_at_hint(arg_repr):
+            return "at"
+        return "text"
 
     @classmethod
     def _extract_arg_choices(cls, arg: object) -> list[str]:
@@ -1342,6 +1454,7 @@ class AutoMetadataBuilder:
 
         payload = dict(item)
         payload["command"] = command
+        payload.setdefault("argument_source", "discovery")
         if "text_min" not in payload and text_schema.get("min") is not None:
             payload["text_min"] = text_schema.get("min")
         if "text_max" not in payload and text_schema.get("max") is not None:
@@ -1361,6 +1474,8 @@ class AutoMetadataBuilder:
             "allow_sticky_arg",
             "access_level",
             "slot_choices",
+            "slot_types",
+            "slot_renderers",
             "shortcut_renders",
         ):
             if field not in payload and field in schema:
@@ -2005,6 +2120,19 @@ class AutoMetadataBuilder:
         return merged
 
     @classmethod
+    def _merge_slot_mapping(cls, *values: object) -> dict[str, str]:
+        merged: dict[str, str] = {}
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            for raw_key, raw_item in value.items():
+                key = cls._normalize_command(str(raw_key or ""))
+                item = " ".join(str(raw_item or "").strip().split())
+                if key and item and key not in merged:
+                    merged[key] = item
+        return merged
+
+    @classmethod
     def _merge_shortcut_renders(cls, *values: object) -> list[dict[str, object]]:
         merged: list[dict[str, object]] = []
         seen: set[tuple[str, str]] = set()
@@ -2065,13 +2193,18 @@ class AutoMetadataBuilder:
                 current.get("aliases"),
                 payload.get("aliases"),
             )
-            current["params"] = cls._merge_unique_strings(
-                current.get("params"),
-                payload.get("params"),
-            )
+            cls._merge_argument_contract(current, payload)
             current["slot_choices"] = cls._merge_slot_choices(
                 current.get("slot_choices"),
                 payload.get("slot_choices"),
+            )
+            current["slot_types"] = cls._merge_slot_mapping(
+                current.get("slot_types"),
+                payload.get("slot_types"),
+            )
+            current["slot_renderers"] = cls._merge_slot_mapping(
+                current.get("slot_renderers"),
+                payload.get("slot_renderers"),
             )
             current["shortcut_renders"] = cls._merge_shortcut_renders(
                 current.get("shortcut_renders"),
@@ -2101,14 +2234,6 @@ class AutoMetadataBuilder:
             current["requires_to_me"] = bool(current.get("requires_to_me")) or bool(
                 payload.get("requires_to_me")
             )
-            cls._merge_numeric_requirement(current, payload, "text_min", prefer="max")
-            cls._merge_numeric_requirement(current, payload, "image_min", prefer="max")
-            cls._merge_numeric_requirement(
-                current, payload, "text_max", prefer="min_positive"
-            )
-            cls._merge_numeric_requirement(
-                current, payload, "image_max", prefer="min_positive"
-            )
             if payload.get("allow_at") is not None:
                 current["allow_at"] = bool(current.get("allow_at")) or bool(
                     payload.get("allow_at")
@@ -2129,6 +2254,73 @@ class AutoMetadataBuilder:
                 str(item.get("command") or ""),
             ),
         )
+
+    @classmethod
+    def _merge_argument_contract(
+        cls,
+        current: dict[str, Any],
+        incoming: dict[str, Any],
+    ) -> None:
+        fields = ("text_min", "text_max", "image_min", "image_max")
+
+        def has_facts(payload: dict[str, Any]) -> bool:
+            return bool(payload.get("params")) or any(
+                payload.get(field) is not None for field in fields
+            )
+
+        current_has_facts = has_facts(current)
+        incoming_has_facts = has_facts(incoming)
+        current_source = str(current.get("argument_source") or "unknown")
+        incoming_source = str(incoming.get("argument_source") or "unknown")
+        current_rank = cls._argument_source_rank.get(current_source, 0)
+        incoming_rank = cls._argument_source_rank.get(incoming_source, 0)
+
+        if incoming_has_facts and (
+            not current_has_facts or incoming_rank > current_rank
+        ):
+            current["params"] = cls._merge_unique_strings(
+                incoming.get("params"), []
+            )
+            for field in fields:
+                if incoming.get(field) is not None:
+                    current[field] = incoming.get(field)
+            current["argument_source"] = incoming_source
+            cls._normalize_requirement_bounds(current)
+            return
+
+        if not incoming_has_facts:
+            current.setdefault("params", [])
+            current.setdefault("argument_source", current_source)
+            return
+
+        if incoming_rank == current_rank:
+            current["params"] = cls._merge_unique_strings(
+                current.get("params"), incoming.get("params")
+            )
+            cls._merge_numeric_requirement(
+                current, incoming, "text_min", prefer="max"
+            )
+            cls._merge_numeric_requirement(
+                current, incoming, "image_min", prefer="max"
+            )
+            cls._merge_numeric_requirement(
+                current, incoming, "text_max", prefer="min_positive"
+            )
+            cls._merge_numeric_requirement(
+                current, incoming, "image_max", prefer="min_positive"
+            )
+            current["argument_source"] = current_source
+            cls._normalize_requirement_bounds(current)
+            return
+
+        for field in fields:
+            if current.get(field) is None and incoming.get(field) is not None:
+                current[field] = incoming.get(field)
+        if not current.get("params") and current.get("text_max") != 0:
+            current["params"] = cls._merge_unique_strings(
+                incoming.get("params"), []
+            )
+        cls._normalize_requirement_bounds(current)
 
 
 __all__ = ["AutoMetadataBuilder"]

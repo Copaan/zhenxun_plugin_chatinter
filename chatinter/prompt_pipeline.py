@@ -8,6 +8,8 @@ chat-degrade split no longer exists.
 
 from __future__ import annotations
 
+import time
+
 from nonebot.adapters import Bot, Event
 from nonebot_plugin_uninfo import Uninfo
 
@@ -31,7 +33,7 @@ from .pipeline_stages import (
     stage_send,
     stage_thread_context,
 )
-from .turn_frame import TurnFrame
+from .turn_frame import PipelineStage, TurnFrame
 from .unified_flow import stage_unified_run
 
 
@@ -74,18 +76,22 @@ class PromptPipeline:
             message=frame.message,
             cached_plain_text=frame.cached_plain_text,
         )
+        gscore_route_started = time.perf_counter()
         gscore_route = await get_gscore_adapter().route_turn(frame)
+        frame.gscore_route_result = gscore_route
         frame.update_tags(
             gscore_route=gscore_route.disposition,
             gscore_matches=float(len(gscore_route.matches)),
+            gscore_route_ms=(time.perf_counter() - gscore_route_started) * 1000,
         )
+        frame.stage(PipelineStage.GSCORE_ROUTE)
         if gscore_route.suppress_chatinter:
             complete_suppressed_turn(
                 frame,
                 reason=f"gscore_{gscore_route.disposition}",
             )
             return
-        await stage_thread_context(frame=frame)
+        await stage_thread_context(frame=frame, bot=bot)
         if frame.allow_plugin_tools:
             await stage_route_media_context(frame=frame, bot=bot, event=event)
             await stage_group_capability_hint(

@@ -12,6 +12,7 @@ import inspect
 import json
 from typing import Any, Protocol
 
+import json_repair
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -232,6 +233,7 @@ class LLMGenerationConfig(BaseModel):
     response_schema: dict[str, Any] | None = None
     response_mime_type: str | None = None
     structured_output_strategy: str | None = None
+    validation_policy: dict[str, Any] | None = None
 
     def merge_with(self, other: "LLMGenerationConfig | Any | None") -> Any:
         if other is None:
@@ -270,6 +272,8 @@ def _new_generation_config(config: Any | None) -> Any | None:
         result.output.response_mime_type = config.response_mime_type
     if config.structured_output_strategy is not None:
         result.output.structured_output_strategy = config.structured_output_strategy
+    if config.validation_policy is not None:
+        result.validation_policy = copy.deepcopy(config.validation_policy)
     if config.tool_config and config.tool_config.mode:
         mode = str(config.tool_config.mode or "AUTO").upper()
         if mode in {"ANY", "REQUIRED"}:
@@ -720,15 +724,29 @@ async def validate_tool_call_arguments(
         try:
             parsed = json.loads(args_raw)
         except (TypeError, ValueError) as exc:
-            return (
-                executable,
-                None,
-                _tool_argument_error(
-                    tool_name,
-                    validation_error="invalid_json",
-                    error=f"工具参数不是有效 JSON：{exc}",
-                ),
-            )
+            if bool(
+                getattr(
+                    executable,
+                    "chatinter_ignore_unknown_top_level_arguments",
+                    False,
+                )
+            ):
+                try:
+                    parsed = json_repair.loads(args_raw, skip_json_loads=True)
+                except Exception:
+                    parsed = None
+            else:
+                parsed = None
+            if parsed is None:
+                return (
+                    executable,
+                    None,
+                    _tool_argument_error(
+                        tool_name,
+                        validation_error="invalid_json",
+                        error=f"工具参数不是有效 JSON：{exc}",
+                    ),
+                )
     else:
         parsed = args_raw
     if not isinstance(parsed, dict):
@@ -745,6 +763,25 @@ async def validate_tool_call_arguments(
     definition = await executable.get_definition()
     schema = definition.parameters if isinstance(definition.parameters, dict) else {}
     validation = _validate_json_schema(parsed, schema, path="$")
+    if (
+        validation is not None
+        and validation[0] == "unexpected_arguments"
+        and bool(
+            getattr(
+                executable,
+                "chatinter_ignore_unknown_top_level_arguments",
+                False,
+            )
+        )
+    ):
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            # Plugin dispatch tools share one model-visible catalog. A model can
+            # occasionally copy a top-level field from a neighbouring dispatch
+            # schema. Unknown fields are never executable input, so discard them
+            # once and validate the complete declared schema again.
+            parsed = {key: value for key, value in parsed.items() if key in properties}
+            validation = _validate_json_schema(parsed, schema, path="$")
     if validation is not None:
         validation_error, path, error = validation
         return (
@@ -758,6 +795,52 @@ async def validate_tool_call_arguments(
             ),
         )
     return executable, parsed, None
+
+
+async def normalize_responses_tool_argument_envelope(
+    tool_call: Any,
+    available_tools: dict[str, ToolExecutable],
+) -> tuple[Any, bool]:
+    """Unwrap one provider-added ``arguments`` envelope after strict validation."""
+
+    tool_name, args_raw = _tool_call_name_and_arguments(tool_call)
+    executable = available_tools.get(tool_name)
+    if executable is None or not isinstance(args_raw, str):
+        return tool_call, False
+    try:
+        outer = json.loads(args_raw)
+    except (TypeError, ValueError):
+        return tool_call, False
+    if not isinstance(outer, dict) or set(outer) != {"arguments"}:
+        return tool_call, False
+
+    definition = await executable.get_definition()
+    schema = definition.parameters if isinstance(definition.parameters, dict) else {}
+    properties = schema.get("properties")
+    if isinstance(properties, dict) and "arguments" in properties:
+        return tool_call, False
+
+    inner = outer["arguments"]
+    if isinstance(inner, str):
+        try:
+            inner = json.loads(inner)
+        except (TypeError, ValueError):
+            return tool_call, False
+    if not isinstance(inner, dict):
+        return tool_call, False
+    if _validate_json_schema(inner, schema, path="$") is not None:
+        return tool_call, False
+
+    normalized = copy.deepcopy(tool_call)
+    function = getattr(normalized, "function", None)
+    if function is None:
+        return tool_call, False
+    function.arguments = json.dumps(
+        inner,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return normalized, True
 
 
 def _tool_call_name_and_arguments(tool_call: Any) -> tuple[str, Any]:
@@ -883,29 +966,6 @@ def _tool_argument_error(
     )
 
 
-async def embed_documents(texts: list[str]) -> list[list[float]]:
-    from zhenxun.services.ai.llm.api import embed
-
-    response = await embed(texts, task="document")
-    return response.embeddings
-
-
-async def embed_query(text: str) -> list[float]:
-    from zhenxun.services.ai.llm.api import embed
-
-    response = await embed(text, task="query")
-    return response.vector
-
-
-def list_embedding_models() -> list[Any]:
-    try:
-        from zhenxun.services.ai.llm.manager import list_embedding_models as _list
-
-        return list(_list() or [])
-    except Exception:
-        return []
-
-
 __all__ = [
     "AI",
     "LLMContentPart",
@@ -922,9 +982,7 @@ __all__ = [
     "ToolExecutable",
     "ToolInvoker",
     "ToolResult",
-    "embed_documents",
-    "embed_query",
-    "list_embedding_models",
+    "normalize_responses_tool_argument_envelope",
     "response_reasoning_replay_items",
     "validate_tool_call_arguments",
 ]

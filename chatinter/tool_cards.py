@@ -12,8 +12,6 @@ _TEXT_LIMIT = 240
 _USAGE_LIMIT = 600
 _CANDIDATE_LIST_LIMIT = 8
 _CANDIDATE_EXAMPLE_LIMIT = 3
-
-
 def project_command_card(snapshot: CommandToolSnapshot) -> dict[str, Any]:
     card: dict[str, Any] = {
         "command_id": _clip(snapshot.command_id, 160),
@@ -22,29 +20,10 @@ def project_command_card(snapshot: CommandToolSnapshot) -> dict[str, Any]:
         "aliases": [_clip(value, 120) for value in snapshot.aliases if _text(value)],
         "description": _clip(snapshot.description or snapshot.capability_text, 320),
         "command_role": snapshot.command_role,
-        "task_verbs": [
-            _clip(value, 80) for value in snapshot.task_verbs if _text(value)
-        ],
-        "intent_types": [
-            _clip(value, 80) for value in snapshot.intent_types if _text(value)
-        ],
-        "generative": bool(snapshot.generative),
         "slots": [_slot_card(slot) for slot in snapshot.slots],
         "render": _clip(snapshot.render or snapshot.head, 320),
         "accepted_inputs": _accepted_inputs(snapshot),
         "required_context": _required_context(snapshot),
-        "use_cases": [
-            _clip(value, 240) for value in snapshot.use_cases if _text(value)
-        ],
-        "anti_use_cases": [
-            _clip(value, 240) for value in snapshot.anti_use_cases if _text(value)
-        ],
-        "entity_scope": snapshot.entity_scope,
-        "output_mode": snapshot.output_mode,
-        "side_effect": snapshot.side_effect,
-        "execution_policy": snapshot.execution_policy,
-        "source_of_truth": snapshot.source_of_truth,
-        "requires_real_result": bool(snapshot.requires_real_result),
     }
     usage = _text(snapshot.usage)
     if usage:
@@ -69,26 +48,18 @@ def project_command_candidate_card(snapshot: CommandToolSnapshot) -> dict[str, A
             "aliases",
             "description",
             "command_role",
-            "task_verbs",
-            "intent_types",
-            "generative",
             "slots",
             "render",
             "accepted_inputs",
             "required_context",
-            "use_cases",
-            "anti_use_cases",
-            "output_mode",
-            "side_effect",
-            "requires_real_result",
         )
         if key in card
     }
-    for key in ("aliases", "task_verbs", "intent_types"):
+    for key in ("aliases",):
         values = projected.get(key)
         if isinstance(values, list):
             projected[key] = values[:_CANDIDATE_LIST_LIMIT]
-    for key in ("use_cases", "anti_use_cases", "examples"):
+    for key in ("examples",):
         values = card.get(key)
         if isinstance(values, list) and values:
             projected[key] = values[:_CANDIDATE_EXAMPLE_LIMIT]

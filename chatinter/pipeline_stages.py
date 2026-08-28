@@ -8,6 +8,7 @@ ChatInter - pipeline stages
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from html import escape as _xml_escape
 import time
 from typing import Any, cast
@@ -54,6 +55,7 @@ from .group_turn_context import (
     consume_group_turn_context,
     snapshot_group_turn_records,
 )
+from .history_policy import get_durable_history_summary_cursor
 from .intent_classifier import classify_message_intent
 from .intervention_router import InterventionDecision, decide_intervention
 from .llm_compat import LLMContentPart, LLMMessage
@@ -64,26 +66,28 @@ from .main_request_models import (
 )
 from .memory import _chat_memory
 from .memory_writer import MemoryWriteContext, MemoryWriter
-from .member_similarity import score_alias_in_message
 from .models.chat_history import ChatInterChatHistory
 from .models.pydantic_models import PluginKnowledgeBase
 from .native_route import (
     NativeRouteDecision,
     NativeRouteReport,
 )
+from .person_candidates import (
+    TurnPersonCandidateLedger,
+    retrieve_person_candidates,
+)
 from .person_registry import (
-    AliasCandidate,
     PersonProfile,
     RelevantPerson,
     get_person_profile,
-    normalize_alias_key,
-    resolve_alias_candidates,
     resolve_relevant_people,
     upsert_seen_person,
 )
 from .plugin_registry import (
     PluginSelectionContext,
 )
+from .reaction_delivery import reaction_message, validated_reaction_path
+from .reaction_models import ReactionAction
 from .reply_delivery import (
     DeliveryReceipt,
     build_reply_delivery_plan,
@@ -114,9 +118,12 @@ from .runtime_result import (
 from .target_context import (
     build_mention_profiles,
     extract_pending_entities,
-    remember_target_resolution,
+    get_current_group_member_profiles_for_target,
 )
-from .target_resolver import VerifiedActionTarget, resolve_verified_action_target
+from .target_resolver import (
+    VerifiedActionTarget,
+    resolve_verified_action_target,
+)
 from .thread_resolver import ThreadContext, resolve_thread_context
 from .thread_store import record_thread_message
 from .trace import StageTrace
@@ -181,9 +188,11 @@ async def _persist_message_timeline(
         session_id=session_id,
     )
     if dialog is not None and int(getattr(dialog, "id", 0) or 0) % 32 == 0:
+        active_session_id = session_id or _chat_memory.get_session_id(user_id, group_id)
         await ChatInterChatHistory.prune_old_dialogs(
-            session_id or _chat_memory.get_session_id(user_id, group_id),
+            active_session_id,
             get_chat_history_limit(),
+            through_dialog_id=get_durable_history_summary_cursor(active_session_id),
         )
     if event_context is not None and thread_context is not None:
         pending_entities = tuple(
@@ -228,6 +237,7 @@ async def _build_dialogue_context_pack(
     *,
     event_context: ChatInterEventContext,
     mention_profiles: dict[str, dict[str, str]] | None = None,
+    bot: Bot | None = None,
 ) -> tuple[
     DialogueContextPack,
     PersonProfile | None,
@@ -246,27 +256,40 @@ async def _build_dialogue_context_pack(
         group_id=event_context.group_id,
         nickname=event_context.nickname,
     )
-    alias_candidates: list[AliasCandidate] = await resolve_alias_candidates(
-        group_id=event_context.group_id,
-        text=event_context.message_text_with_tags,
-        exclude_user_id=event_context.user_id,
-        limit=10,
-    )
     addressee = await resolve_addressee(
         event_context=event_context,
         bot_names=(BotConfig.self_nickname or "",),
         mention_profiles=mention_profiles,
         speaker_profile=speaker_profile,
-        alias_candidates=alias_candidates,
+        alias_candidates=[],
     )
     thread = await resolve_thread_context(
         event_context=event_context,
         addressee=addressee,
     )
     recent_user_ids = _recent_group_participant_ids(event_context)
-    relevant_people = await resolve_relevant_people(
+    roster_profiles = await get_current_group_member_profiles_for_target(
+        event_context.group_id,
+        bot=bot,
+    )
+    person_candidate_set = await retrieve_person_candidates(
         group_id=event_context.group_id,
         message_text=event_context.message_text_with_tags,
+        roster_profiles=roster_profiles,
+        current_user_id=event_context.user_id,
+        bot_id=event_context.bot_id,
+        mention_user_ids=tuple(event_context.mentioned_user_ids),
+        reply_sender_id=(
+            event_context.reply.sender_id if event_context.reply is not None else None
+        ),
+        thread_user_ids=thread.participants,
+        recent_user_ids=recent_user_ids,
+        current_speaker_profile=speaker_profile,
+    )
+    person_candidate_ledger = TurnPersonCandidateLedger(person_candidate_set)
+    relevant_people = await resolve_relevant_people(
+        group_id=event_context.group_id,
+        message_text="",
         speaker_profile=speaker_profile,
         bot_id=event_context.bot_id,
         mention_user_ids=tuple(event_context.mentioned_user_ids),
@@ -275,13 +298,16 @@ async def _build_dialogue_context_pack(
         else None,
         thread_user_ids=thread.participants,
         recent_user_ids=recent_user_ids,
-        entity_hints=thread.pending_entities,
-        alias_candidates=alias_candidates,
+        entity_hints=(),
+        alias_candidates=[],
+    )
+    relevant_people = _merge_person_candidates(
+        person_candidate_set.candidates,
+        relevant_people,
     )
     verified_action_target = resolve_verified_action_target(
         event_context=event_context,
         addressee=addressee,
-        alias_candidates=alias_candidates,
         speaker_profile=speaker_profile,
         reply_has_image=bool(
             event_context.reply and extract_image_tokens(event_context.reply.text)
@@ -318,11 +344,7 @@ async def _build_dialogue_context_pack(
         addressee=addressee,
         thread=thread,
         relevant_people=relevant_people,
-        action_target_user_ids=recent_user_ids,
-        alias_target_user_ids=_alias_target_user_ids(
-            event_context=event_context,
-            relevant_people=relevant_people,
-        ),
+        person_candidate_ledger=person_candidate_ledger,
     )
     return (
         pack,
@@ -334,49 +356,32 @@ async def _build_dialogue_context_pack(
     )
 
 
-_ALIAS_TARGET_LIMIT = 2
-
-
-def _alias_target_user_ids(
-    *,
-    event_context: ChatInterEventContext,
+def _merge_person_candidates(
+    candidates,
     relevant_people: tuple[RelevantPerson, ...],
-) -> tuple[str, ...]:
-    """本轮消息里被别名字面点名的人。
-
-    ``recent_user_ids`` 只覆盖"最近说过话的人"，一个从未在近期内存里发言的成员
-    即使被当前消息直接叫了名字也拿不到 target_ref，LLM 只能编造昵称、随后被
-    native_executor 拒绝。这里用消息原文重算别名字面命中，把强证据补进白名单。
-    """
-    message = str(event_context.message_text_with_tags or "")
-    if not message:
-        return ()
-    excluded = {
-        str(event_context.user_id or "").strip(),
-        str(event_context.bot_id or "").strip(),
-    }
-    scored: list[tuple[int, float, str]] = []
+) -> tuple[RelevantPerson, ...]:
+    merged: list[RelevantPerson] = []
     seen: set[str] = set()
-    for person in relevant_people:
-        if person.is_current_speaker:
-            continue
-        profile = person.profile
-        user_id = str(profile.user_id or "").strip()
-        if not user_id or user_id in excluded or user_id in seen:
-            continue
-        if str(getattr(profile, "conflict_state", "") or "").strip():
-            # 同一别名指向多人时不能凭字面命中授权，交由澄清流程处理。
-            continue
-        alias_key = normalize_alias_key(str(person.matched_alias or ""))
-        if not alias_key:
-            continue
-        score = score_alias_in_message(message, alias_key)
-        if score <= 0.0:
+    for candidate in candidates:
+        user_id = str(candidate.profile.user_id or "").strip()
+        if not user_id or user_id in seen:
             continue
         seen.add(user_id)
-        scored.append((len(alias_key), score, user_id))
-    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return tuple(user_id for _length, _score, user_id in scored[:_ALIAS_TARGET_LIMIT])
+        merged.append(
+            RelevantPerson(
+                profile=candidate.profile,
+                reason="person_candidate",
+                confidence=candidate.score,
+                matched_alias=candidate.matched_alias,
+            )
+        )
+    for person in relevant_people:
+        user_id = str(person.profile.user_id or "").strip()
+        if not user_id or user_id in seen:
+            continue
+        seen.add(user_id)
+        merged.append(person)
+    return tuple(merged[:8])
 
 
 def _recent_group_participant_ids(
@@ -587,6 +592,7 @@ async def stage_event_context(
 async def stage_thread_context(
     *,
     frame: TurnFrame,
+    bot: Bot | None = None,
 ) -> None:
     if frame.event_context is None:
         raise RuntimeError("missing event context")
@@ -600,8 +606,10 @@ async def stage_thread_context(
     ) = await _build_dialogue_context_pack(
         event_context=frame.event_context,
         mention_profiles=frame.mention_profiles,
+        bot=bot,
     )
     frame.dialogue_context_pack = dialogue_context_pack
+    frame.person_candidate_ledger = dialogue_context_pack.person_candidate_ledger
     frame.addressee_result = addressee_result
     frame.verified_action_target = verified_action_target
     frame.thread_context = thread_context
@@ -614,6 +622,11 @@ async def stage_thread_context(
         thread_id=thread_context.thread_id,
         intervention=intervention_decision.action,
         intervention_reason=intervention_decision.reason,
+        **(
+            dialogue_context_pack.person_candidate_ledger.snapshot()
+            if dialogue_context_pack.person_candidate_ledger is not None
+            else {}
+        ),
     )
     frame.stage(PipelineStage.THREAD_CONTEXT)
 
@@ -654,6 +667,7 @@ async def stage_memory(
             frame.event_context.reply if frame.event_context is not None else None
         ),
         context_sections_out=context_sections,
+        recent_reactions_out=frame.recent_reactions,
     )
     frame.chat_memory_layered = getattr(
         frame.dialogue_context_pack,
@@ -978,6 +992,7 @@ async def stage_current_user(
 ) -> None:
     image_extraction = await _extract_current_turn_images(frame=frame, message=message)
     image_parts = list(image_extraction.image_parts)
+    frame.current_image_parts = list(image_parts)
     frame.image_parts = image_parts
     if image_extraction.context_xml:
         _append_frame_context_section(
@@ -1163,7 +1178,10 @@ def _set_agent_stage_result(
     envelope.add(ChannelName.ANALYSIS, main_result.output.analysis)
     if main_result.output.should_send:
         reply_text = main_result.output.final_text
-        if not normalize_message_text(reply_text):
+        if (
+            not normalize_message_text(reply_text)
+            and not main_result.output.nontext_delivery
+        ):
             reply_text = EMPTY_REPLY_TEXT
         model_chat_completed = _is_model_chat_result(main_result)
         quality_enabled = bool(
@@ -1197,7 +1215,8 @@ def _set_agent_stage_result(
                 final_text=reply_text,
             )
             frame.main_result = main_result
-        envelope.add(ChannelName.FINAL, reply_text)
+        if normalize_message_text(reply_text):
+            envelope.add(ChannelName.FINAL, reply_text)
     frame.final_envelope = envelope
 
 
@@ -1364,15 +1383,23 @@ async def stage_persist(frame: TurnFrame) -> None:
         frame.update_tags(persistence_error=type(exc).__name__)
     frame.delivery_persisted = True
     frame.stage(PipelineStage.PERSIST)
+    persisted_reply_text = (
+        main_result.output.memory_text or envelope.final
+        if main_result.output.nontext_delivery
+        else envelope.final
+    )
     if main_result.output.record_chat_feedback:
         FeedbackStore.record_chat(
             session_id=frame.session_key,
             kind=cast(FeedbackKind, main_result.output.feedback_kind),
             message_text=frame.current_message,
-            reply_text=envelope.final,
+            reply_text=persisted_reply_text,
             weight=0.2,
         )
-    _persist_plain_chat_dialogue_state(frame=frame, reply_text=envelope.final)
+    _persist_plain_chat_dialogue_state(
+        frame=frame,
+        reply_text=persisted_reply_text,
+    )
     _record_delivered_result_observation(frame, main_result)
     _finish_trace(
         trace=frame.trace,
@@ -1443,6 +1470,41 @@ async def stage_send(frame: TurnFrame) -> None:
         message_preview=frame.current_message,
         **_route_report_observer_kwargs(frame.route_report),
     )
+    candidate_reaction = getattr(frame, "reaction_action", None)
+    reaction_action = (
+        candidate_reaction if isinstance(candidate_reaction, ReactionAction) else None
+    )
+    reaction_path = (
+        await validated_reaction_path(reaction_action)
+        if reaction_action is not None
+        else None
+    )
+    if reaction_action is not None and reaction_path is None:
+        frame.update_tags(
+            reaction_delivery="invalid",
+            reaction_delivery_result="validation_failed",
+            reaction_abstain_stage="validation_failed",
+        )
+        if not normalize_message_text(envelope.final):
+            main_result = _apply_reaction_text_fallback(
+                frame=frame,
+                main_result=main_result,
+                envelope=envelope,
+                action=reaction_action,
+            )
+        else:
+            main_result = replace(
+                main_result,
+                timeline=_without_reaction_history(main_result.timeline),
+                output=replace(
+                    main_result.output,
+                    memory_text=envelope.final,
+                    nontext_delivery=False,
+                ),
+            )
+            frame.main_result = main_result
+        reaction_action = None
+        frame.reaction_action = None
     delivery_mode, max_chars, max_segments = get_reply_delivery_settings()
     plan = build_reply_delivery_plan(
         envelope.final,
@@ -1452,12 +1514,14 @@ async def stage_send(frame: TurnFrame) -> None:
         ),
         hard_limit=max_chars,
         max_segments=max_segments,
+        attachment_count=1 if reaction_action is not None else 0,
     )
     frame.delivery_plan = plan
     interval_settings = (
         get_reply_delivery_interval_settings() if plan.conversational else None
     )
     delivered: list[str] = []
+    delivered_attachments = 0
     frame.delivery_receipt = DeliveryReceipt.from_plan(plan)
     quote_first = _should_quote_first_segment(frame)
     for index, segment in enumerate(plan.segments):
@@ -1469,7 +1533,11 @@ async def stage_send(frame: TurnFrame) -> None:
         else:
             await _send_frame_message(frame, message)
         delivered.append(segment)
-        frame.delivery_receipt = DeliveryReceipt.from_plan(plan, delivered)
+        frame.delivery_receipt = DeliveryReceipt.from_plan(
+            plan,
+            delivered,
+            delivered_attachments=delivered_attachments,
+        )
         if (
             plan.conversational
             and index + 1 < len(plan.segments)
@@ -1485,11 +1553,89 @@ async def stage_send(frame: TurnFrame) -> None:
             )
             if delay > 0:
                 await asyncio.sleep(delay)
+    if (
+        reaction_action is not None
+        and reaction_path is not None
+        and _frame_is_current(frame)
+    ):
+        try:
+            await _send_frame_message(
+                frame,
+                reaction_message(reaction_path),
+                reply_to=quote_first and not delivered,
+            )
+            delivered_attachments = 1
+            frame.update_tags(
+                reaction_delivery="complete",
+                reaction_delivery_result="complete",
+                reaction_abstain_stage="",
+            )
+            main_result = replace(
+                main_result,
+                output=replace(
+                    main_result.output,
+                    memory_text=reaction_action.memory_text,
+                    nontext_delivery=True,
+                ),
+            )
+            frame.main_result = main_result
+            frame.delivery_receipt = DeliveryReceipt.from_plan(
+                plan,
+                delivered,
+                delivered_attachments=delivered_attachments,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"ChatInter reaction delivery failed: {exc}")
+            frame.update_tags(
+                reaction_delivery="failed",
+                reaction_delivery_result="failed",
+                reaction_abstain_stage="delivery_failed",
+            )
+            if not delivered:
+                main_result = _apply_reaction_text_fallback(
+                    frame=frame,
+                    main_result=main_result,
+                    envelope=envelope,
+                    action=reaction_action,
+                )
+                fallback_plan = build_reply_delivery_plan(
+                    envelope.final,
+                    conversational=False,
+                    hard_limit=max_chars,
+                    max_segments=max_segments,
+                )
+                fallback_message = MessageUtils.build_message(envelope.final)
+                await _send_frame_message(
+                    frame,
+                    fallback_message,
+                    reply_to=quote_first,
+                )
+                delivered = [envelope.final]
+                plan = fallback_plan
+                frame.delivery_plan = fallback_plan
+                frame.delivery_receipt = DeliveryReceipt.from_plan(
+                    fallback_plan,
+                    delivered,
+                )
+            else:
+                main_result = replace(
+                    main_result,
+                    timeline=_without_reaction_history(main_result.timeline),
+                    output=replace(
+                        main_result.output,
+                        memory_text=envelope.final,
+                        nontext_delivery=False,
+                    ),
+                )
+                frame.main_result = main_result
+                frame.reaction_action = None
     receipt = _delivery_receipt(frame)
     frame.delivery_succeeded = bool(receipt and receipt.complete)
     frame.update_tags(
         delivery_state="complete" if frame.delivery_succeeded else "partial",
-        delivery_planned=float(len(plan.segments)),
+        delivery_planned=float(len(plan.segments) + plan.planned_attachments),
         delivery_segments=float(receipt.delivered_count if receipt else 0),
         delivery_conversational="1" if plan.conversational else "0",
     )
@@ -1497,6 +1643,56 @@ async def stage_send(frame: TurnFrame) -> None:
         frame.stage(PipelineStage.SEND)
     if frame.delivery_succeeded:
         _mark_group_context_answered(frame)
+
+
+def _apply_reaction_text_fallback(
+    *,
+    frame: TurnFrame,
+    main_result: MainRequestResult,
+    envelope: TurnChannelEnvelope,
+    action: ReactionAction,
+) -> MainRequestResult:
+    fallback = normalize_reply_text(action.fallback_text) or EMPTY_REPLY_TEXT
+    envelope.add(ChannelName.FINAL, fallback)
+    timeline = list(_without_reaction_history(main_result.timeline))
+    if not any(
+        item.role == "assistant"
+        and item.kind == "final_output"
+        and normalize_message_text(item.content) == normalize_message_text(fallback)
+        for item in timeline
+    ):
+        timeline.append(
+            MainRequestTimelineItem(
+                role="assistant",
+                kind="final_output",
+                content=fallback,
+                metadata={"assistant_history": True},
+            )
+        )
+    updated = replace(
+        main_result,
+        timeline=tuple(timeline),
+        output=replace(
+            main_result.output,
+            final_text=fallback,
+            memory_text=fallback,
+            should_send=True,
+            nontext_delivery=False,
+        ),
+    )
+    frame.main_result = updated
+    frame.reaction_action = None
+    return updated
+
+
+def _without_reaction_history(
+    timeline: tuple[MainRequestTimelineItem, ...],
+) -> tuple[MainRequestTimelineItem, ...]:
+    return tuple(
+        item
+        for item in timeline
+        if not (item.role == "assistant" and item.kind == "reaction_output")
+    )
 
 
 def _persist_plain_chat_dialogue_state(
@@ -1720,7 +1916,6 @@ __all__ = [
     "complete_suppressed_turn",
     "handle_pipeline_cancelled",
     "handle_pipeline_error",
-    "remember_target_resolution",
     "stage_chat_capability_hint",
     "stage_current_user",
     "stage_dialogue_state",

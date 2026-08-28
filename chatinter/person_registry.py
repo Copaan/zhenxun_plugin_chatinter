@@ -397,6 +397,14 @@ async def resolve_alias_candidates(
     return scored[: max(int(limit or 0), 0)]
 
 
+async def list_group_person_profiles(group_id: str | None) -> tuple[PersonProfile, ...]:
+    """Return the persisted alias snapshot for one group without ranking it."""
+
+    if not group_id:
+        return ()
+    return tuple(await _load_group_profiles(group_id))
+
+
 async def resolve_relevant_people(
     *,
     group_id: str | None,
@@ -746,9 +754,7 @@ async def _load_group_profiles(group_id: str) -> list[PersonProfile]:
 
 
 def _score_alias_match(alias_key: str, profile: PersonProfile) -> tuple[float, str]:
-    # Reuse build_member_alias_entries so relevant_people/addressee/verified_target
-    # resolution gets the same prefix/suffix fuzzy coverage as target_context's
-    # fuzzy-target path (e.g. "番茄" addressing a member nicknamed "番茄炒蛋").
+    # All identity paths use the same full, prefix, suffix, and fuzzy evidence.
     weighted_entries: list[tuple[MemberAliasEntry, float, str]] = []
 
     def register(value: str, weight: float) -> None:
@@ -915,6 +921,7 @@ __all__ = [
     "format_person_fact_layers",
     "format_person_history_label",
     "get_person_profile",
+    "list_group_person_profiles",
     "normalize_alias_key",
     "resolve_alias_candidates",
     "resolve_relevant_people",

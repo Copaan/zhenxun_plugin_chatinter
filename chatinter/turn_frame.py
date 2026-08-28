@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .context_budget import ChatContextBundle
     from .llm_compat import LLMMessage
+    from .reaction_models import ReactionAction, ReactionTurnState, RecentReactionFact
     from .reply_delivery import DeliveryReceipt, ReplyDeliveryPlan
 
 from .trace import StageTrace
@@ -19,6 +20,7 @@ class PipelineStage(str, Enum):
     IDENTITY = "identity"
     KNOWLEDGE = "knowledge"
     EVENT_CONTEXT = "event_context"
+    GSCORE_ROUTE = "gscore_route"
     THREAD_CONTEXT = "thread_context"
     DIALOGUE_STATE = "dialogue_state"
     CONTEXT = "context"
@@ -82,7 +84,9 @@ class TurnFrame:
     turn_priority: int = 0
     queue_wait_ms: float = 0.0
     event_context: Any | None = None
+    gscore_route_result: Any | None = None
     dialogue_context_pack: Any | None = None
+    person_candidate_ledger: Any | None = None
     addressee_result: Any | None = None
     verified_action_target: Any | None = None
     thread_context: Any | None = None
@@ -105,6 +109,10 @@ class TurnFrame:
     reply_images_data: list[Any] = field(default_factory=list)
     reply_image_segments_for_reroute: list[Any] = field(default_factory=list)
     image_parts: list[Any] = field(default_factory=list)
+    current_image_parts: list[Any] = field(default_factory=list)
+    reaction_turn_state: ReactionTurnState | None = None
+    reaction_action: ReactionAction | None = None
+    recent_reactions: list[RecentReactionFact] = field(default_factory=list)
     agent_messages: list[LLMMessage] = field(default_factory=list)
     agent_observations: list[Any] = field(default_factory=list)
     router_context: dict[str, object] = field(default_factory=dict)

@@ -166,13 +166,10 @@ def score_alias_in_message(
     if alias not in message_key:
         return 0.0
     if _is_ascii(alias) and not _has_ascii_word_boundary(message, alias):
-        # "bob" must not fire on "bobcat"; CJK has no word boundaries so the
-        # substring test alone is the evidence there.
+        # ASCII aliases require token boundaries; CJK aliases use containment.
         return 0.0
     if kind in ("suffix", "prefix"):
-        # A suffix/prefix match ("小明" out of "李小明", "番茄" out of "番茄炒蛋")
-        # is weaker evidence than a full alias; keep it aligned with
-        # score_member_alias's suffix/prefix clamp.
+        # Partial alias matches share the weaker score cap used by name matching.
         return 0.88
     return 0.94 if len(alias) >= 3 else 0.90
 
@@ -280,11 +277,11 @@ def _is_cjk(char: str) -> bool:
     return "\u4e00" <= char <= "\u9fff"
 
 
-# 别名解析共享阈值：生产分数区间见 score_member_alias / score_alias_in_message。
-ALIAS_MATCH_THRESHOLD = 0.86        # 单候选最低采纳分
-ALIAS_AMBIGUOUS_TOP = 0.90          # 多候选时 top 需达到的分数（0.92 对子串分支不可达，降至 0.90）
-ALIAS_AMBIGUOUS_GAP = 0.12          # 多候选时 top 与次名的最小分差
-ALIAS_MEMORY_WRITE_THRESHOLD = 0.90 # 别名记忆写入门槛
+# Shared thresholds for alias resolution and persistence.
+ALIAS_MATCH_THRESHOLD = 0.86  # Minimum score for a unique candidate.
+ALIAS_AMBIGUOUS_TOP = 0.90  # Minimum leading score when candidates conflict.
+ALIAS_AMBIGUOUS_GAP = 0.12  # Minimum gap between the top two candidates.
+ALIAS_MEMORY_WRITE_THRESHOLD = 0.90  # Minimum score for alias persistence.
 
 
 __all__ = (

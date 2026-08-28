@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 import hashlib
 import json
-from typing import Any
+from typing import Any, Literal
 from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 
@@ -18,6 +18,13 @@ from ..token_compat import estimate_text_tokens
 from .state import groups_with_next_user_message, is_runtime_control_message
 
 SEMANTIC_SUMMARY_OUTPUT_TOKENS = 20_000
+CompactionTrigger = Literal["soft_pressure", "provider_overflow", "manual"]
+CompactionStrategy = Literal[
+    "semantic",
+    "deterministic",
+    "tool_prune",
+    "unchanged",
+]
 
 
 class SemanticSummaryPayload(BaseModel):
@@ -64,6 +71,7 @@ _SEMANTIC_SUMMARY_REPAIR = f"""\
 
 _PROTECTED_TAIL_TOKENS = 24_000
 _LARGE_TOOL_RESULT_CHARS = 2_000
+_LARGE_TOOL_ROUND_TOKENS = 1_200
 _PRUNED_TOOL_HEAD_CHARS = 300
 _PRUNED_TOOL_TAIL_CHARS = 700
 _SUMMARY_CONTENT_CHARS = 6_000
@@ -114,6 +122,18 @@ class ContextCompressionResult:
     target_prompt_tokens: int = 0
     tail_token_budget: int = 0
     summary_token_target: int = 0
+    strategy: CompactionStrategy = "unchanged"
+    trigger: CompactionTrigger = "soft_pressure"
+    retained_rounds: int = 0
+    dropped_rounds: int = 0
+    candidate_attempts: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SemanticSummaryResponse:
+    text: str
+    candidate_attempts: tuple[str, ...] = ()
+    failure_reason: str = ""
 
 
 def context_window_budget(
@@ -149,22 +169,99 @@ def resolve_superuser_max_input_tokens(model_name: str | None) -> int:
 def estimate_messages_tokens(messages: list[LLMMessage]) -> int:
     total = 0
     for message in messages:
-        total += 4 + estimate_agent_text_tokens(
-            _message_content(getattr(message, "content", ""))
-        )
+        total += 4 + _message_payload_tokens(message)
         if getattr(message, "role", "") == "tool":
             total += 40
             total += estimate_agent_text_tokens(str(getattr(message, "name", "") or ""))
-        for tool_call in getattr(message, "tool_calls", None) or ():
-            function = getattr(tool_call, "function", None)
-            total += 8
-            total += estimate_agent_text_tokens(
-                str(getattr(function, "name", "") or "")
-            )
-            total += estimate_agent_text_tokens(
-                str(getattr(function, "arguments", "") or "")
-            )
     return total
+
+
+def _message_payload_tokens(message: LLMMessage) -> int:
+    raw_metadata = getattr(message, "metadata", None)
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+    replay = metadata.get(
+        "provider_replay_payload",
+        metadata.get(
+            "reasoning_replay_payload",
+            metadata.get("reasoning_replay_items"),
+        ),
+    )
+    if (
+        getattr(message, "role", "") == "assistant"
+        and getattr(message, "tool_calls", None)
+        and isinstance(replay, list | tuple)
+        and replay
+    ):
+        return estimate_agent_text_tokens(
+            json.dumps(replay, ensure_ascii=False, separators=(",", ":"), default=str)
+        )
+
+    content_parts = getattr(message, "content_parts", None)
+    if content_parts is not None:
+        total = estimate_agent_text_tokens(
+            json.dumps(
+                [_token_visible_part(part) for part in content_parts],
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            )
+        )
+    else:
+        total = estimate_agent_text_tokens(
+            _token_visible_content(getattr(message, "content", ""))
+        )
+    for tool_call in getattr(message, "tool_calls", None) or ():
+        function = getattr(tool_call, "function", None)
+        payload = {
+            "id": str(getattr(tool_call, "id", "") or ""),
+            "name": str(getattr(function, "name", "") or ""),
+            "arguments": str(getattr(function, "arguments", "") or ""),
+            "thought_signature": str(
+                getattr(tool_call, "thought_signature", "") or ""
+            ),
+            "metadata": getattr(tool_call, "metadata", None) or {},
+        }
+        total += 8 + estimate_agent_text_tokens(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+        )
+    thought_signature = getattr(message, "thought_signature", None)
+    if thought_signature:
+        total += estimate_agent_text_tokens(str(thought_signature))
+    return total
+
+
+def _token_visible_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    return json.dumps(
+        [_token_visible_part(part) for part in content or ()],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _token_visible_part(part: Any) -> dict[str, Any]:
+    def value(name: str, default: Any = None) -> Any:
+        if isinstance(part, dict):
+            return part.get(name, default)
+        return getattr(part, name, default)
+
+    result: dict[str, Any] = {"type": str(value("type", "") or "")}
+    for key in (
+        "text",
+        "thought_text",
+        "image_source",
+        "mime_type",
+        "id",
+        "tool_name",
+        "args",
+        "metadata",
+    ):
+        item = value(key)
+        if item not in (None, "", {}, []):
+            result[key] = item
+    return result
 
 
 def estimate_agent_text_tokens(text: str) -> int:
@@ -224,13 +321,35 @@ def semantic_summary_output_tokens(
     return output_tokens
 
 
+def summary_request_output_tokens(
+    messages: list[LLMMessage],
+    *,
+    max_input_tokens: int,
+) -> int:
+    for message in messages:
+        content = _message_content(message.content)
+        start = content.find("<summary_output_token_target>")
+        end = content.find("</summary_output_token_target>", start)
+        if start < 0 or end < 0:
+            continue
+        value = content[start + len("<summary_output_token_target>") : end]
+        try:
+            return min(
+                semantic_summary_output_tokens(max_input_tokens),
+                max(int(value.strip()), 1),
+            )
+        except ValueError:
+            break
+    return semantic_summary_output_tokens(max_input_tokens)
+
+
 def _compression_prompt_target(
     budget: ContextWindowBudget,
     *,
     target_prompt_tokens: int | None,
     tighter: bool,
 ) -> int:
-    target = budget.compact_threshold if tighter else budget.blocking_limit
+    target = max(int(budget.effective_window * (0.4 if tighter else 0.5)), 1)
     if target_prompt_tokens is not None:
         target = min(target, max(int(target_prompt_tokens or 0), 1))
     return max(min(target, budget.blocking_limit), 1)
@@ -311,18 +430,22 @@ async def compact_messages(
     *,
     trace_id: str,
     max_input_tokens: int,
-    summarize: Callable[[list[LLMMessage]], Awaitable[str]],
+    summarize: Callable[
+        [list[LLMMessage]], Awaitable[str | SemanticSummaryResponse]
+    ],
     schema_tokens: int = 0,
     output_reserve_tokens: int = 0,
     force: bool = False,
-    blocked_source_fingerprint: str = "",
     on_failure: Callable[[str, dict[str, Any]], None] | None = None,
     propagate_errors: tuple[type[Exception], ...] = (),
-    max_attempts: int = 2,
+    attempt_summary: bool = True,
     prune_tool_results: bool = True,
     prompt_tokens_before: int | None = None,
     target_prompt_tokens: int | None = None,
+    summary_max_input_tokens: int | None = None,
     tighter: bool = False,
+    trigger: CompactionTrigger = "soft_pressure",
+    checkpoint_state: dict[str, Any] | None = None,
 ) -> ContextCompressionResult:
     initial_prompt_tokens = (
         prompt_tokens_before
@@ -351,23 +474,21 @@ async def compact_messages(
         else _unchanged_result(messages, tail_token_budget=tail_token_budget)
     )
     pruned = _with_compression_targets(
-        pruned,
+        replace(
+            pruned,
+            strategy="tool_prune" if pruned.changed else "unchanged",
+            trigger=trigger,
+        ),
         budget=main_budget,
         target_prompt_tokens=prompt_target,
         tail_token_budget=tail_token_budget,
     )
-    working_messages = pruned.messages
     if pruned.changed:
         pruned = _with_rewrite_token_baseline(
             pruned,
             prompt_tokens_before=prompt_tokens_before,
         )
-        enough_limit = (
-            prompt_target
-            if force or tighter or target_prompt_tokens is not None
-            else main_budget.compact_threshold
-        )
-        if pruned.after_tokens < enough_limit:
+        if pruned.after_tokens < prompt_target:
             return _with_compression_targets(
                 pruned,
                 budget=main_budget,
@@ -375,176 +496,168 @@ async def compact_messages(
                 tail_token_budget=tail_token_budget,
             )
 
+    working_messages = pruned.messages if pruned.changed else list(messages)
     plan = build_semantic_compression_plan(
         working_messages,
         tail_token_budget=tail_token_budget,
     )
-    failure_reason = ""
+    failure_reason = "no_compressible_history" if plan is None else ""
     summary_token_target = 0
+    candidate_attempts: tuple[str, ...] = ()
+    semantic_result: ContextCompressionResult | None = None
     if plan is not None:
         fingerprint = compression_source_fingerprint(plan.source)
-        if fingerprint != blocked_source_fingerprint:
-            summary_token_target = _summary_token_target(
-                plan,
-                max_input_tokens=max_input_tokens,
+        summary_token_target = _summary_token_target(
+            plan,
+            max_input_tokens=max_input_tokens,
+            target_prompt_tokens=prompt_target,
+        )
+        if summary_token_target <= 0:
+            failure_reason = "protected_context_exceeds_target"
+            _report_compression_failure(
+                on_failure,
+                fingerprint,
+                error=failure_reason,
+                protected_tokens=estimate_messages_tokens([*plan.prefix, *plan.tail]),
                 target_prompt_tokens=prompt_target,
             )
-            if summary_token_target <= 0:
-                failure_reason = "protected_context_exceeds_target"
-                _report_compression_failure(
-                    on_failure,
-                    fingerprint,
-                    error=failure_reason,
-                    protected_tokens=estimate_messages_tokens(
-                        [*plan.prefix, *plan.tail]
+        elif attempt_summary:
+            payload, failure_reason, candidate_attempts = (
+                await _summarize_plan_in_order(
+                    plan,
+                    max_input_tokens=max(
+                        int(summary_max_input_tokens or 0),
+                        int(max_input_tokens or 0),
                     ),
-                    target_prompt_tokens=prompt_target,
+                    summary_token_target=summary_token_target,
+                    summarize=summarize,
+                    propagate_errors=propagate_errors,
+                    on_failure=on_failure,
+                    fingerprint=fingerprint,
                 )
-                return _with_compression_targets(
-                    pruned,
-                    budget=main_budget,
-                    target_prompt_tokens=prompt_target,
-                    tail_token_budget=tail_token_budget,
-                    failure_reason=failure_reason,
-                )
-            attempt_count = min(max(int(max_attempts or 0), 0), 2)
-            request_messages, prompt_tokens, dropped_rounds = _fit_summary_request(
-                plan,
-                max_input_tokens=max_input_tokens,
-                summary_token_target=summary_token_target,
-                reserve_repair=attempt_count > 1,
             )
-            request_budget = context_window_budget(
-                max_input_tokens=max_input_tokens,
-                prompt_tokens=prompt_tokens,
-                schema_tokens=0,
-                output_reserve_tokens=semantic_summary_output_tokens(max_input_tokens),
-            )
-            if request_messages is None:
-                failure_reason = "summary_request_too_large"
-                _report_compression_failure(
-                    on_failure,
-                    fingerprint,
-                    error=failure_reason,
-                    prompt_tokens=prompt_tokens,
-                    blocking_limit=request_budget.blocking_limit,
+            if payload is not None:
+                result = apply_semantic_summary(
+                    plan,
+                    json.dumps(payload, ensure_ascii=False),
+                    trace_id=trace_id,
                 )
-            attempt_messages = request_messages
-            for attempt in range(attempt_count if request_messages else 0):
-                try:
-                    summary_text = await summarize(list(attempt_messages))
-                    result = apply_semantic_summary(
-                        plan,
-                        summary_text,
-                        trace_id=trace_id,
-                        summary_input_dropped_rounds=dropped_rounds,
-                    )
-                except Exception as exc:
-                    if propagate_errors and isinstance(exc, propagate_errors):
-                        raise
-                    _report_compression_failure(
-                        on_failure,
-                        fingerprint,
-                        error=f"{type(exc).__name__}: {str(exc)[:240]}",
-                    )
-                    failure_reason = "summary_request_failed"
-                    continue
+                result = replace(
+                    result,
+                    artifact_ids=tuple(
+                        dict.fromkeys((*pruned.artifact_ids, *result.artifact_ids))
+                    ),
+                    pruned_tool_results=pruned.pruned_tool_results,
+                    candidate_attempts=candidate_attempts,
+                    trigger=trigger,
+                )
                 if result.changed:
-                    combined = replace(
-                        result,
-                        before_tokens=estimate_messages_tokens(messages),
-                        pruned_tool_results=pruned.pruned_tool_results,
-                        artifact_ids=tuple(
-                            dict.fromkeys((*pruned.artifact_ids, *result.artifact_ids))
-                        ),
-                    )
                     combined = _with_rewrite_token_baseline(
-                        combined,
-                        prompt_tokens_before=prompt_tokens_before,
-                    )
-                    failure_reason = (
-                        "compressed_prompt_over_target"
-                        if combined.after_tokens >= prompt_target
-                        else ""
-                    )
-                    return _with_compression_targets(
-                        combined,
-                        budget=main_budget,
-                        target_prompt_tokens=prompt_target,
-                        tail_token_budget=tail_token_budget,
-                        summary_token_target=summary_token_target,
-                        failure_reason=failure_reason,
-                    )
-                if result.artifact_persistence_failed:
-                    failure_reason = "artifact_persistence_failed"
-                    _report_compression_failure(
-                        on_failure,
-                        fingerprint,
-                        error=failure_reason,
-                    )
-                    failed = _with_rewrite_token_baseline(
                         replace(
-                            pruned,
-                            artifact_persistence_failed=True,
-                            failure_reason=failure_reason,
+                            result,
+                            before_tokens=estimate_messages_tokens(messages),
                         ),
                         prompt_tokens_before=prompt_tokens_before,
                     )
-                    return _with_compression_targets(
-                        failed,
-                        budget=main_budget,
-                        target_prompt_tokens=prompt_target,
-                        tail_token_budget=tail_token_budget,
-                        summary_token_target=summary_token_target,
-                        failure_reason=failure_reason,
-                    )
-                if result.low_savings:
-                    failure_reason = "ineffective_semantic_summary"
-                    _report_compression_failure(
-                        on_failure,
-                        fingerprint,
-                        error=failure_reason,
-                        before_tokens=result.before_tokens,
-                        candidate_tokens=result.summary_candidate_tokens,
-                        savings_tokens=result.summary_savings_tokens,
-                        savings_ratio=result.summary_savings_ratio,
-                    )
-                    continue
-                failure_reason = "invalid_structured_summary"
-                _report_compression_failure(
-                    on_failure,
-                    fingerprint,
-                    error=failure_reason,
-                )
-                if attempt + 1 < attempt_count:
-                    repair_messages = _summary_repair_request(request_messages)
-                    if (
-                        estimate_messages_tokens(list(repair_messages))
-                        >= request_budget.blocking_limit
-                    ):
-                        failure_reason = "summary_repair_request_too_large"
+                    if combined.after_tokens < prompt_target:
+                        return _with_compression_targets(
+                            combined,
+                            budget=main_budget,
+                            target_prompt_tokens=prompt_target,
+                            tail_token_budget=tail_token_budget,
+                            summary_token_target=summary_token_target,
+                            failure_reason="",
+                        )
+                    failure_reason = "compressed_prompt_over_target"
+                    semantic_result = combined
+                else:
+                    if result.artifact_persistence_failed:
+                        failure_reason = "artifact_persistence_failed"
                         _report_compression_failure(
                             on_failure,
                             fingerprint,
                             error=failure_reason,
-                            blocking_limit=request_budget.blocking_limit,
                         )
-                        break
-                    attempt_messages = repair_messages
-            if request_messages is not None and attempt_count == 0:
-                failure_reason = "compression_attempts_exhausted"
+                    elif result.low_savings:
+                        failure_reason = "ineffective_semantic_summary"
+                        _report_compression_failure(
+                            on_failure,
+                            fingerprint,
+                            error=failure_reason,
+                            before_tokens=result.before_tokens,
+                            candidate_tokens=result.summary_candidate_tokens,
+                            savings_tokens=result.summary_savings_tokens,
+                            savings_ratio=result.summary_savings_ratio,
+                        )
+                    else:
+                        failure_reason = "invalid_structured_summary"
+                        _report_compression_failure(
+                            on_failure,
+                            fingerprint,
+                            error=failure_reason,
+                        )
         else:
-            failure_reason = "compression_circuit_open"
-    else:
-        enough_limit = (
-            prompt_target
-            if force or tighter or target_prompt_tokens is not None
-            else main_budget.compact_threshold
+            failure_reason = "semantic_summary_skipped"
+
+    deterministic_source = (
+        semantic_result.messages if semantic_result is not None else working_messages
+    )
+    deterministic = apply_deterministic_checkpoint(
+        deterministic_source,
+        trace_id=trace_id,
+        target_prompt_tokens=prompt_target,
+        tail_token_budget=tail_token_budget,
+        checkpoint_state=checkpoint_state,
+        trigger=trigger,
+    )
+    deterministic = replace(
+        deterministic,
+        before_tokens=estimate_messages_tokens(messages),
+        artifact_ids=tuple(
+            dict.fromkeys(
+                (
+                    *pruned.artifact_ids,
+                    *((semantic_result.artifact_ids) if semantic_result else ()),
+                    *deterministic.artifact_ids,
+                )
+            )
+        ),
+        pruned_tool_results=pruned.pruned_tool_results,
+        candidate_attempts=candidate_attempts,
+        trigger=trigger,
+    )
+    if (
+        not deterministic.changed
+        and semantic_result is not None
+        and not deterministic.artifact_persistence_failed
+    ):
+        deterministic = replace(
+            semantic_result,
+            failure_reason=failure_reason or "compressed_prompt_over_target",
+            artifact_persistence_failed=deterministic.artifact_persistence_failed,
+            artifact_ids=tuple(
+                dict.fromkeys(
+                    (*semantic_result.artifact_ids, *deterministic.artifact_ids)
+                )
+            ),
+            candidate_attempts=candidate_attempts,
+            trigger=trigger,
+            strategy="semantic",
         )
-        if pruned.after_tokens >= enough_limit:
-            failure_reason = "no_compressible_history"
+    elif not deterministic.changed and pruned.changed:
+        deterministic = replace(
+            pruned,
+            failure_reason=deterministic.failure_reason or failure_reason,
+            artifact_persistence_failed=deterministic.artifact_persistence_failed,
+            artifact_ids=tuple(
+                dict.fromkeys((*pruned.artifact_ids, *deterministic.artifact_ids))
+            ),
+            candidate_attempts=candidate_attempts,
+            trigger=trigger,
+            strategy="tool_prune",
+        )
     final = _with_rewrite_token_baseline(
-        pruned,
+        deterministic,
         prompt_tokens_before=prompt_tokens_before,
     )
     return _with_compression_targets(
@@ -553,8 +666,160 @@ async def compact_messages(
         target_prompt_tokens=prompt_target,
         tail_token_budget=tail_token_budget,
         summary_token_target=summary_token_target,
-        failure_reason=failure_reason,
+        failure_reason=(
+            final.failure_reason
+            or (failure_reason if not final.changed else "")
+        ),
     )
+
+
+async def _summarize_plan_in_order(
+    plan: SemanticCompressionPlan,
+    *,
+    max_input_tokens: int,
+    summary_token_target: int,
+    summarize: Callable[
+        [list[LLMMessage]], Awaitable[str | SemanticSummaryResponse]
+    ],
+    propagate_errors: tuple[type[Exception], ...],
+    on_failure: Callable[[str, dict[str, Any]], None] | None,
+    fingerprint: str,
+) -> tuple[dict[str, str] | None, str, tuple[str, ...]]:
+    summaries = tuple(
+        message for message in plan.middle if is_context_summary(message)
+    )
+    rounds = _api_rounds(
+        tuple(message for message in plan.middle if not is_context_summary(message))
+    )
+    if not rounds:
+        return None, "no_compressible_history", ()
+    accumulator = summaries
+    latest_payload: dict[str, str] | None = None
+    round_index = 0
+    candidate_attempts: list[str] = []
+    while round_index < len(rounds):
+        request, next_index = _next_summary_request_batch(
+            accumulator,
+            rounds,
+            round_index=round_index,
+            max_input_tokens=max_input_tokens,
+            summary_token_target=summary_token_target,
+        )
+        if request is None:
+            _report_compression_failure(
+                on_failure,
+                fingerprint,
+                error="summary_request_too_large",
+            )
+            return None, "summary_request_too_large", tuple(candidate_attempts)
+        payload: dict[str, str] | None = None
+        try:
+            response = await summarize(list(request))
+            if isinstance(response, SemanticSummaryResponse):
+                candidate_attempts.extend(response.candidate_attempts)
+                response_text = response.text
+                response_failure = response.failure_reason
+            else:
+                response_text = response
+                response_failure = ""
+            payload = parse_semantic_summary(response_text)
+        except Exception as exc:
+            if propagate_errors and isinstance(exc, propagate_errors):
+                raise
+            _report_compression_failure(
+                on_failure,
+                fingerprint,
+                error=f"{type(exc).__name__}: {str(exc)[:240]}",
+            )
+            return None, "summary_request_failed", tuple(candidate_attempts)
+        if payload is None:
+            _report_compression_failure(
+                on_failure,
+                fingerprint,
+                error=response_failure or "invalid_structured_summary",
+            )
+            return (
+                None,
+                response_failure or "invalid_structured_summary",
+                tuple(candidate_attempts),
+            )
+        accumulator = (
+            LLMMessage(
+                role="user",
+                content=render_semantic_summary(payload),
+                metadata={_SUMMARY_METADATA_KEY: True},
+            ),
+        )
+        latest_payload = payload
+        round_index = next_index
+    return (
+        latest_payload,
+        "" if latest_payload is not None else "invalid_structured_summary",
+        tuple(candidate_attempts),
+    )
+
+
+def _next_summary_request_batch(
+    summaries: tuple[LLMMessage, ...],
+    rounds: tuple[tuple[LLMMessage, ...], ...],
+    *,
+    round_index: int,
+    max_input_tokens: int,
+    summary_token_target: int,
+) -> tuple[tuple[LLMMessage, ...] | None, int]:
+    selected: list[tuple[LLMMessage, ...]] = []
+    for index in range(round_index, len(rounds)):
+        candidate = _summary_request_messages(
+            (
+                *summaries,
+                *(message for round_ in selected for message in round_),
+                *rounds[index],
+            ),
+            summary_token_target=summary_token_target,
+        )
+        if _summary_request_fits(
+            candidate,
+            max_input_tokens=max_input_tokens,
+            summary_token_target=summary_token_target,
+        ):
+            selected.append(rounds[index])
+            continue
+        break
+    if selected:
+        return (
+            _summary_request_messages(
+                (*summaries, *(message for round_ in selected for message in round_)),
+                summary_token_target=summary_token_target,
+            ),
+            round_index + len(selected),
+        )
+    bounded = _summary_request_messages(
+        (*summaries, *rounds[round_index]),
+        bound_content=True,
+        summary_token_target=summary_token_target,
+    )
+    if not _summary_request_fits(
+        bounded,
+        max_input_tokens=max_input_tokens,
+        summary_token_target=summary_token_target,
+    ):
+        return None, round_index
+    return bounded, round_index + 1
+
+
+def _summary_request_fits(
+    request: tuple[LLMMessage, ...],
+    *,
+    max_input_tokens: int,
+    summary_token_target: int,
+) -> bool:
+    budget = context_window_budget(
+        max_input_tokens=max_input_tokens,
+        prompt_tokens=estimate_messages_tokens(list(request)),
+        schema_tokens=0,
+        output_reserve_tokens=summary_token_target,
+    )
+    return budget.prompt_tokens < budget.blocking_limit
 
 
 def apply_semantic_summary(
@@ -576,14 +841,11 @@ def apply_semantic_summary(
             protected_messages=len(plan.tail),
             failure_reason="invalid_structured_summary",
         )
-    artifact = get_artifact_store().store_text(
+    artifact_id = _store_context_source(
         plan.source,
-        artifact_type="text",
         trace_id=trace_id,
         source="semantic_context_compression:omitted_messages",
-        force_file=True,
     )
-    artifact_id = str(getattr(artifact, "artifact_id", "") or "")
     if not artifact_id:
         return ContextCompressionResult(
             messages=before_messages,
@@ -637,7 +899,484 @@ def apply_semantic_summary(
         summary_savings_ratio=savings_ratio,
         low_savings=low_savings,
         summary_input_dropped_rounds=max(int(summary_input_dropped_rounds or 0), 0),
+        strategy="semantic",
     )
+
+
+def apply_deterministic_checkpoint(
+    messages: list[LLMMessage],
+    *,
+    trace_id: str,
+    target_prompt_tokens: int,
+    tail_token_budget: int,
+    checkpoint_state: dict[str, Any] | None = None,
+    trigger: CompactionTrigger = "soft_pressure",
+) -> ContextCompressionResult:
+    before_tokens = estimate_messages_tokens(messages)
+    system_end = 0
+    while system_end < min(len(messages), 2) and messages[system_end].role == "system":
+        system_end += 1
+    prefix = tuple(messages[:system_end])
+    body = tuple(messages[system_end:])
+    if not body:
+        return replace(
+            _unchanged_result(messages, tail_token_budget=tail_token_budget),
+            failure_reason="no_compressible_history",
+            trigger=trigger,
+        )
+    target = max(int(target_prompt_tokens or 0), 1)
+    rounds = _api_rounds(
+        tuple(message for message in body if not is_context_summary(message))
+    )
+    summaries = tuple(message for message in body if is_context_summary(message))
+    if before_tokens <= target and len(rounds) <= 1 and not summaries:
+        return replace(
+            _unchanged_result(messages, tail_token_budget=tail_token_budget),
+            failure_reason="no_compressible_history",
+            trigger=trigger,
+        )
+
+    payload = _deterministic_checkpoint_payload(
+        body,
+        checkpoint_state=checkpoint_state,
+    )
+    checkpoint_artifact_refs = _checkpoint_artifact_refs(checkpoint_state)
+    prefix_tokens = estimate_messages_tokens(list(prefix))
+    checkpoint_budget = max(
+        min(target // 5, semantic_summary_output_tokens(max(target, 1))),
+        256,
+    )
+    checkpoint_budget = min(
+        checkpoint_budget,
+        max(target - prefix_tokens - 16, 64),
+    )
+    placeholder_checkpoint = _deterministic_checkpoint_message(
+        payload,
+        artifact_id="x" * 64,
+        token_budget=checkpoint_budget,
+        artifact_refs=checkpoint_artifact_refs,
+    )
+    used_tokens = estimate_messages_tokens([*prefix, placeholder_checkpoint])
+    available_tail_tokens = max(
+        min(int(tail_token_budget or 0), target - used_tokens),
+        0,
+    )
+    retained: list[tuple[LLMMessage, ...]] = []
+    retained_tokens = 0
+    oversized_latest: tuple[LLMMessage, ...] | None = None
+    for reverse_index, round_ in enumerate(reversed(rounds)):
+        round_tokens = estimate_messages_tokens(list(round_))
+        if retained_tokens + round_tokens > available_tail_tokens:
+            if reverse_index == 0 and _round_requires_provider_replay(round_):
+                retained.append(round_)
+                retained_tokens += round_tokens
+            elif reverse_index == 0 and _round_has_current_user_request(round_):
+                oversized_latest = round_
+            break
+        retained.append(round_)
+        retained_tokens += round_tokens
+    retained.reverse()
+
+    source = "\n".join(_message_record(message) for message in body)
+    artifact_id = _store_context_source(
+        source,
+        trace_id=trace_id,
+        source="deterministic_context_checkpoint:omitted_messages",
+    )
+    if not artifact_id:
+        return ContextCompressionResult(
+            messages=list(messages),
+            changed=False,
+            before_tokens=before_tokens,
+            after_tokens=before_tokens,
+            artifact_persistence_failed=True,
+            failure_reason="artifact_persistence_failed",
+            target_prompt_tokens=target,
+            tail_token_budget=max(int(tail_token_budget or 0), 1),
+            strategy="unchanged",
+            trigger=trigger,
+        )
+    checkpoint = _deterministic_checkpoint_message(
+        payload,
+        artifact_id=artifact_id,
+        token_budget=checkpoint_budget,
+        artifact_refs=checkpoint_artifact_refs,
+    )
+    retained_messages = [message for round_ in retained for message in round_]
+    result_messages = [*prefix, checkpoint, *retained_messages]
+    if oversized_latest:
+        current_budget = max(
+            target - estimate_messages_tokens(result_messages) - 8,
+            1,
+        )
+        result_messages.append(
+            _archived_current_round_message(
+                oversized_latest,
+                artifact_id=artifact_id,
+                token_budget=current_budget,
+            )
+        )
+
+    while (
+        len(retained) > 1
+        and estimate_messages_tokens(result_messages) > target
+    ):
+        retained.pop(0)
+        retained_messages = [message for round_ in retained for message in round_]
+        result_messages = [*prefix, checkpoint, *retained_messages]
+        if oversized_latest:
+            current_budget = max(
+                target - estimate_messages_tokens(result_messages) - 8,
+                1,
+            )
+            result_messages.append(
+                _archived_current_round_message(
+                    oversized_latest,
+                    artifact_id=artifact_id,
+                    token_budget=current_budget,
+                )
+            )
+
+    after_tokens = estimate_messages_tokens(result_messages)
+    dropped_rounds = max(len(rounds) - len(retained), 0)
+    savings_tokens = before_tokens - after_tokens
+    if savings_tokens <= 0:
+        return ContextCompressionResult(
+            messages=list(messages),
+            changed=False,
+            before_tokens=before_tokens,
+            after_tokens=before_tokens,
+            protected_messages=len(body),
+            artifact_ids=(artifact_id,),
+            summary_candidate_tokens=after_tokens,
+            summary_savings_tokens=savings_tokens,
+            summary_savings_ratio=(
+                savings_tokens / before_tokens if before_tokens > 0 else 0.0
+            ),
+            low_savings=True,
+            failure_reason="ineffective_deterministic_checkpoint",
+            target_prompt_tokens=target,
+            tail_token_budget=max(int(tail_token_budget or 0), 1),
+            strategy="unchanged",
+            trigger=trigger,
+            retained_rounds=len(retained),
+            dropped_rounds=dropped_rounds,
+        )
+    return ContextCompressionResult(
+        messages=result_messages,
+        changed=True,
+        before_tokens=before_tokens,
+        after_tokens=after_tokens,
+        summarized_messages=max(len(body) - len(retained_messages), 0),
+        protected_messages=len(retained_messages),
+        summary=str(checkpoint.content or ""),
+        artifact_ids=(artifact_id,),
+        summary_candidate_tokens=after_tokens,
+        summary_savings_tokens=savings_tokens,
+        summary_savings_ratio=(
+            savings_tokens / before_tokens if before_tokens > 0 else 0.0
+        ),
+        low_savings=False,
+        summary_input_dropped_rounds=dropped_rounds,
+        target_prompt_tokens=target,
+        tail_token_budget=max(int(tail_token_budget or 0), 1),
+        strategy="deterministic",
+        trigger=trigger,
+        retained_rounds=len(retained),
+        dropped_rounds=dropped_rounds,
+    )
+
+
+def _store_context_source(source_text: str, *, trace_id: str, source: str) -> str:
+    try:
+        artifact = get_artifact_store().store_text(
+            source_text,
+            artifact_type="text",
+            trace_id=trace_id,
+            source=source,
+            force_file=True,
+        )
+    except Exception:
+        return ""
+    return str(getattr(artifact, "artifact_id", "") or "")
+
+
+def _round_has_current_user_request(round_: tuple[LLMMessage, ...]) -> bool:
+    return any(
+        message.role == "user"
+        and not is_context_summary(message)
+        and not is_runtime_control_message(message)
+        and not _is_compacted_tool_round(message)
+        for message in round_
+    )
+
+
+def _round_requires_provider_replay(round_: tuple[LLMMessage, ...]) -> bool:
+    calls = {
+        str(getattr(call, "id", "") or "")
+        for message in round_
+        if message.role == "assistant"
+        for call in message.tool_calls or ()
+        if str(getattr(call, "id", "") or "")
+    }
+    if not calls:
+        return False
+    observations = {
+        str(message.tool_call_id or "")
+        for message in round_
+        if message.role == "tool" and str(message.tool_call_id or "")
+    }
+    return bool(calls - observations) or bool(round_ and round_[-1].role == "tool")
+
+
+def _archived_current_round_message(
+    round_: tuple[LLMMessage, ...],
+    *,
+    artifact_id: str,
+    token_budget: int,
+) -> LLMMessage:
+    user_text = "\n".join(
+        _summary_visible_content(message.content)
+        for message in round_
+        if message.role == "user"
+        and not is_context_summary(message)
+        and not is_runtime_control_message(message)
+        and not _is_compacted_tool_round(message)
+    ).strip()
+    content = (
+        f"{user_text}\n\n"
+        f"[该请求完整原文已归档为 artifact:{artifact_id}]"
+    ).strip()
+    return LLMMessage(
+        role="user",
+        content=_truncate_text_to_tokens(content, max(int(token_budget or 0), 1)),
+        metadata={"chatinter_archived_current_request": True},
+    )
+
+
+def _deterministic_checkpoint_payload(
+    messages: tuple[LLMMessage, ...],
+    *,
+    checkpoint_state: dict[str, Any] | None,
+) -> dict[str, str]:
+    payload = {field: "" for field in SEMANTIC_SUMMARY_FIELDS}
+    for message in messages:
+        if not is_context_summary(message):
+            continue
+        previous = _rendered_summary_payload(_message_content(message.content))
+        if previous is None:
+            continue
+        for field in SEMANTIC_SUMMARY_FIELDS:
+            if previous.get(field):
+                payload[field] = previous[field]
+
+    user_requests = [
+        _message_content(message.content).strip()
+        for message in messages
+        if message.role == "user"
+        and not is_context_summary(message)
+        and not is_runtime_control_message(message)
+        and not _is_compacted_tool_round(message)
+        and _message_content(message.content).strip()
+    ]
+    if user_requests and not payload["goal"]:
+        payload["goal"] = f"原始用户请求（原文）：\n{user_requests[0]}"
+    recent_requests = user_requests[-4:]
+    if recent_requests:
+        recent = "\n".join(
+            f"- 最近用户请求（原文）：{value}" for value in recent_requests
+        )
+        payload["remaining"] = _join_checkpoint_fact(payload["remaining"], recent)
+
+    tool_facts: list[str] = []
+    for message in messages:
+        for call in message.tool_calls or ():
+            function = getattr(call, "function", None)
+            name = str(getattr(function, "name", "") or "unknown")
+            call_id = str(getattr(call, "id", "") or "")
+            tool_facts.append(
+                f"- 工具调用：{name}"
+                + (f"（call_id={call_id}）" if call_id else "")
+            )
+        if message.role == "tool":
+            content = _summary_visible_content(message.content).strip()
+            if content:
+                tool_facts.append(
+                    "- 工具结果"
+                    + (f" {message.name}" if message.name else "")
+                    + (
+                        f"（call_id={message.tool_call_id}）"
+                        if message.tool_call_id
+                        else ""
+                    )
+                    + f"：{_bounded_checkpoint_fact(content)}"
+                )
+    if tool_facts:
+        payload["findings"] = _join_checkpoint_fact(
+            payload["findings"],
+            "\n".join(tool_facts[-12:]),
+        )
+    state = checkpoint_state if isinstance(checkpoint_state, dict) else {}
+    plan_items = state.get("plan_items")
+    if isinstance(plan_items, list | tuple):
+        for item in plan_items:
+            if not isinstance(item, dict):
+                continue
+            content = str(item.get("content", "") or "").strip()
+            status = str(item.get("status", "") or "").strip()
+            if not content:
+                continue
+            fact = f"- 计划项 [{status or 'unknown'}]：{content}"
+            field = "completed" if status == "completed" else "remaining"
+            payload[field] = _join_checkpoint_fact(payload[field], fact)
+    return payload
+
+
+def _checkpoint_artifact_refs(
+    checkpoint_state: dict[str, Any] | None,
+) -> tuple[str, ...]:
+    state = checkpoint_state if isinstance(checkpoint_state, dict) else {}
+    values = state.get("artifact_refs")
+    if not isinstance(values, list | tuple):
+        return ()
+    return tuple(
+        dict.fromkeys(
+            str(value or "").strip()
+            for value in values
+            if str(value or "").strip()
+        )
+    )
+
+
+def _bounded_checkpoint_fact(value: str) -> str:
+    text = str(value or "").strip()
+    if len(text) <= 800:
+        return text
+    return f"{text[:500]} ...[已归档]... {text[-200:]}"
+
+
+def _rendered_summary_payload(value: str) -> dict[str, str] | None:
+    text = str(value or "").strip()
+    closing_tag = "</agent_context_summary>"
+    end = text.find(closing_tag)
+    if not text.startswith("<agent_context_summary>") or end < 0:
+        return None
+    try:
+        root = ElementTree.fromstring(text[: end + len(closing_tag)])
+    except ElementTree.ParseError:
+        return None
+    if root.tag != "agent_context_summary":
+        return None
+    return {
+        field: str(root.findtext(field) or "").strip()
+        for field in SEMANTIC_SUMMARY_FIELDS
+    }
+
+
+def _join_checkpoint_fact(existing: str, value: str) -> str:
+    current = str(existing or "").strip()
+    addition = str(value or "").strip()
+    if not current:
+        return addition
+    if not addition or addition in current:
+        return current
+    return f"{current}\n{addition}"
+
+
+def _deterministic_checkpoint_message(
+    payload: dict[str, str],
+    *,
+    artifact_id: str,
+    token_budget: int,
+    artifact_refs: tuple[str, ...] = (),
+) -> LLMMessage:
+    fitted = dict(payload)
+    budget = max(int(token_budget or 0), 64)
+    refs = tuple(
+        value
+        for value in dict.fromkeys(artifact_refs)
+        if value and value != artifact_id
+    )
+    refs_content = (
+        "\n<available_artifact_refs>\n"
+        + "\n".join(f"<artifact_ref>{escape(value)}</artifact_ref>" for value in refs)
+        + "\n</available_artifact_refs>"
+        if refs
+        else ""
+    )
+    content = ""
+    for _ in range(128):
+        content = render_semantic_summary(fitted, artifact_id=artifact_id)
+        content += (
+            "\n该 checkpoint 由运行时按原文和状态确定性生成，"
+            "没有推测未记录的完成情况。"
+        )
+        content += refs_content
+        if estimate_agent_text_tokens(content) <= budget:
+            break
+        populated = [field for field in SEMANTIC_SUMMARY_FIELDS if fitted[field]]
+        if not populated:
+            content = (
+                "<agent_context_summary>\n"
+                f"<source_artifact_id>{escape(artifact_id)}</source_artifact_id>\n"
+                "</agent_context_summary>\n"
+                "较早上下文仅保存在 source artifact 中。"
+                f"{refs_content}"
+            )
+            break
+        field = max(
+            populated,
+            key=lambda item: estimate_agent_text_tokens(fitted[item]),
+        )
+        field_tokens = estimate_agent_text_tokens(fitted[field])
+        reduced = _truncate_text_to_tokens(
+            fitted[field],
+            max(field_tokens * 3 // 4, 16),
+        )
+        if reduced == fitted[field]:
+            reduced = ""
+        fitted[field] = reduced
+    else:
+        content = (
+            "<agent_context_summary>\n"
+            f"<source_artifact_id>{escape(artifact_id)}</source_artifact_id>\n"
+            "</agent_context_summary>\n"
+            "较早上下文仅保存在 source artifact 中。"
+            f"{refs_content}"
+        )
+    return LLMMessage(
+        role="user",
+        content=content,
+        metadata={
+            _SUMMARY_METADATA_KEY: True,
+            "chatinter_compaction_strategy": "deterministic",
+        },
+    )
+
+
+def _truncate_text_to_tokens(value: str, token_budget: int) -> str:
+    text = str(value or "")
+    budget = max(int(token_budget or 0), 1)
+    if estimate_agent_text_tokens(text) <= budget:
+        return text
+    low = 1
+    high = len(text)
+    best = ""
+    while low <= high:
+        keep = (low + high) // 2
+        head = max(keep * 2 // 3, 1)
+        tail = max(keep - head, 0)
+        candidate = (
+            text[:head]
+            + "\n...[内容已归档到 source artifact]...\n"
+            + (text[-tail:] if tail else "")
+        )
+        if estimate_agent_text_tokens(candidate) <= budget:
+            best = candidate
+            low = keep + 1
+        else:
+            high = keep - 1
+    return best or "[完整内容已归档到 source artifact]"
 
 
 def _with_rewrite_token_baseline(
@@ -648,17 +1387,12 @@ def _with_rewrite_token_baseline(
     if prompt_tokens_before is None or not result.changed:
         return result
     estimated_before = max(int(result.before_tokens or 0), 0)
-    estimated_after = max(int(result.after_tokens or 0), 0)
+    estimated_after = estimate_messages_tokens(result.messages)
     conservative_before = max(int(prompt_tokens_before or 0), estimated_before)
-    estimated_savings = max(estimated_before - estimated_after, 0)
-    conservative_after = max(
-        estimated_after,
-        conservative_before - estimated_savings,
-    )
     return replace(
         result,
         before_tokens=conservative_before,
-        after_tokens=conservative_after,
+        after_tokens=estimated_after,
     )
 
 
@@ -673,23 +1407,28 @@ def prune_old_large_tool_results(
         messages,
         token_budget=tail_token_budget,
     )
-    result = list(messages)
+    result, round_artifacts, compacted_results = _compact_consumed_tool_rounds(
+        messages,
+        trace_id=trace_id,
+        tail_start=tail_start,
+    )
+    tail_start = _protected_tail_start(
+        result,
+        token_budget=tail_token_budget,
+    )
     pruned = 0
-    artifact_ids: list[str] = []
-    for index, message in enumerate(messages[:tail_start]):
+    artifact_ids: list[str] = list(round_artifacts)
+    for index, message in enumerate(result[:tail_start]):
         if message.role != "tool":
             continue
         content = _message_content(message.content)
         if len(content) <= _LARGE_TOOL_RESULT_CHARS:
             continue
-        artifact = get_artifact_store().store_text(
+        artifact_id = _store_context_source(
             content,
-            artifact_type="text",
             trace_id=trace_id,
             source=f"context_tool_result:{message.name or 'unknown'}",
-            force_file=True,
         )
-        artifact_id = str(getattr(artifact, "artifact_id", "") or "")
         if not artifact_id:
             continue
         head = content[:_PRUNED_TOOL_HEAD_CHARS].rstrip()
@@ -706,13 +1445,106 @@ def prune_old_large_tool_results(
     after_tokens = estimate_messages_tokens(result)
     return ContextCompressionResult(
         messages=result,
-        changed=pruned > 0,
+        changed=pruned > 0 or compacted_results > 0,
         before_tokens=before_tokens,
         after_tokens=after_tokens,
-        pruned_tool_results=pruned,
-        protected_messages=len(messages) - tail_start,
+        pruned_tool_results=pruned + compacted_results,
+        protected_messages=len(result) - tail_start,
         artifact_ids=tuple(dict.fromkeys(artifact_ids)),
     )
+
+
+def _compact_consumed_tool_rounds(
+    messages: list[LLMMessage],
+    *,
+    trace_id: str,
+    tail_start: int,
+) -> tuple[list[LLMMessage], tuple[str, ...], int]:
+    spans: list[tuple[int, int, tuple[LLMMessage, ...]]] = []
+    cursor = 0
+    for round_ in _api_rounds(messages):
+        end = cursor + len(round_)
+        spans.append((cursor, end, round_))
+        cursor = end
+
+    replacements: dict[int, tuple[int, LLMMessage]] = {}
+    artifact_ids: list[str] = []
+    compacted_results = 0
+    for start, end, round_ in spans:
+        if end > tail_start:
+            continue
+        tool_results = [message for message in round_ if message.role == "tool"]
+        if not tool_results or not any(message.tool_calls for message in round_):
+            continue
+        if not any(message.role == "assistant" for message in messages[end:]):
+            continue
+        if estimate_messages_tokens(list(round_)) < _LARGE_TOOL_ROUND_TOKENS:
+            continue
+        source = "\n".join(_message_record(message) for message in round_)
+        artifact_id = _store_context_source(
+            source,
+            trace_id=trace_id,
+            source="context_consumed_tool_round",
+        )
+        if not artifact_id:
+            continue
+        replacements[start] = (
+            end,
+            _compacted_tool_round_message(round_, artifact_id=artifact_id),
+        )
+        artifact_ids.append(artifact_id)
+        compacted_results += len(tool_results)
+
+    if not replacements:
+        return list(messages), (), 0
+    result: list[LLMMessage] = []
+    index = 0
+    while index < len(messages):
+        replacement = replacements.get(index)
+        if replacement is None:
+            result.append(messages[index])
+            index += 1
+            continue
+        end, message = replacement
+        result.append(message)
+        index = end
+    return result, tuple(artifact_ids), compacted_results
+
+
+def _compacted_tool_round_message(
+    round_: tuple[LLMMessage, ...],
+    *,
+    artifact_id: str,
+) -> LLMMessage:
+    names = list(
+        dict.fromkeys(
+            str(getattr(getattr(call, "function", None), "name", "") or "unknown")
+            for message in round_
+            for call in message.tool_calls or ()
+        )
+    )
+    observations = [
+        _bounded_checkpoint_fact(_summary_visible_content(message.content))
+        for message in round_
+        if message.role == "tool" and _summary_visible_content(message.content).strip()
+    ]
+    content = (
+        "<agent_tool_history>\n"
+        f"tools={escape(json.dumps(names, ensure_ascii=False))}\n"
+        f"results={escape(json.dumps(observations, ensure_ascii=False))}\n"
+        f"source_artifact_id={escape(artifact_id)}\n"
+        "</agent_tool_history>"
+    )
+    return LLMMessage(
+        role="assistant",
+        content=content,
+        metadata={"chatinter_compacted_tool_round": True},
+    )
+
+
+def _is_compacted_tool_round(message: LLMMessage) -> bool:
+    metadata = message.metadata if isinstance(message.metadata, dict) else {}
+    return metadata.get("chatinter_compacted_tool_round") is True
 
 
 def parse_semantic_summary(value: str) -> dict[str, str] | None:
@@ -921,95 +1753,29 @@ def _legacy_summary_artifact_id(message: LLMMessage) -> str:
     return str(root.findtext("source_artifact_id") or "").strip()
 
 
-def _fit_summary_request(
-    plan: SemanticCompressionPlan,
-    *,
-    max_input_tokens: int,
-    summary_token_target: int | None = None,
-    reserve_repair: bool = False,
-) -> tuple[tuple[LLMMessage, ...] | None, int, int]:
-    request = _summary_request_messages(
-        plan.middle,
-        summary_token_target=summary_token_target,
-    )
-    prompt_tokens = estimate_messages_tokens(list(request))
-    budget = context_window_budget(
-        max_input_tokens=max_input_tokens,
-        prompt_tokens=prompt_tokens,
-        schema_tokens=0,
-        output_reserve_tokens=semantic_summary_output_tokens(max_input_tokens),
-    )
-    required_tokens = (
-        estimate_messages_tokens(list(_summary_repair_request(request)))
-        if reserve_repair
-        else prompt_tokens
-    )
-    if required_tokens < budget.blocking_limit:
-        return request, prompt_tokens, 0
-
-    bounded = _summary_request_messages(
-        plan.middle,
-        bound_content=True,
-        summary_token_target=summary_token_target,
-    )
-    bounded_tokens = estimate_messages_tokens(list(bounded))
-    bounded_required_tokens = (
-        estimate_messages_tokens(list(_summary_repair_request(bounded)))
-        if reserve_repair
-        else bounded_tokens
-    )
-    if bounded_required_tokens < budget.blocking_limit:
-        return bounded, bounded_tokens, 0
-
-    pinned_summary = tuple(
-        message for message in plan.middle if is_context_summary(message)
-    )
-    rounds = _api_rounds(
-        tuple(message for message in plan.middle if not is_context_summary(message))
-    )
-    if len(rounds) < 3:
-        return None, prompt_tokens, 0
-    pinned_first = rounds[:1]
-    droppable = rounds[1:-1]
-    pinned_latest = rounds[-1:]
-    low = 1
-    high = len(droppable)
-    fitted: tuple[LLMMessage, ...] | None = None
-    fitted_tokens = prompt_tokens
-    fitted_dropped = 0
-    while low <= high:
-        dropped = (low + high) // 2
-        remaining = (
-            *pinned_summary,
-            *(message for round_ in pinned_first for message in round_),
-            *(message for round_ in droppable[dropped:] for message in round_),
-            *(message for round_ in pinned_latest for message in round_),
-        )
-        candidate = _summary_request_messages(
-            remaining,
-            bound_content=True,
-            summary_token_target=summary_token_target,
-        )
-        candidate_tokens = estimate_messages_tokens(list(candidate))
-        candidate_required_tokens = (
-            estimate_messages_tokens(list(_summary_repair_request(candidate)))
-            if reserve_repair
-            else candidate_tokens
-        )
-        if candidate_required_tokens < budget.blocking_limit:
-            fitted = candidate
-            fitted_tokens = candidate_tokens
-            fitted_dropped = dropped
-            high = dropped - 1
-        else:
-            low = dropped + 1
-    return fitted, fitted_tokens, fitted_dropped
-
-
 def _summary_repair_request(
     request_messages: tuple[LLMMessage, ...],
 ) -> tuple[LLMMessage, ...]:
     return (*request_messages, LLMMessage.user(_SEMANTIC_SUMMARY_REPAIR))
+
+
+def semantic_summary_repair_messages(
+    request_messages: list[LLMMessage] | tuple[LLMMessage, ...],
+) -> list[LLMMessage]:
+    return list(_summary_repair_request(tuple(request_messages)))
+
+
+def summary_request_fits_model(
+    request_messages: list[LLMMessage] | tuple[LLMMessage, ...],
+    *,
+    max_input_tokens: int,
+    summary_token_target: int,
+) -> bool:
+    return _summary_request_fits(
+        tuple(request_messages),
+        max_input_tokens=max_input_tokens,
+        summary_token_target=summary_token_target,
+    )
 
 
 def _summary_request_messages(
@@ -1041,9 +1807,9 @@ def _summary_request_messages(
     history = tuple(
         _summary_round_message(
             round_,
-            bound_content=bound_content and index > 0,
+            bound_content=bound_content,
         )
-        for index, round_ in enumerate(rounds)
+        for round_ in rounds
     )
     return (
         LLMMessage.system(SEMANTIC_COMPRESSION_SYSTEM),
@@ -1087,6 +1853,8 @@ def _summary_message_record(
         content = _bounded_summary_text(content)
     if message.role == "system" or is_runtime_control_message(message):
         record_type = "runtime_control"
+    elif _is_compacted_tool_round(message):
+        record_type = "tool_history"
     elif message.role == "user":
         record_type = "user_request"
     elif message.role == "tool":
@@ -1144,7 +1912,7 @@ def _bounded_summary_text(value: str) -> str:
 
 
 def _message_record(message: LLMMessage, *, bounded: bool = False) -> str:
-    content = _message_content(message.content)
+    content = _summary_visible_content(message.content)
     payload: dict[str, Any] = {
         "role": message.role,
         "content": _bounded_summary_text(content) if bounded else content,
@@ -1185,10 +1953,14 @@ def _message_content(content: Any) -> str:
 
 __all__ = [
     "SEMANTIC_SUMMARY_OUTPUT_TOKENS",
+    "CompactionStrategy",
+    "CompactionTrigger",
     "ContextCompressionResult",
     "ContextWindowBudget",
     "SemanticCompressionPlan",
     "SemanticSummaryPayload",
+    "SemanticSummaryResponse",
+    "apply_deterministic_checkpoint",
     "apply_semantic_summary",
     "build_semantic_compression_plan",
     "compact_messages",
@@ -1206,4 +1978,7 @@ __all__ = [
     "resolve_superuser_max_input_tokens",
     "semantic_summary_json_schema",
     "semantic_summary_output_tokens",
+    "semantic_summary_repair_messages",
+    "summary_request_fits_model",
+    "summary_request_output_tokens",
 ]

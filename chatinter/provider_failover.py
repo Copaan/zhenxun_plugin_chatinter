@@ -31,6 +31,10 @@ from zhenxun.services.log import logger
 _LOG_COMMAND = "ChatInterFailover"
 
 
+class CandidatePromptNotFitError(ValueError):
+    pass
+
+
 class LLMFailureKind(str, Enum):
     TRANSIENT = "transient"
     CONTEXT_OVERFLOW = "context_overflow"
@@ -67,6 +71,8 @@ def classify_llm_error(exc: BaseException) -> LLMFailureKind:
     chain = _exception_chain(exc)
     type_names = tuple(type(item).__name__ for item in chain)
     text = "\n".join(f"{type(item).__name__}: {item}" for item in chain)
+    if any(isinstance(item, CandidatePromptNotFitError) for item in chain):
+        return LLMFailureKind.FALLBACK_ELIGIBLE
     if any(isinstance(item, ContextLengthExceededException) for item in chain):
         return LLMFailureKind.CONTEXT_OVERFLOW
     if _CONTEXT_PATTERNS.search(text):
@@ -296,6 +302,7 @@ async def request_with_failover(
 
 
 __all__ = [
+    "CandidatePromptNotFitError",
     "FailoverAttempt",
     "FailoverOutcome",
     "LLMFailureKind",

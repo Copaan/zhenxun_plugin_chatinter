@@ -10,6 +10,7 @@ from zhenxun.services import logger
 from zhenxun.utils.message import MessageUtils
 
 from ..config import get_reply_delivery_settings, reply_to_trigger_message_enabled
+from ..history_policy import schedule_pending_history_summary_jobs
 from ..reply_delivery import build_reply_delivery_plan
 from ..route_text import normalize_message_text
 from ..superuser_agent.runtime import (
@@ -33,12 +34,15 @@ async def handle_superuser_agent_turn(
         async def send_progress(text: str) -> None:
             await _send_message(bot=bot, event=event, text=text)
 
-        result = await run_superuser_agent_runtime(
-            message_text=normalized,
-            session_key=session_key,
-            progress_hook=send_progress,
-            bot_id=str(getattr(bot, "self_id", "") or ""),
-        )
+        try:
+            result = await run_superuser_agent_runtime(
+                message_text=normalized,
+                session_key=session_key,
+                progress_hook=send_progress,
+                bot_id=str(getattr(bot, "self_id", "") or ""),
+            )
+        finally:
+            schedule_pending_history_summary_jobs()
         if result.final_text:
             if getattr(result, "status", "completed") == "completed":
                 await _send_final_answer(

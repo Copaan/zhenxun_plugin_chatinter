@@ -9,10 +9,20 @@ ChatInter - AI 意图识别插件
 """
 
 import asyncio
+from collections.abc import Awaitable, Callable
+from functools import wraps
+from typing import Any
 
 from nonebot import on_message
 from nonebot.adapters import Bot, Event
-from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message, PrivateMessageEvent
+from nonebot.adapters.onebot.v11 import (
+    Bot as OneBotV11Bot,
+)
+from nonebot.adapters.onebot.v11 import (
+    GroupMessageEvent,
+    Message,
+    PrivateMessageEvent,
+)
 from nonebot.matcher import Matcher
 from nonebot.message import run_postprocessor
 from nonebot.permission import SUPERUSER
@@ -41,8 +51,6 @@ from .event_signals import get_event_signal, set_event_signal
 from .execution_observer import render_execution_observer_summary
 from .handler import handle_fallback
 from .history_policy import (
-    begin_history_foreground_request,
-    end_history_foreground_request,
     history_foreground_arrived,
     schedule_pending_history_summary_jobs,
     shutdown_history_summary_tasks,
@@ -60,6 +68,29 @@ from .utils.unimsg_utils import uni_to_text_with_tags
 
 _DYNAMIC_MATCHER_RESCAN_DELAY_SECONDS = 10.0
 _dynamic_rescan_task: asyncio.Task | None = None
+
+
+def _event_observing_sender(
+    sender: Callable[..., Awaitable[Any]],
+) -> Callable[..., Awaitable[Any]]:
+    @wraps(sender)
+    async def observed(bot: Bot, event: Event, message: Any, **kwargs: Any) -> Any:
+        result = await sender(bot, event, message, **kwargs)
+        set_event_signal(event, "_zx_visible_output_sent", True)
+        return result
+
+    setattr(observed, "_chatinter_event_send_observer", True)
+    return observed
+
+
+def _patch_onebot_event_send_observer() -> None:
+    current = OneBotV11Bot.send
+    if getattr(current, "_chatinter_event_send_observer", False):
+        return
+    OneBotV11Bot.send = _event_observing_sender(current)  # type: ignore[method-assign]
+
+
+_patch_onebot_event_send_observer()
 
 
 @run_postprocessor
@@ -228,6 +259,41 @@ _fallback_matcher = on_message(
     block=True,
     rule=to_me(),
 )
+_reaction_observer = on_message(priority=1, block=False)
+
+
+@_reaction_observer.handle()
+async def _observe_group_reaction_images(
+    bot: Bot,
+    event: Event,
+    session: Uninfo,
+    msg: UniMsg,
+) -> None:
+    if session.group is None or session.user is None:
+        return
+    group_id = str(session.group.id)
+    sender_id = str(session.user.id)
+    if not group_id or not sender_id or sender_id == str(bot.self_id):
+        return
+    if not chatinter_available(group_id):
+        return
+    from .reaction_runtime import reaction_settings, schedule_reaction_observation
+
+    settings = reaction_settings()
+    if not settings.enabled or not settings.auto_discovery:
+        return
+    event_id = str(getattr(event, "message_id", "") or "")
+    if not event_id:
+        try:
+            event_id = str(event.get_event_id())
+        except Exception:
+            event_id = ""
+    schedule_reaction_observation(
+        group_id=group_id,
+        sender_id=sender_id,
+        message_id=event_id,
+        message=msg,
+    )
 
 
 def _is_supported_private_message(
@@ -326,7 +392,6 @@ async def _process_queued_fallback(
     cached_plain_text: str | None = None,
     queued: bool = False,
 ) -> None:
-    begin_history_foreground_request()
     try:
         await handle_fallback(
             bot,
@@ -339,7 +404,7 @@ async def _process_queued_fallback(
             queued=queued,
         )
     finally:
-        end_history_foreground_request()
+        schedule_pending_history_summary_jobs()
 
 
 @_fallback_matcher.handle()
@@ -360,13 +425,17 @@ async def _handle_fallback(
         return
     if get_event_signal(event, "_ai_triggered", False):
         return
+    if get_event_signal(event, "_zx_visible_output_sent", False):
+        logger.debug("earlier matcher produced visible output, skip ChatInter fallback")
+        return
 
     state_plain_text = _state_plain_text(state)
     raw_message = _extract_raw_message(event, msg, state_plain_text)
     if raw_message is None:
         return
 
-    if is_already_handled(event):
+    handled_session_key = conversation_session_key(session)
+    if is_already_handled(event, session_key=handled_session_key):
         logger.debug("event already handled, skip ChatInter fallback")
         return
 
@@ -404,7 +473,7 @@ async def _handle_fallback(
     if scenario.scenario is ChatInterScenario.SUPERUSER_AGENT:
         from .agents.superuser_entry import handle_superuser_agent_turn
 
-        mark_as_handled(event)
+        mark_as_handled(event, session_key=handled_session_key)
         await handle_superuser_agent_turn(
             bot=bot,
             event=event,
@@ -423,7 +492,7 @@ async def _handle_fallback(
         if mode_admission.blocked_by == "agent_active":
             from .agents.superuser_entry import handle_superuser_agent_turn
 
-            mark_as_handled(event)
+            mark_as_handled(event, session_key=handled_session_key)
             await handle_superuser_agent_turn(
                 bot=bot,
                 event=event,
@@ -431,7 +500,7 @@ async def _handle_fallback(
                 session_key=str(session.user.id),
             )
             return
-        mark_as_handled(event)
+        mark_as_handled(event, session_key=handled_session_key)
         await _send_mode_gate_reply(
             bot=bot,
             event=event,
@@ -466,6 +535,7 @@ async def _try_runtime_control_before_queue(
     raw_message: str,
 ) -> bool:
     user_id = str(session.user.id if session.user else "")
+    handled_session_key = conversation_session_key(session)
     if not event_is_private(event) or not resolve_superuser(bot, user_id):
         return False
     from .superuser_agent.runtime_control import (
@@ -496,7 +566,7 @@ async def _try_runtime_control_before_queue(
                 else "Agent 模式正在切换，请稍后重试。"
             )
             await _send_mode_gate_reply(bot=bot, event=event, text=text)
-            mark_as_handled(event)
+            mark_as_handled(event, session_key=handled_session_key)
             return True
     else:
         await gate.sync_agent_active(session_key, active=active_source)
@@ -516,7 +586,7 @@ async def _try_runtime_control_before_queue(
             )
     if not handled:
         return False
-    mark_as_handled(event)
+    mark_as_handled(event, session_key=handled_session_key)
     return True
 
 
@@ -566,6 +636,7 @@ async def _try_runtime_approval_before_queue(
     raw_message: str,
 ) -> bool:
     user_id = str(session.user.id if session.user else "")
+    handled_session_key = conversation_session_key(session)
     if not event_is_private(event) or not resolve_superuser(bot, user_id):
         return False
     from .superuser_agent.runtime_approval import (
@@ -582,7 +653,7 @@ async def _try_runtime_approval_before_queue(
         raw_message=raw_message,
     ):
         return False
-    mark_as_handled(event)
+    mark_as_handled(event, session_key=handled_session_key)
     return True
 
 
@@ -678,6 +749,9 @@ async def _on_startup():
     ensure_persona_file()
     _chat_memory.set_bot_nickname(BotConfig.self_nickname)
     await PluginRegistry.preload_cache()
+    from .reaction_runtime import start_reaction_runtime
+
+    await start_reaction_runtime()
     _dynamic_rescan_task = asyncio.create_task(_rescan_dynamic_matchers_after_startup())
 
 
@@ -724,6 +798,9 @@ async def _on_shutdown():
         _dynamic_rescan_task.cancel()
         await asyncio.gather(_dynamic_rescan_task, return_exceptions=True)
     _dynamic_rescan_task = None
+    from .reaction_runtime import shutdown_reaction_runtime
+
+    await shutdown_reaction_runtime()
     await PluginRegistry.shutdown()
     from .superuser_agent.proactive_tasks import shutdown_proactive_tasks
 

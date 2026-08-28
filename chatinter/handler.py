@@ -40,7 +40,11 @@ async def handle_fallback(
 ) -> None:
     """Handle one ChatInter fallback turn."""
 
-    if not queued and is_already_handled(event):
+    handled_session_key = conversation_session_key(session)
+    if not queued and is_already_handled(
+        event,
+        session_key=handled_session_key,
+    ):
         logger.debug("event already handled, skip ChatInter")
         return
 
@@ -118,7 +122,7 @@ async def handle_fallback(
     except (TypeError, ValueError):
         frame.turn_priority = 0
     if not queued:
-        mark_as_handled(event)
+        mark_as_handled(event, session_key=handled_session_key)
     pipeline = PromptPipeline()
 
     try:

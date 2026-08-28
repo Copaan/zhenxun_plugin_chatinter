@@ -82,11 +82,9 @@ _STATIC_BM25_STRONG_FIELDS = frozenset(
         "slot",
     }
 )
-# Bump whenever the static BM25 index schema (fields, identity channels) changes
-# so cached indexes built by an older schema are not reused.
+# The version identifies the static BM25 field and identity-channel schema.
 _STATIC_BM25_INDEX_VERSION = 3
-# A single CJK char entry pointing at more than this many documents is dropped:
-# high frequency chars ("打"/"看"/"用") would otherwise flood the candidate set.
+# High-posting single CJK terms are excluded to bound the candidate set.
 _STATIC_SINGLE_CJK_CHAR_MAX_POSTINGS = 8
 _STATIC_SINGLE_CJK_CHAR_SCORE = 72.0
 _MEDIA_CONTEXT_TERMS = (
@@ -131,6 +129,7 @@ class CommandCandidate:
     reasons: tuple[str, ...] = ()
     exact_protected: bool = False
     features: CommandCandidateFeatures | None = None
+    strict_identity_mode: str = ""
 
 
 @dataclass(frozen=True)
@@ -2027,23 +2026,47 @@ def _score_static_metadata_bm25_tools(
     *,
     router_context: dict[str, Any] | None = None,
 ) -> list[_ScoredCandidate]:
+    pure_sparse = bool((router_context or {}).get("pure_sparse"))
     query_terms = _query_terms_no_single(query)
-    identity_variants = _query_identity_variants(query)
+    identity_variants = (
+        (normalize_message_text(query),)
+        if pure_sparse
+        else _query_identity_variants(query)
+    )
     normalized, stripped = identity_variants[0], identity_variants[-1]
     if not query_terms and not normalize_message_text(stripped):
         return []
 
     index = _get_static_bm25_index(tools)
-    (
-        identity_indexes,
-        longest_prefix_matches,
-        unicode_identity_matches,
-        scoped_single_identity_matches,
-    ) = _static_identity_indexes(
-        index,
-        variants=identity_variants,
-        router_context=router_context,
-    )
+    if pure_sparse:
+        identity_indexes: set[int] = set()
+        longest_prefix_matches: set[int] = set()
+        unicode_identity_matches: set[int] = set()
+        scoped_single_identity_matches: set[int] = set()
+        for document_index, document in enumerate(index.documents):
+            exact_head, exact_alias = _match_exact_or_alias_variants(
+                identity_variants,
+                document.schema,
+            )
+            exact_command_id = any(
+                _normalize_command_identity(text)
+                == _normalize_command_identity(document.schema.command_id)
+                for text in identity_variants
+                if text
+            )
+            if exact_head or exact_alias or exact_command_id:
+                identity_indexes.add(document_index)
+    else:
+        (
+            identity_indexes,
+            longest_prefix_matches,
+            unicode_identity_matches,
+            scoped_single_identity_matches,
+        ) = _static_identity_indexes(
+            index,
+            variants=identity_variants,
+            router_context=router_context,
+        )
     relevant_indexes = set(identity_indexes)
     for term in query_terms:
         relevant_indexes.update(index.postings.get(term, ()))
@@ -2076,19 +2099,31 @@ def _score_static_metadata_bm25_tools(
             identity_variants,
             schema,
         )
-        exact_shortcut = any(
+        exact_command_id = pure_sparse and any(
+            _normalize_command_identity(text)
+            == _normalize_command_identity(schema.command_id)
+            for text in identity_variants
+            if text
+        )
+        exact_shortcut = (not pure_sparse) and any(
             match_command_head(text, shortcut)
             for text in (normalized, stripped)
             for shortcut in document.shortcut_texts
             if text and shortcut
         )
-        unicode_identity = document_index in unicode_identity_matches
-        exact_protected = (
-            exact_head or exact_alias or exact_shortcut or unicode_identity
+        unicode_identity = (
+            not pure_sparse and document_index in unicode_identity_matches
         )
-        if exact_head:
+        exact_protected = (
+            exact_head
+            or exact_alias
+            or exact_command_id
+            or exact_shortcut
+            or unicode_identity
+        )
+        if exact_command_id or exact_head:
             score += _EXACT_BOOST
-            reasons.append("exact_head")
+            reasons.append("exact_command_id" if exact_command_id else "exact_head")
         elif exact_alias:
             score += _ALIAS_BOOST
             reasons.append("exact_alias")
@@ -2100,7 +2135,7 @@ def _score_static_metadata_bm25_tools(
             reasons.append("unicode_identity")
             strong_match = True
 
-        if bool((router_context or {}).get("skill_scoped")):
+        if not pure_sparse and bool((router_context or {}).get("skill_scoped")):
             embedded_lengths = [
                 len(phrase)
                 for raw_phrase in (schema.head, *schema.aliases)
@@ -2113,24 +2148,28 @@ def _score_static_metadata_bm25_tools(
                 strong_match = True
                 reasons.append("scoped_embedded_identity")
 
-        if document_index in longest_prefix_matches:
+        if not pure_sparse and document_index in longest_prefix_matches:
             score += 96.0 + min(len(schema.head), 4) * 8.0
             strong_match = True
             reasons.append("head_prefix")
 
-        if document_index in scoped_single_identity_matches:
+        if not pure_sparse and document_index in scoped_single_identity_matches:
             score += 96.0
             strong_match = True
             reasons.append("scoped_single_identity")
 
-        if document_index in single_cjk_char_matches:
+        if not pure_sparse and document_index in single_cjk_char_matches:
             score += _STATIC_SINGLE_CJK_CHAR_SCORE
             strong_match = True
             reasons.append("scoped_single_cjk_char")
 
-        fuzzy_score = _short_cjk_fuzzy_score(
-            normalized,
-            [schema.head, *list(schema.aliases or [])],
+        fuzzy_score = (
+            0.0
+            if pure_sparse
+            else _short_cjk_fuzzy_score(
+                normalized,
+                [schema.head, *list(schema.aliases or [])],
+            )
         )
         if fuzzy_score:
             score += fuzzy_score
@@ -2173,16 +2212,19 @@ def _score_static_metadata_bm25_tools(
 
         if ascii_match:
             reasons.append("ascii_token")
-        if score <= 0 or not (exact_protected or strong_match):
+        if score <= 0 or (
+            not pure_sparse and not (exact_protected or strong_match)
+        ):
             continue
 
-        score, context_reasons = _apply_static_context_score(
-            score,
-            schema=schema,
-            query=normalized,
-            router_context=router_context,
-        )
-        reasons.extend(context_reasons)
+        if not pure_sparse:
+            score, context_reasons = _apply_static_context_score(
+                score,
+                schema=schema,
+                query=normalized,
+                router_context=router_context,
+            )
+            reasons.extend(context_reasons)
         if score <= 0:
             continue
 
@@ -2201,6 +2243,16 @@ def _score_static_metadata_bm25_tools(
             )
         )
 
+    if bool((router_context or {}).get("exhaustive_sparse")):
+        return sorted(
+            scored,
+            key=lambda item: (
+                not item.exact_protected,
+                -item.score,
+                item.schema.command_id.casefold(),
+                item.schema.command_id,
+            ),
+        )
     return _dynamic_relevance_cut(scored, router_context=router_context)
 
 

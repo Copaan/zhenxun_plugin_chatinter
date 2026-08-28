@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 import shlex
-from typing import Any
+from typing import Any, Literal
 
 from .command_index import CommandCandidate
 from .command_observation import build_command_observation
@@ -20,6 +20,7 @@ from .native_route import (
     NativeSlotValue,
     candidate_selection_to_native_route,
 )
+from .person_candidates import TurnPersonCandidateLedger
 from .route_text import (
     collect_placeholders,
     normalize_message_text,
@@ -48,7 +49,7 @@ _PAYLOAD_EXPLANATION_MARKERS = (
     ":",
     "@",
 )
-from .task_frame import TaskFrame, pop_task_context, pop_task_text
+from .task_frame import TaskFrame, pop_task_context
 
 _NATIVE_EXECUTION_STAGE = "main_request"
 
@@ -60,6 +61,21 @@ class NativeValidatedRoute:
     reason: str
     task_frame: TaskFrame | None = None
     candidate: CommandCandidate | None = None
+
+
+NativeValidationReason = Literal[
+    "untrusted_target",
+    "unknown_target_ref",
+    "command_identity_mismatch",
+    "route_validation_failed",
+]
+
+
+@dataclass(frozen=True)
+class NativeValidationFailure:
+    reason: NativeValidationReason
+    task_text: str
+    target_ref: str = ""
 
 
 @dataclass(frozen=True)
@@ -87,7 +103,9 @@ class NativeCommandExecutionContext:
     route_executor: ExecuteNativeRoute
     message_text: str
     event_target_hint: str = ""
+    event_target_ids: tuple[str, ...] = ()
     target_refs: dict[str, str] = field(default_factory=dict)
+    person_candidate_ledger: TurnPersonCandidateLedger | None = None
     retrieval_context: dict[str, bool | int | str] = field(default_factory=dict)
     executions: list[NativeToolExecutionResult] = field(default_factory=list)
     task_count: int = 0
@@ -102,17 +120,16 @@ class NativeCommandExecutionContext:
         raw_slots: dict[str, Any],
     ) -> ToolResult:
         self.report.note_tool_choice()
-        validated = self._validate_tool_call(binding=binding, raw_slots=raw_slots)
-        if validated is None:
-            task_text, _slots = pop_task_text(raw_slots)
-            return _failure_tool_result(
+        validation = self._validate_tool_call(binding=binding, raw_slots=raw_slots)
+        if isinstance(validation, NativeValidationFailure):
+            if self.person_candidate_ledger is not None:
+                self.person_candidate_ledger.note_validation(validation.reason)
+            return _validation_failure_tool_result(
                 binding=binding,
-                task_text=task_text,
+                failure=validation,
                 ambient_message=self.message_text,
-                error="工具调用未通过本地校验，请重新选择候选工具或直接聊天。",
-                display_content="工具调用校验失败",
-                retryable=True,
             )
+        validated = validation
 
         execution_key = _native_execution_key(binding=binding, validated=validated)
         previous_execution = self.execution_receipts.get(execution_key)
@@ -162,28 +179,61 @@ class NativeCommandExecutionContext:
         *,
         binding: NativeCommandToolBinding,
         raw_slots: dict[str, Any],
-    ) -> NativeValidatedRoute | None:
+    ) -> NativeValidatedRoute | NativeValidationFailure:
         candidate = binding.candidate
         (
             task_text,
             target_hint,
-            target_ref,
+            target_refs,
             payload_hint,
             plugin_raw_slots,
         ) = pop_task_context(raw_slots)
+        primary_target_ref = target_refs[0] if target_refs else ""
         if _has_untrusted_task_target(task_text, self.message_text):
-            return None
+            return NativeValidationFailure(
+                "untrusted_target", task_text, primary_target_ref
+            )
+        command_id = normalize_message_text(binding.command_id)
+        if not command_id or not any(
+            normalize_message_text(item.schema.command_id) == command_id
+            for item in self.candidates
+        ):
+            return NativeValidationFailure(
+                "command_identity_mismatch",
+                task_text,
+                primary_target_ref,
+            )
+        trusted_target_ids: tuple[str, ...] = ()
         if self.event_target_hint:
             target_hint = self.event_target_hint
-        elif target_ref and _schema_accepts_target(candidate.schema):
-            target_user_id = self.target_refs.get(target_ref.casefold())
-            if not target_user_id:
-                return None
-            target_hint = f"[@{target_user_id}]"
+            hinted_ids = set(_target_hint_ids(target_hint))
+            trusted_target_ids = tuple(
+                user_id
+                for user_id in dict.fromkeys(self.event_target_ids)
+                if user_id in hinted_ids
+            )
+        elif target_refs and _schema_accepts_target(candidate.schema):
+            resolved_target_ids = (
+                self.person_candidate_ledger.validate_many(target_refs)
+                if self.person_candidate_ledger is not None
+                else _resolve_target_refs(target_refs, self.target_refs)
+            )
+            if not resolved_target_ids:
+                return NativeValidationFailure(
+                    "unknown_target_ref",
+                    task_text,
+                    _first_unknown_target_ref(target_refs, self.target_refs),
+                )
+            trusted_target_ids = tuple(dict.fromkeys(resolved_target_ids))
+            target_hint = " ".join(
+                f"[@{target_user_id}]" for target_user_id in trusted_target_ids
+            )
         target_hint = _normalize_target_hint_for_schema(
             candidate.schema,
             target_hint,
         )
+        if not target_hint:
+            trusted_target_ids = ()
         slots = normalize_native_tool_slots(candidate.schema.slots, plugin_raw_slots)
         slots = _fill_missing_text_slots_from_task(
             candidate.schema,
@@ -208,7 +258,8 @@ class NativeCommandExecutionContext:
             target_hint=target_hint,
             payload_hint=payload_hint,
             ambient_message=self.message_text,
-            target_refs=(target_ref,) if target_ref else (),
+            target_refs=target_refs,
+            trusted_target_ids=trusted_target_ids,
         )
         route_message_text = _merge_ambient_context_tokens(
             _merge_task_frame_hints(task_frame),
@@ -234,7 +285,15 @@ class NativeCommandExecutionContext:
             has_reply=self.has_reply,
         )
         if route is None:
-            return None
+            if self.person_candidate_ledger is not None and target_refs:
+                self.person_candidate_ledger.note_validation(
+                    "route_validation_failed"
+                )
+            return NativeValidationFailure(
+                "route_validation_failed",
+                task_text,
+                primary_target_ref,
+            )
         decision, route_result = route
         return NativeValidatedRoute(
             decision=decision,
@@ -498,6 +557,41 @@ def _normalize_target_hint_for_schema(schema: Any, target_hint: str) -> str:
     return text
 
 
+def _target_hint_ids(target_hint: str) -> tuple[str, ...]:
+    ids: list[str] = []
+    for token in collect_placeholders(target_hint):
+        if token.startswith("[@") and token.endswith("]"):
+            user_id = token[2:-1].strip()
+            if user_id:
+                ids.append(user_id)
+    return tuple(dict.fromkeys(ids))
+
+
+def _resolve_target_refs(
+    target_refs: tuple[str, ...],
+    available_refs: dict[str, str],
+) -> tuple[str, ...] | None:
+    resolved = tuple(
+        available_refs.get(normalize_message_text(target_ref).casefold(), "")
+        for target_ref in target_refs
+    )
+    return None if any(not user_id for user_id in resolved) else resolved
+
+
+def _first_unknown_target_ref(
+    target_refs: tuple[str, ...],
+    available_refs: dict[str, str],
+) -> str:
+    return next(
+        (
+            target_ref
+            for target_ref in target_refs
+            if not available_refs.get(normalize_message_text(target_ref).casefold())
+        ),
+        target_refs[0] if target_refs else "",
+    )
+
+
 def _has_untrusted_task_target(task_text: str, ambient_text: str) -> bool:
     ambient_targets = {
         token
@@ -579,30 +673,34 @@ def _coerce_slot_value(slot: CommandSlotSpec, value: Any) -> str | None:
     return normalized
 
 
-def _failure_tool_result(
+def _validation_failure_tool_result(
     *,
     binding: NativeCommandToolBinding,
-    task_text: str,
+    failure: NativeValidationFailure,
     ambient_message: str,
-    error: str,
-    display_content: str,
-    retryable: bool,
-    missing: list[str] | tuple[str, ...] | None = None,
 ) -> ToolResult:
+    output = build_command_observation(
+        ok=False,
+        command_id=binding.command_id,
+        rendered_command=binding.candidate.schema.head,
+        matched_plugin=binding.candidate.plugin_name,
+        task_text=failure.task_text,
+        ambient_message=ambient_message,
+        error="工具参数未通过本轮执行边界校验。",
+        retryable=False,
+        plugin_module=binding.candidate.plugin_module,
+    )
+    output.update(
+        status="invalid_tool_arguments",
+        validation_reason=failure.reason,
+    )
+    if failure.target_ref:
+        output["target_ref"] = failure.target_ref[:64]
     return ToolResult(
-        output=build_command_observation(
-            ok=False,
-            command_id=binding.command_id,
-            rendered_command=binding.candidate.schema.head,
-            matched_plugin=binding.candidate.plugin_name,
-            task_text=task_text,
-            ambient_message=ambient_message,
-            error=error,
-            missing=missing,
-            retryable=retryable,
-            plugin_module=binding.candidate.plugin_module,
-        ),
-        display_content=display_content,
+        output=output,
+        display_content="",
+        is_error=True,
+        is_retryable=False,
     )
 
 
@@ -717,5 +815,7 @@ __all__ = [
     "NativeCommandExecutionContext",
     "NativeToolExecutionResult",
     "NativeValidatedRoute",
+    "NativeValidationFailure",
+    "NativeValidationReason",
     "normalize_native_tool_slots",
 ]

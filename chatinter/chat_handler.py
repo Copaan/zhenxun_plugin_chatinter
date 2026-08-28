@@ -9,16 +9,20 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 import re
 import time
-from typing import Any, cast
+from typing import Any
 import uuid
 
 from nonebot.adapters import Bot, Event
+from nonebot.adapters.onebot.v11 import (
+    Bot as OneBotV11Bot,
+)
 from nonebot.adapters.onebot.v11 import (
     GroupMessageEvent,
     Message,
     MessageSegment,
     PrivateMessageEvent,
 )
+from nonebot.message import handle_event as handle_nonebot_event
 from nonebot.plugin import get_loaded_plugins
 
 from zhenxun.services import logger
@@ -72,6 +76,15 @@ _FORWARD_SEND_APIS = frozenset(
 _FORWARD_SEND_CAPTURE: ContextVar[tuple[str, Bot, list[SendObservation]] | None] = (
     ContextVar("chatinter_forward_send_capture", default=None)
 )
+
+
+async def _dispatch_rerouted_event(bot: Bot, event: Event) -> None:
+    if isinstance(bot, OneBotV11Bot):
+        await handle_nonebot_event(bot, event)
+        return
+    await bot.handle_event(event)
+
+
 @dataclass(frozen=True)
 class RerouteExecutionResult:
     success: bool
@@ -487,7 +500,6 @@ async def reroute_to_plugin_with_result(
         if route_heads:
             set_event_signal(new_event, "_ai_route_heads", frozenset(route_heads))
 
-        handle_event = cast(Any, bot.handle_event)
         forward_send_outputs: list[SendObservation] = []
         if wait:
             capture_token = _FORWARD_SEND_CAPTURE.set(
@@ -495,11 +507,11 @@ async def reroute_to_plugin_with_result(
             )
             try:
                 with observe_send_trace(trace_key):
-                    task = asyncio.create_task(handle_event(new_event))
+                    task = asyncio.create_task(_dispatch_rerouted_event(bot, new_event))
             finally:
                 _FORWARD_SEND_CAPTURE.reset(capture_token)
         else:
-            task = asyncio.create_task(handle_event(new_event))
+            task = asyncio.create_task(_dispatch_rerouted_event(bot, new_event))
         _REROUTE_TASKS.add(task)
         task.add_done_callback(lambda done_task: _REROUTE_TASKS.discard(done_task))
         if wait:

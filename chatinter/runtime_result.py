@@ -107,16 +107,26 @@ async def _finalize_result(
         output = result.output
 
     final_text = normalize_reply_text(output.final_text)
-    if not final_text:
+    if not final_text and not output.nontext_delivery:
         final_text = _fallback_final_reply(list(result.executions)) or EMPTY_REPLY_TEXT
-    if reply_hook is not None:
+    if reply_hook is not None and final_text:
         maybe_reply = reply_hook(final_text)
         final_text = (
             await maybe_reply if isawaitable(maybe_reply) else str(maybe_reply or "")
         )
     final_text = normalize_reply_text(final_text)
-    if not final_text:
+    if not final_text and not output.nontext_delivery:
         final_text = EMPTY_REPLY_TEXT
+    if not final_text and output.nontext_delivery:
+        return replace(
+            result,
+            output=replace(
+                output,
+                final_text="",
+                memory_text=normalize_message_text(output.memory_text),
+                should_send=True,
+            ),
+        )
     final_timeline = _with_final_timeline(
         result.timeline,
         final_text=final_text,

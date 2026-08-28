@@ -11,8 +11,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from .capability_graph import build_capability_graph_snapshot
-from .command_index import CommandCandidate, build_command_candidates
-from .models.pydantic_models import CommandToolSnapshot, PluginKnowledgeBase
+from .command_index import (
+    CommandCandidate,
+    build_command_candidates,
+)
+from .models.pydantic_models import (
+    CommandToolSnapshot,
+    PluginKnowledgeBase,
+)
 from .plugin_reference import build_command_tool_snapshots
 from .route_text import normalize_message_text
 
@@ -66,7 +72,9 @@ class CommandToolRetriever:
         context: dict[str, Any] | None = None,
     ) -> CommandRetrievalResult:
         normalized_query = normalize_message_text(query)
-        retrieval_limit = _coerce_limit(limit) if limit is not None else _DISPATCH_RETRIEVAL_LIMIT
+        retrieval_limit = (
+            _coerce_limit(limit) if limit is not None else _DISPATCH_RETRIEVAL_LIMIT
+        )
         candidates = build_command_candidates(
             self.knowledge_base,
             normalized_query,

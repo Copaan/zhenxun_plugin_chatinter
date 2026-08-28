@@ -298,7 +298,7 @@ async def _get_group_member_profiles_for_fuzzy(
 ) -> list[dict[str, str | tuple[str, ...]]]:
     if not group_id:
         return []
-    cache_key = str(group_id)
+    cache_key = _group_member_profile_cache_key(group_id, bot)
     now = time.monotonic()
     cached = _GROUP_MEMBER_PROFILE_CACHE.get(cache_key)
     if cached and (now - cached[0]) < _GROUP_MEMBER_PROFILE_CACHE_TTL:
@@ -338,6 +338,7 @@ async def _get_group_member_profiles_for_fuzzy(
                 "alias_key": alias_key,
                 "alias_keys": alias_keys,
                 "alias_entries": alias_entries,
+                "membership_source": "group_database",
             }
         )
 
@@ -365,6 +366,44 @@ async def _get_group_member_profiles_for_fuzzy(
         )[: len(_GROUP_MEMBER_PROFILE_CACHE) - _GROUP_MEMBER_PROFILE_CACHE_MAX]:
             _GROUP_MEMBER_PROFILE_CACHE.pop(_evict_key, None)
     return profiles
+
+
+def _group_member_profile_cache_key(group_id: str, bot: Bot | None) -> str:
+    if bot is None:
+        return f"database::{group_id}"
+    adapter = getattr(bot, "adapter", None)
+    adapter_name = ""
+    get_name = getattr(adapter, "get_name", None)
+    if callable(get_name):
+        try:
+            adapter_name = str(get_name() or "").strip()
+        except Exception:
+            adapter_name = ""
+    bot_id = str(getattr(bot, "self_id", "") or "").strip()
+    return f"{adapter_name}:{bot_id}:{group_id}"
+
+
+async def get_group_member_profiles_for_target(
+    group_id: str | None,
+    bot: Bot | None = None,
+) -> tuple[dict[str, str | tuple[str, ...]], ...]:
+    """Return the cached current-group roster used for target verification."""
+
+    return tuple(await _get_group_member_profiles_for_fuzzy(group_id, bot=bot))
+
+
+async def get_current_group_member_profiles_for_target(
+    group_id: str | None,
+    bot: Bot | None = None,
+) -> tuple[dict[str, str | tuple[str, ...]], ...]:
+    """Return roster-backed members, excluding history-only person records."""
+
+    profiles = await _get_group_member_profiles_for_fuzzy(group_id, bot=bot)
+    return tuple(
+        profile
+        for profile in profiles
+        if profile.get("membership_source") != "person_history"
+    )
 
 
 async def _get_recent_chat_member_profiles(
@@ -413,6 +452,7 @@ async def _get_recent_chat_member_profiles(
                 "alias_key": _normalize_alias_key(display_name),
                 "alias_keys": _alias_entries_to_keys(alias_entries),
                 "alias_entries": alias_entries,
+                "membership_source": "person_history",
             }
         )
     return profiles
@@ -457,6 +497,7 @@ async def _get_adapter_group_member_profiles(
                 "alias_key": _normalize_alias_key(display_name),
                 "alias_keys": alias_keys,
                 "alias_entries": alias_entries,
+                "membership_source": "adapter_live",
             }
         )
     return profiles
@@ -672,8 +713,7 @@ def _profile_alias_entries(
 
 def _fuzzy_match_thresholds(trigger_strength: str) -> tuple[float, float, float, float]:
     if (trigger_strength or "weak").lower() == "strong":
-        # strong-trigger 档位是刻意放宽的独立阈值组，与下方 weak 档的共享常量
-        # 无关联，保持原字面量不变。
+        # Strong evidence uses an independent, more permissive threshold set.
         return 0.72, 0.72, 0.86, 0.08
     return (
         0.80,
@@ -1181,6 +1221,8 @@ __all__ = [
     "extract_fuzzy_target_hint",
     "extract_mentioned_user_ids",
     "extract_pending_entities",
+    "get_current_group_member_profiles_for_target",
+    "get_group_member_profiles_for_target",
     "is_technical_request_like",
     "needs_target_for_route",
     "remember_target_resolution",

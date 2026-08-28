@@ -27,6 +27,7 @@ class ReplyDeliveryPlan:
     canonical_text: str
     segments: tuple[str, ...]
     conversational: bool = False
+    planned_attachments: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +35,8 @@ class DeliveryReceipt:
     canonical_text: str
     planned_segments: int
     delivered_segments: tuple[str, ...] = ()
+    planned_attachments: int = 0
+    delivered_attachments: int = 0
     complete: bool = False
 
     @classmethod
@@ -41,18 +44,28 @@ class DeliveryReceipt:
         cls,
         plan: ReplyDeliveryPlan,
         delivered_segments: tuple[str, ...] | list[str] = (),
+        *,
+        delivered_attachments: int = 0,
     ) -> DeliveryReceipt:
         delivered = tuple(delivered_segments)
+        attachment_count = min(
+            max(int(delivered_attachments), 0),
+            max(int(plan.planned_attachments), 0),
+        )
+        planned_total = len(plan.segments) + max(int(plan.planned_attachments), 0)
+        delivered_total = len(delivered) + attachment_count
         return cls(
             canonical_text=plan.canonical_text,
             planned_segments=len(plan.segments),
             delivered_segments=delivered,
-            complete=bool(plan.segments) and len(delivered) == len(plan.segments),
+            planned_attachments=max(int(plan.planned_attachments), 0),
+            delivered_attachments=attachment_count,
+            complete=planned_total > 0 and delivered_total == planned_total,
         )
 
     @property
     def delivered_count(self) -> int:
-        return len(self.delivered_segments)
+        return len(self.delivered_segments) + self.delivered_attachments
 
     @property
     def delivered_text(self) -> str:
@@ -67,10 +80,15 @@ def build_reply_delivery_plan(
     conversational: bool,
     hard_limit: int = HARD_MESSAGE_CHAR_LIMIT,
     max_segments: int = CONVERSATIONAL_MAX_SEGMENTS,
+    attachment_count: int = 0,
 ) -> ReplyDeliveryPlan:
     canonical = str(text or "").strip()
     if not canonical:
-        return ReplyDeliveryPlan(canonical_text="", segments=())
+        return ReplyDeliveryPlan(
+            canonical_text="",
+            segments=(),
+            planned_attachments=max(int(attachment_count), 0),
+        )
 
     base_segments = (canonical,)
     natural_split = False
@@ -93,6 +111,7 @@ def build_reply_delivery_plan(
         canonical_text=canonical,
         segments=bounded or (canonical,),
         conversational=natural_split,
+        planned_attachments=max(int(attachment_count), 0),
     )
 
 

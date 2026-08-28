@@ -17,7 +17,13 @@ from .models.pydantic_models import (
     PluginCommandSchema,
 )
 from .route_text import normalize_message_text
-from .task_frame import TARGET_REF_FIELD, TASK_TEXT_FIELD
+from .task_frame import (
+    TARGET_REF_FIELD,
+    TARGET_REF_SCHEMA_DESCRIPTION,
+    TARGET_REFS_FIELD,
+    TARGET_REFS_SCHEMA_DESCRIPTION,
+    TASK_TEXT_FIELD,
+)
 
 _TOOL_NAME_PREFIX = "ci_cmd_"
 _TOOL_NAME_DIGEST_SIZE = 5
@@ -240,11 +246,15 @@ def _build_parameters(
         },
         TARGET_REF_FIELD: {
             "type": ["string", "null"],
-            "description": (
-                "可选的受限操作目标。仅在当前请求明确承接对话关系时，"
-                "填写 <relevant_people> 中已有的 target_ref；"
-                "不得填写昵称或用户 ID，否则填写 null。"
-            ),
+            "description": TARGET_REF_SCHEMA_DESCRIPTION,
+        },
+        TARGET_REFS_FIELD: {
+            "type": ["array", "null"],
+            "items": {"type": "string", "minLength": 1},
+            "minItems": 2,
+            "maxItems": 4,
+            "uniqueItems": True,
+            "description": TARGET_REFS_SCHEMA_DESCRIPTION,
         },
     }
     required: list[str] = [TASK_TEXT_FIELD]

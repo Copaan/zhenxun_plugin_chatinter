@@ -24,7 +24,13 @@ def estimate_text_tokens(text: str) -> int:
                 return max(int(counter(value)), 0)
             except (TypeError, ValueError):
                 continue
-    cjk_chars = len(re.findall(r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af\u1100-\u11ff]", value))
+    cjk_chars = len(
+        re.findall(
+            r"[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef\u3040-\u309f"
+            r"\u30a0-\u30ff\uac00-\ud7af\u1100-\u11ff]",
+            value,
+        )
+    )
     return math.ceil(cjk_chars * 1.2 + (len(value) - cjk_chars) * 0.3)
 
 

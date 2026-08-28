@@ -139,8 +139,6 @@ class ResponseQualityJudge:
                 severity="error",
                 rule_hits=tuple(rule_hits),
             )
-        if "too_stiff_for_dialogue_state" in (_quality_rule_hits(message=message, reply=reply, state=dialogue_state) if not rule_hits else rule_hits):
-            pass  # Downgraded to observation-only; no text rewriting
         if _looks_off_topic(message, reply, dialogue_state):
             return ResponseQualityResult(
                 action="revise",
@@ -178,13 +176,13 @@ def _soften_reply(reply: str) -> str:
     import re
     softened = reply
     for phrase in _STIFF_PHRASES:
-        # 尝试删除包含该词的完整分句（以标点分隔）
         softened = re.sub(
-            r"[^，,。.!！？?\n]*" + re.escape(phrase) + r"[^，,。.!！？?\n]*[，,。.!！？?]?\s*",
+            r"[^，,。.!！？?\n]*"
+            + re.escape(phrase)
+            + r"[^，,。.!！？?\n]*[，,。.!！？?]?\s*",
             "",
             softened,
         )
-    # 清理残余开头标点
     softened = re.sub(r"^[\s，,。.!！？?]+", "", softened)
     return normalize_message_text(softened) or reply
 
@@ -234,8 +232,11 @@ def _quality_rule_hits(
 def _generic_filler(message: str, reply: str) -> bool:
     if reply in _GENERIC_FILLER_REPLIES and len(message) >= 10:
         return True
-    # 超短回复（≤3字）面对较长的用户消息，也视为无效 filler
-    if len(reply) <= 3 and len(message) >= 15 and not any(c in reply for c in "！!？?…"):
+    if (
+        len(reply) <= 3
+        and len(message) >= 15
+        and not any(c in reply for c in "！!？?…")
+    ):
         return True
     return False
 

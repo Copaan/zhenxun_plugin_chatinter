@@ -16,7 +16,7 @@ import re
 from typing import Any, Literal
 from xml.sax.saxutils import escape
 
-from zhenxun.services.ai.core.models import ModelCapabilities
+from zhenxun.services.ai.core.models import ModelCapabilities, ReasoningMode
 from zhenxun.services.ai.llm.system.capabilities import (
     ModelModality,
     get_model_capabilities,
@@ -45,6 +45,10 @@ from .route_text import normalize_message_text
 ProviderFamily = Literal["openai", "gemini", "custom"]
 ToolSchemaMode = Literal["full", "compact", "light"]
 ProviderReplayKind = Literal["responses_output",]
+ReasoningTransportPolicy = Literal["provider_default", "capability_gated"]
+
+_REASONING_TRANSPORT_POLICY_KEY = "chatinter_reasoning_transport_policy"
+_REASONING_REPLAY_POLICY_KEY = "chatinter_reasoning_replay_policy"
 
 _MAX_TOOL_DESCRIPTION_CHARS = 1800
 _MAX_PARAM_DESCRIPTION_CHARS = 700
@@ -73,6 +77,8 @@ class ProviderCapabilityProfile:
     supports_required_tool_choice: bool
     supports_named_tool_choice: bool
     supports_prompt_cache_key: bool
+    reasoning_mode: ReasoningMode
+    supports_thinking_toggle: bool
     tool_result_message_format: ToolResultMessageFormat
     mcp: MCPToolProtocolProfile
     provider_replay_kind: ProviderReplayKind | None = None
@@ -90,6 +96,8 @@ class ProviderCapabilityProfile:
             "supports_required_tool_choice": self.supports_required_tool_choice,
             "supports_named_tool_choice": self.supports_named_tool_choice,
             "supports_prompt_cache_key": self.supports_prompt_cache_key,
+            "reasoning_mode": self.reasoning_mode.value,
+            "supports_thinking_toggle": self.supports_thinking_toggle,
             "tool_result_message_format": self.tool_result_message_format,
             "provider_replay_kind": self.provider_replay_kind,
             "mcp": self.mcp.to_metadata(),
@@ -179,6 +187,8 @@ class ProviderCapabilityAdapter:
             supports_named_tool_choice=protocol.tool_choice.supports_named,
             supports_prompt_cache_key=normalized_api_type
             in {"openai", "openai_responses"},
+            reasoning_mode=capabilities.reasoning_mode,
+            supports_thinking_toggle=capabilities.supports_thinking_toggle,
             tool_result_message_format=protocol.tool_result_message_format,
             mcp=protocol.mcp,
             provider_replay_kind=_provider_replay_kind(
@@ -293,6 +303,7 @@ class ProviderCapabilityAdapter:
         required_tool_names: Iterable[str] = (),
         schema_modes: dict[str, ToolSchemaMode] | None = None,
         generation_config: Any | None = None,
+        reasoning_transport_policy: ReasoningTransportPolicy = "provider_default",
     ) -> ProviderPreparedRequest:
         """Build the provider-safe request shape consumed by AI.generate_internal."""
 
@@ -316,14 +327,22 @@ class ProviderCapabilityAdapter:
             tool_choice,
             has_tools=bool(request_tools),
         )
+        request_messages = self.adapt_messages(messages)
+        request_generation_config = build_tool_generation_config(
+            tool_choice=adapted_tool_choice,
+            base=generation_config,
+        )
+        if reasoning_transport_policy == "capability_gated":
+            request_messages = _with_reasoning_replay_policy(request_messages)
+            request_generation_config = _capability_gated_generation_config(
+                request_generation_config,
+                profile=self.profile,
+            )
         return ProviderPreparedRequest(
-            messages=self.adapt_messages(messages),
+            messages=request_messages,
             tools=request_tools,
             tool_choice=adapted_tool_choice,
-            generation_config=build_tool_generation_config(
-                tool_choice=adapted_tool_choice,
-                base=generation_config,
-            ),
+            generation_config=request_generation_config,
             metadata={
                 "provider": self.profile.to_metadata(),
                 "tool_count": len(request_tools or {}),
@@ -460,6 +479,65 @@ class ProviderCapabilityAdapter:
             -score,
             command_id or normalized_name,
         )
+
+
+def _with_reasoning_replay_policy(messages: list[LLMMessage]) -> list[LLMMessage]:
+    """Return a transient request view that never fabricates reasoning replay."""
+
+    result: list[LLMMessage] = []
+    for message in messages:
+        if message.role != "assistant":
+            result.append(message)
+            continue
+        metadata = copy.deepcopy(message.metadata or {})
+        metadata[_REASONING_REPLAY_POLICY_KEY] = "nonempty_only"
+        result.append(message.model_copy(update={"metadata": metadata}))
+    return result
+
+
+def _capability_gated_generation_config(
+    generation_config: Any | None,
+    *,
+    profile: ProviderCapabilityProfile,
+) -> Any | None:
+    """Attach the opt-in transport policy and remove unsupported reasoning intent."""
+
+    if generation_config is None:
+        return None
+    request_config = copy.deepcopy(generation_config)
+    validation_policy = dict(
+        getattr(request_config, "validation_policy", None) or {}
+    )
+    validation_policy[_REASONING_TRANSPORT_POLICY_KEY] = "capability_gated"
+    request_config.validation_policy = validation_policy
+
+    reasoning = getattr(request_config, "reasoning", None)
+    common = getattr(request_config, "common", None)
+    effort = (
+        getattr(reasoning, "effort", None)
+        if reasoning is not None
+        else getattr(common, "reasoning_effort", None)
+        if common is not None
+        else None
+    )
+    if effort is None:
+        return request_config
+
+    effort_value = str(getattr(effort, "value", effort) or "").strip().casefold()
+    supports_disable = (
+        profile.supports_thinking_toggle
+        or profile.reasoning_mode == ReasoningMode.BUDGET
+    )
+    keep_effort = profile.reasoning_mode != ReasoningMode.NONE and (
+        effort_value != "none" or supports_disable
+    )
+    if keep_effort:
+        return request_config
+    if reasoning is not None:
+        reasoning.effort = None
+    elif common is not None:
+        common.reasoning_effort = None
+    return request_config
 
 
 def is_light_request_tool(tool: ToolExecutable | None) -> bool:

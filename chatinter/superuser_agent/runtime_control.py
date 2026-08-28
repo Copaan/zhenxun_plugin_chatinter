@@ -26,6 +26,7 @@ from ..provider_capability import ProviderCapabilityAdapter
 from ..route_text import normalize_message_text
 from ..web_access import tools_for_web_candidate
 from .approval_store import list_pending_approvals, reject_pending_approval
+from .compaction import compact_superuser_context, summarize_with_candidates
 from .permission_policy import (
     clear_conversation_permissions,
     conversation_has_workspace_shell_grant,
@@ -37,16 +38,15 @@ from .runtime import (
     SuperuserSessionBusyError,
     _calculate_tool_schema_metrics,
     _estimate_prompt_tokens,
+    _model_visible_superuser_messages,
     _semantic_summary_generation_config,
     _superuser_prompt_cache_key,
-    _tool_schema_hash,
     cancel_superuser_session_execution,
     record_superuser_model_usage,
     request_superuser_semantic_summary,
     superuser_session_execution,
     superuser_session_is_executing,
 )
-from .state import append_artifact_refs
 from .store import (
     activate_agent_session,
     archive_conversation,
@@ -55,7 +55,6 @@ from .store import (
     deactivate_agent_session,
     delete_conversation,
     get_active_conversation,
-    get_agent_run_messages,
     get_agent_run_snapshot,
     get_agent_session,
     list_agent_run_activities,
@@ -664,7 +663,6 @@ def _approval_run_id(approval: Any) -> str:
 
 async def _compact_conversation(run_id: str) -> str:
     from .context import (
-        compact_messages,
         context_window_budget,
         estimate_prompt_tokens_with_baseline,
     )
@@ -676,30 +674,18 @@ async def _compact_conversation(run_id: str) -> str:
     snapshot = get_agent_run_snapshot(run_id)
     if not isinstance(snapshot, dict):
         return "当前 Agent 对话不存在。"
-    messages = get_agent_run_messages(run_id)
-    budget = snapshot.get("budget")
-    budget = budget if isinstance(budget, dict) else {}
-    prompt_tokens_before = estimate_prompt_tokens_with_baseline(
-        messages,
-        current_context_tokens=budget.get("current_context_tokens", 0),
-        last_usage_message_count=budget.get("last_usage_message_count", 0),
-        last_usage_schema_tokens=budget.get("last_usage_schema_tokens", 0),
-    )
-    trace_id = str(snapshot.get("trace_id", "") or run_id)
     configured_model = get_agent_model("superuser")
-    candidate = (
-        await resolve_host_model_candidates(
-            configured_model,
-            get_fallback_models(configured_model),
-        )
-    )[0]
-    model_name = candidate.name
-    max_input_tokens = candidate.context_window(
-        get_agent_context_window_tokens("superuser")
+    candidates = await resolve_host_model_candidates(
+        configured_model,
+        get_fallback_models(configured_model),
     )
-    ai: AI | None = None
+    candidate = candidates[0]
+    model_name = candidate.name
+    configured_context_tokens = get_agent_context_window_tokens("superuser")
+    max_input_tokens = candidate.context_window(configured_context_tokens)
+    base_tools = build_superuser_tools()
     source_tools = tools_for_web_candidate(
-        build_superuser_tools(),
+        base_tools,
         candidate=candidate,
         scope="superuser",
     )
@@ -712,38 +698,70 @@ async def _compact_conversation(run_id: str) -> str:
     state = load_agent_run_state(run_id, tool_map=source_tools)
     if state is None:
         return "当前 Agent 对话无法恢复。"
-    _, schema_tokens = await _calculate_tool_schema_metrics(tools)
-    tool_schema_hash = await _tool_schema_hash(tools)
-    prompt_cache_key = await _superuser_prompt_cache_key(
-        run_id=run_id,
-        model_name=model_name,
-        tool_schema_hash=tool_schema_hash,
+    budget = snapshot.get("budget")
+    budget = budget if isinstance(budget, dict) else {}
+    prompt_tokens_before = estimate_prompt_tokens_with_baseline(
+        _model_visible_superuser_messages(state.messages),
+        current_context_tokens=budget.get("current_context_tokens", 0),
+        last_usage_message_count=budget.get("last_usage_message_count", 0),
+        last_usage_schema_tokens=budget.get("last_usage_schema_tokens", 0),
+        estimate=_estimate_prompt_tokens,
     )
+    _, schema_tokens = await _calculate_tool_schema_metrics(tools)
     output_reserve_tokens = get_superuser_max_output_tokens()
-    failure_reasons: list[str] = []
-    usage_recorded = False
+    candidate_blocking_limits: list[int] = []
+    for item in candidates:
+        if item is candidate:
+            item_schema_tokens = schema_tokens
+        else:
+            item_source_tools = tools_for_web_candidate(
+                base_tools,
+                candidate=item,
+                scope="superuser",
+            )
+            item_adapter = ProviderCapabilityAdapter.for_model(
+                item.name,
+                capabilities=item.capabilities,
+                api_type=item.api_type,
+            )
+            item_tools = item_adapter.prepare_tool_map_for_request(item_source_tools)
+            _, item_schema_tokens = await _calculate_tool_schema_metrics(item_tools)
+        candidate_blocking_limits.append(
+            context_window_budget(
+                max_input_tokens=item.context_window(configured_context_tokens),
+                prompt_tokens=0,
+                schema_tokens=item_schema_tokens,
+                output_reserve_tokens=output_reserve_tokens,
+            ).blocking_limit
+        )
+    ai = AI(session_id=f"chatinter-superuser:{run_id}")
     budget_before = (
         state.budget.run_input_tokens,
         state.budget.run_output_tokens,
         state.budget.model_calls,
     )
 
-    def record_failure(_fingerprint: str, metadata: dict[str, Any]) -> None:
-        reason = _manual_compression_failure_code(metadata.get("error"))
-        if reason not in failure_reasons:
-            failure_reasons.append(reason)
-
-    async def summarize(request_messages) -> str:
-        nonlocal ai, usage_recorded
-        ai = ai or AI(session_id=f"chatinter-superuser:{run_id}")
+    async def invoke_summary(
+        summary_candidate,
+        request_messages,
+        candidate_max_input_tokens,
+        summary_token_target,
+    ):
+        prompt_cache_key = await _superuser_prompt_cache_key(
+            run_id=run_id,
+            model_name=summary_candidate.name,
+            tool_schema_hash="",
+            namespace="summary",
+        )
         response = await request_superuser_semantic_summary(
             ai=ai,
             messages=request_messages,
-            model_name=model_name or None,
-            candidate=candidate,
-            max_input_tokens=max_input_tokens,
+            model_name=summary_candidate.name,
+            candidate=summary_candidate,
+            max_input_tokens=candidate_max_input_tokens,
             timeout=SUPERUSER_MODEL_TIMEOUT_SECONDS,
             prompt_cache_key=prompt_cache_key,
+            summary_token_target=summary_token_target,
         )
         record_superuser_model_usage(
             state,
@@ -752,82 +770,80 @@ async def _compact_conversation(run_id: str) -> str:
             schema_tokens=0,
             update_context=False,
             request_kind="summary",
-            model_name=model_name,
+            model_name=summary_candidate.name,
             tool_schema_hash="",
             request_message_count=len(request_messages),
             request_generation_config=_semantic_summary_generation_config(
-                max_input_tokens
+                candidate_max_input_tokens,
+                summary_token_target=summary_token_target,
+                native_structured_output=(
+                    getattr(response, "chatinter_summary_strategy", "native")
+                    == "native"
+                ),
             ),
             cache_phase="compaction_request",
             visible_messages=request_messages,
         )
-        usage_recorded = True
-        if getattr(response, "tool_calls", None):
-            raise ValueError("semantic_summary_returned_tool_calls")
-        return str(response.text or "")
+        return response
 
-    result = await compact_messages(
-        messages,
-        trace_id=trace_id,
+    async def summarize(request_messages):
+        return await summarize_with_candidates(
+            request_messages,
+            candidates=candidates,
+            preferred_name=model_name,
+            configured_context_tokens=configured_context_tokens,
+            invoke=invoke_summary,
+        )
+
+    execution = await compact_superuser_context(
+        state,
         max_input_tokens=max_input_tokens,
-        summarize=summarize,
         schema_tokens=schema_tokens,
         output_reserve_tokens=output_reserve_tokens,
-        force=True,
-        blocked_source_fingerprint="",
-        on_failure=record_failure,
         prompt_tokens_before=prompt_tokens_before,
-    )
-    if not result.changed:
-        if usage_recorded and not persist_agent_run_state(
+        summarize=summarize,
+        persist=lambda stage, metadata: persist_agent_run_state(
             state,
-            stage="context_compression_attempt",
-        ):
-            _record_manual_compression_trajectory(
-                state,
-                started_at=started_at,
-                started_perf=started_perf,
-                budget_before=budget_before,
-                outcome="failed",
-                failure_reason="persistence_failed",
-            )
-            return "上下文压缩记录保存失败；原上下文已保留。"
+            stage=stage,
+            metadata=metadata,
+        ),
+        visible_messages=_model_visible_superuser_messages,
+        trigger="manual",
+        hard_required=True,
+        summary_max_input_tokens=max(
+            (
+                candidate.context_window(configured_context_tokens)
+                for candidate in candidates
+            ),
+            default=max_input_tokens,
+        ),
+    )
+    result = execution.result
+    usage_recorded = state.budget.model_calls > budget_before[2]
+    fits_candidate_chain = any(
+        result.after_tokens < blocking_limit
+        for blocking_limit in candidate_blocking_limits
+    )
+    largest_candidate_limit = max(candidate_blocking_limits, default=0)
+    if result.artifact_persistence_failed:
+        return "上下文归档写入失败；原上下文已保留，请检查数据目录存储状态。"
+    if not result.changed:
         if usage_recorded:
             _record_manual_compression_trajectory(
                 state,
                 started_at=started_at,
                 started_perf=started_perf,
                 budget_before=budget_before,
-                outcome="failed" if failure_reasons else "no_change",
-                failure_reason=(
-                    failure_reasons[0] if failure_reasons else "no_safe_middle"
-                ),
+                outcome="failed" if result.failure_reason else "no_change",
+                failure_reason=result.failure_reason or "no_safe_middle",
             )
-        if failure_reasons:
-            details = "；".join(
-                _MANUAL_COMPRESSION_FAILURE_MESSAGES[reason]
-                for reason in failure_reasons
+        if not fits_candidate_chain:
+            return (
+                "固定系统上下文、工具定义和归档后的当前请求仍超过所有候选模型窗口。"
+                "请缩短本次输入或配置更大上下文窗口的模型。"
             )
-            return f"上下文压缩失败：{details}。原上下文已保留。"
         return "当前没有可安全压缩的旧内容；原上下文未修改。"
-    state.messages = list(result.messages)
-    append_artifact_refs(state.artifact_refs, result.artifact_ids)
-    state.compression_failure_fingerprint = ""
-    state.compression_failure_count = 0
-    state.budget.current_context_tokens = max(int(result.after_tokens or 0), 0)
-    state.budget.last_usage_message_count = len(state.messages)
-    state.budget.last_usage_schema_tokens = 0
-    if not persist_agent_run_state(
-        state,
-        stage="context_compacted",
-        metadata={
-            "before_tokens": result.before_tokens,
-            "after_tokens": result.after_tokens,
-            "summary_savings_tokens": result.summary_savings_tokens,
-            "summary_savings_ratio": result.summary_savings_ratio,
-            "low_savings": result.low_savings,
-        },
-    ):
+    if execution.persistence_failed:
         if usage_recorded:
             _record_manual_compression_trajectory(
                 state,
@@ -847,19 +863,12 @@ async def _compact_conversation(run_id: str) -> str:
             outcome="completed",
             failure_reason="",
         )
-    post_compression_budget = context_window_budget(
-        max_input_tokens=max_input_tokens,
-        prompt_tokens=result.after_tokens,
-        schema_tokens=schema_tokens,
-        output_reserve_tokens=output_reserve_tokens,
-    )
-    if post_compression_budget.prompt_tokens >= post_compression_budget.blocking_limit:
+    if not fits_candidate_chain:
         return (
             f"上下文已压缩：{result.before_tokens} -> {result.after_tokens} tokens，"
-            "但仍超过当前候选模型的可请求窗口"
-            f"（{post_compression_budget.prompt_tokens} >= "
-            f"{post_compression_budget.blocking_limit}）；"
-            "请使用 /新增会话 后继续。"
+            "但仍超过所有候选模型的可请求窗口"
+            f"（{result.after_tokens} >= {largest_candidate_limit}）；"
+            "请缩短本次输入或配置更大上下文窗口的模型。"
         )
     return f"上下文已压缩：{result.before_tokens} -> {result.after_tokens} tokens。"
 
@@ -910,32 +919,6 @@ def _record_manual_compression_trajectory(
         )
     except Exception:
         return
-
-
-_MANUAL_COMPRESSION_FAILURE_MESSAGES = {
-    "artifact_persistence_failed": "压缩源保存失败",
-    "compressed_prompt_over_target": "压缩后上下文仍超过目标预算",
-    "compression_attempts_exhausted": "摘要重试次数已用尽",
-    "compression_circuit_open": "自动压缩连续失败熔断已生效",
-    "ineffective_semantic_summary": "摘要没有产生有效 token 收益",
-    "invalid_structured_summary": "摘要模型返回的结构化结果无效",
-    "protected_context_exceeds_target": "必须保留的上下文已超过目标预算",
-    "semantic_summary_returned_tool_calls": "摘要模型错误地返回了工具调用",
-    "summary_repair_request_too_large": "摘要格式修复请求超过候选模型窗口",
-    "summary_request_failed": "摘要模型请求失败",
-    "summary_request_timed_out": "摘要模型请求超时",
-    "summary_request_too_large": "摘要请求仍超过候选模型窗口",
-}
-
-
-def _manual_compression_failure_code(error: Any) -> str:
-    text = normalize_message_text(str(error or "")).casefold()
-    for code in _MANUAL_COMPRESSION_FAILURE_MESSAGES:
-        if code in text:
-            return code
-    if "timeout" in text or "timed out" in text:
-        return "summary_request_timed_out"
-    return "summary_request_failed"
 
 
 def _status_reply(

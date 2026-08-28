@@ -44,8 +44,6 @@ class PluginSkill:
     precautions: tuple[str, ...] = ()
     semantic_tools: tuple[SemanticToolContract, ...] = ()
     input_types: tuple[str, ...] = ()
-    output_modes: tuple[str, ...] = ()
-    side_effects: tuple[str, ...] = ()
     command_count: int = 0
 
 
@@ -140,14 +138,6 @@ def build_plugin_skill_index(
                     ),
                     input_types=_skill_input_types(
                         tools_by_module[_module_key(module)]
-                    ),
-                    output_modes=_stable_values(
-                        tool.output_mode
-                        for tool in tools_by_module[_module_key(module)]
-                    ),
-                    side_effects=_stable_values(
-                        tool.side_effect
-                        for tool in tools_by_module[_module_key(module)]
                     ),
                     command_count=len(command_ids),
                 )
@@ -320,8 +310,6 @@ def _index_fingerprint(skills: tuple[PluginSkill, ...]) -> str:
                 item.model_dump(mode="json") for item in skill.semantic_tools
             ],
             "input_types": skill.input_types,
-            "output_modes": skill.output_modes,
-            "side_effects": skill.side_effects,
             "command_count": skill.command_count,
         }
         digest.update(

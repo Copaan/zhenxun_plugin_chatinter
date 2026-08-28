@@ -243,7 +243,10 @@ def _default_profile(
     supports_image_input: bool,
 ) -> ProviderProtocolProfile:
     if family == "openai":
-        schema = ProviderSchemaPolicy(dialect="openai_strict", nullable_style="type_union")
+        schema = ProviderSchemaPolicy(
+            dialect="openai_strict",
+            nullable_style="type_union",
+        )
         tool_choice = ProviderToolChoicePolicy(
             supports_tools=supports_tools,
             supports_required=True,

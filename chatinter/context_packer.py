@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .addressee_resolver import AddresseeResult, format_addressee_xml
 from .event_context import ChatInterEventContext
+from .person_candidates import TurnPersonCandidateLedger
 from .person_registry import PersonProfile, RelevantPerson
 from .thread_resolver import ThreadContext, format_thread_xml
 
@@ -15,16 +16,20 @@ class DialogueContextPack:
         addressee: AddresseeResult | None,
         thread: ThreadContext | None,
         relevant_people: tuple[RelevantPerson, ...] = (),
-        action_target_user_ids: tuple[str, ...] = (),
-        alias_target_user_ids: tuple[str, ...] = (),
+        person_candidate_ledger: TurnPersonCandidateLedger | None = None,
     ) -> None:
         self.event_context = event_context
         self.speaker_profile = speaker_profile
         self.addressee = addressee
         self.thread = thread
         self.relevant_people = relevant_people
-        self.action_target_user_ids = action_target_user_ids
-        self.alias_target_user_ids = alias_target_user_ids
+        self.person_candidate_ledger = person_candidate_ledger
+        visible_people = _visible_relevant_people(speaker_profile, relevant_people)
+        if person_candidate_ledger is not None:
+            person_candidate_ledger.bind_visible_people(
+                visible_people,
+                speaker_profile=speaker_profile,
+            )
 
     def to_context_xml(self) -> str:
         return build_group_dialogue_context(
@@ -33,27 +38,13 @@ class DialogueContextPack:
             addressee=self.addressee,
             thread=self.thread,
             relevant_people=self.relevant_people,
-            action_target_user_ids=self.action_target_user_ids,
-            alias_target_user_ids=self.alias_target_user_ids,
+            target_refs=self.action_target_refs(),
         )
 
     def action_target_refs(self) -> dict[str, str]:
-        allowed_user_ids = _action_target_user_ids(
-            self.thread,
-            self.action_target_user_ids,
-            self.alias_target_user_ids,
-        )
-        if not allowed_user_ids:
+        if self.person_candidate_ledger is None:
             return {}
-        refs: dict[str, str] = {}
-        for index, person in enumerate(
-            _visible_relevant_people(self.speaker_profile, self.relevant_people)[:8],
-            start=1,
-        ):
-            user_id = str(person.profile.user_id or "").strip()
-            if user_id in allowed_user_ids:
-                refs[f"person:{index}"] = user_id
-        return refs
+        return self.person_candidate_ledger.refs()
 
 
 def append_group_dialogue_context(
@@ -64,8 +55,7 @@ def append_group_dialogue_context(
     addressee: AddresseeResult | None,
     thread: ThreadContext | None,
     relevant_people: tuple[RelevantPerson, ...] = (),
-    action_target_user_ids: tuple[str, ...] = (),
-    alias_target_user_ids: tuple[str, ...] = (),
+    target_refs: dict[str, str] | None = None,
 ) -> str:
     packed = build_group_dialogue_context(
         event_context=event_context,
@@ -73,8 +63,7 @@ def append_group_dialogue_context(
         addressee=addressee,
         thread=thread,
         relevant_people=relevant_people,
-        action_target_user_ids=action_target_user_ids,
-        alias_target_user_ids=alias_target_user_ids,
+        target_refs=target_refs,
     )
     if not packed:
         return context_xml
@@ -88,23 +77,27 @@ def build_group_dialogue_context(
     addressee: AddresseeResult | None,
     thread: ThreadContext | None,
     relevant_people: tuple[RelevantPerson, ...] = (),
-    action_target_user_ids: tuple[str, ...] = (),
-    alias_target_user_ids: tuple[str, ...] = (),
+    target_refs: dict[str, str] | None = None,
 ) -> str:
     lines: list[str] = []
     lines.extend(_event_lines(event_context))
     if speaker_profile is not None:
-        lines.extend(_turn_identity_lines(event_context, speaker_profile))
+        lines.extend(
+            _turn_identity_lines(
+                event_context,
+                speaker_profile,
+                current_speaker_target_ref=_target_ref_for_user(
+                    target_refs,
+                    speaker_profile.user_id,
+                ),
+            )
+        )
     visible_people = _visible_relevant_people(speaker_profile, relevant_people)
     if visible_people:
         lines.extend(
             _relevant_people_lines(
                 visible_people,
-                target_user_ids=_action_target_user_ids(
-                    thread,
-                    action_target_user_ids,
-                    alias_target_user_ids,
-                ),
+                target_refs=target_refs,
             )
         )
     if addressee is not None:
@@ -126,43 +119,6 @@ def _visible_relevant_people(
         for person in relevant_people
         if not person.is_current_speaker
         and (not speaker_id or person.profile.user_id != speaker_id)
-    )
-
-
-def _thread_user_ids(thread: ThreadContext | None) -> set[str]:
-    if thread is None:
-        return set()
-    return {
-        str(user_id).strip()
-        for user_id in thread.related_user_ids
-        if str(user_id).strip()
-    }
-
-
-def _action_target_user_ids(
-    thread: ThreadContext | None,
-    recent_user_ids: tuple[str, ...],
-    alias_target_user_ids: tuple[str, ...] = (),
-) -> set[str]:
-    """执行侧可用的 target_ref 白名单。
-
-    三个来源:
-    - thread 参与者(结构证据)
-    - 最近发言者(弱证据: 只是说过话)
-    - 本轮消息里被别名字面点名的人(强证据: 用户当前就在叫这个人)
-    """
-    return (
-        _thread_user_ids(thread)
-        | {
-            str(user_id).strip()
-            for user_id in recent_user_ids
-            if str(user_id).strip()
-        }
-        | {
-            str(user_id).strip()
-            for user_id in alias_target_user_ids
-            if str(user_id).strip()
-        }
     )
 
 
@@ -195,6 +151,8 @@ def _event_lines(event_context: ChatInterEventContext) -> list[str]:
 def _turn_identity_lines(
     event_context: ChatInterEventContext,
     speaker_profile: PersonProfile,
+    *,
+    current_speaker_target_ref: str = "",
 ) -> list[str]:
     lines = ["<turn_identity>"]
     lines.append(f"current_speaker_user_id={_xml_escape(speaker_profile.user_id)}")
@@ -214,29 +172,52 @@ def _turn_identity_lines(
             "current_speaker_aliases="
             + _xml_escape("、".join(speaker_profile.aliases[:6]))
         )
+    if current_speaker_target_ref:
+        lines.append(
+            "current_speaker_target_ref="
+            + _xml_escape(current_speaker_target_ref)
+        )
     if event_context.group_id:
         lines.append(f"current_group_id={_xml_escape(event_context.group_id)}")
     lines.append("</turn_identity>")
     return lines
 
 
+def _target_ref_for_user(
+    target_refs: dict[str, str] | None,
+    user_id: str,
+) -> str:
+    normalized = str(user_id or "").strip()
+    return next(
+        (
+            target_ref
+            for target_ref, candidate_user_id in (target_refs or {}).items()
+            if candidate_user_id == normalized
+        ),
+        "",
+    )
+
+
 def _relevant_people_lines(
     people: tuple[RelevantPerson, ...],
     *,
-    target_user_ids: set[str] | None = None,
+    target_refs: dict[str, str] | None = None,
 ) -> list[str]:
     lines = ["<relevant_people>"]
-    allowed_targets = target_user_ids or set()
+    refs_by_user_id = {
+        user_id: target_ref for target_ref, user_id in (target_refs or {}).items()
+    }
     for index, person in enumerate(people[:8], start=1):
         profile = person.profile
         fields = [
             f"index={index}",
-            f"user_id={_xml_escape(profile.user_id)}",
             f"display_name={_xml_escape(profile.display_name)}",
             f"is_current_speaker={int(person.is_current_speaker)}",
         ]
-        if profile.user_id in allowed_targets:
-            fields.insert(1, f"target_ref=person:{index}")
+        target_ref = refs_by_user_id.get(profile.user_id)
+        if target_ref:
+            fields.insert(1, f"target_ref={_xml_escape(target_ref)}")
+            fields.append("target_candidate=1")
         if profile.group_card:
             fields.append(f"group_card={_xml_escape(profile.group_card)}")
         if profile.nickname:

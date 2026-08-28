@@ -41,6 +41,12 @@ _CANCEL_SIGNALS_MAX = 512
 _ACTIVITY_RING_MAX_RUNS = 128
 _ACTIVITY_RING_MAX_ITEMS = 40
 _ACTIVITY_RING: dict[str, deque[dict[str, Any]]] = {}
+_LEGACY_COMPRESSION_FAILURE_KEYS = (
+    "compression_failure_fingerprint",
+    "compression_failure_count",
+    "compression_failure_scope",
+    "compression_failure_until",
+)
 _IMPORTANT_PERSIST_STAGES = frozenset(
     {
         "started",
@@ -49,6 +55,7 @@ _IMPORTANT_PERSIST_STAGES = frozenset(
         "tool_execution_reconciled",
         "tool_protocol_repaired",
         "read_only_tool_observation",
+        "context_tool_results_pruned",
         "semantic_compression_failed",
         "semantic_context_compressed",
         "plan_updated",
@@ -97,8 +104,8 @@ _OBSERVABILITY_METADATA_KEYS = frozenset(
         "appended_tool_result_tokens",
         "before_tokens",
         "cache_phase",
+        "candidate_attempts",
         "chain",
-        "compression_failure_count",
         "dropped_rounds",
         "environment_hash",
         "estimate_ratio",
@@ -117,11 +124,13 @@ _OBSERVABILITY_METADATA_KEYS = frozenset(
         "provider_prompt_tokens",
         "prompt_cache_hit_rate",
         "request_kind",
+        "retained_rounds",
         "result_status",
         "run_id_hash",
         "schema_chars",
         "selected_tool_count",
         "status",
+        "strategy",
         "step",
         "subagent_completed",
         "subagent_failed",
@@ -135,6 +144,7 @@ _OBSERVABILITY_METADATA_KEYS = frozenset(
         "system_hash",
         "tool_count",
         "tool_schema_hash",
+        "trigger",
         "update_context",
         "web_citation_count",
         "web_search_used",
@@ -798,8 +808,8 @@ def persist_agent_run_messages(
     snapshot["updated_at"] = utc_now_iso()
     snapshot["stage"] = str(stage or "context_updated")
     snapshot["messages"] = to_jsonable(messages)
-    snapshot["compression_failure_fingerprint"] = ""
-    snapshot["compression_failure_count"] = 0
+    for key in _LEGACY_COMPRESSION_FAILURE_KEYS:
+        snapshot.pop(key, None)
     artifact_refs = _text_list(snapshot.get("artifact_refs"))
     append_artifact_refs(artifact_refs, artifact_ids)
     snapshot["artifact_refs"] = artifact_refs
@@ -845,6 +855,8 @@ def update_agent_run_status(
     snapshot["status"] = str(status or "")
     snapshot["paused_reason"] = "" if status != "paused" else str(reason or "")
     snapshot["stop_reason"] = str(reason or status or "")
+    for key in _LEGACY_COMPRESSION_FAILURE_KEYS:
+        snapshot.pop(key, None)
     if clear_pending_approval:
         snapshot["pending_approval"] = ""
         snapshot.pop("waiting_approval_ids", None)
@@ -904,13 +916,6 @@ def _state_payload(
         "step": int(getattr(state, "step", 0) or 0),
         "max_steps": int(getattr(state, "max_steps", 0) or 0),
         "cost_checkpoint_tokens": int(getattr(state, "cost_checkpoint_tokens", 0) or 0),
-        "compression_failure_fingerprint": str(
-            getattr(state, "compression_failure_fingerprint", "") or ""
-        ),
-        "compression_failure_count": max(
-            int(getattr(state, "compression_failure_count", 0) or 0),
-            0,
-        ),
         "stop_reason": str(getattr(state, "stop_reason", "") or ""),
         "final_text": str(getattr(state, "final_text", "") or ""),
         "delivery_complete": bool(getattr(state, "delivery_complete", False)),
@@ -1241,13 +1246,6 @@ def _state_from_snapshot(
                     snapshot.get("max_total_tokens", 0),
                 )
                 or 0
-            ),
-            compression_failure_fingerprint=str(
-                snapshot.get("compression_failure_fingerprint", "") or ""
-            ),
-            compression_failure_count=max(
-                int(snapshot.get("compression_failure_count", 0) or 0),
-                0,
             ),
             budget=_budget_from_payload(snapshot.get("budget", {})),
             metrics=_metrics_from_observability_checkpoint(

@@ -22,6 +22,7 @@ class MainRequestOutput:
     record_chat_feedback: bool = True
     observation_reason: str = "chat_completed"
     tool_outcome: str = ""
+    nontext_delivery: bool = False
 
 
 @dataclass(frozen=True)

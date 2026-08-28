@@ -18,10 +18,19 @@ from zhenxun.services.message_load import is_db_unhealthy
 from .config import (
     CHAT_RESPONSE_TIMEOUT_SECONDS,
     build_agent_generation_config,
+    get_agent_context_window_tokens,
     get_agent_model,
+    get_chat_history_limit,
+)
+from .foreground_activity import (
+    begin_foreground_llm_activity,
+    end_foreground_llm_activity,
+    foreground_llm_active,
+    wait_for_foreground_llm_idle,
 )
 from .group_turn_context import snapshot_group_turn_context
-from .llm_compat import AI, LLMMessage, ReasoningConfig
+from .host_llm import resolve_host_model_candidates
+from .llm_compat import AI, LLMMessage
 from .models.chat_history import ChatInterChatHistory
 from .persistence import read_json, state_path, utc_now_iso, write_json
 from .person_registry import (
@@ -29,6 +38,7 @@ from .person_registry import (
     format_person_history_label,
     get_person_profile,
 )
+from .reaction_models import RecentReactionFact
 from .route_text import normalize_message_text
 from .runtime_result import _timeline_action_receipts
 from .turn_runtime import estimate_text_tokens
@@ -56,6 +66,8 @@ _SUMMARY_FAILURE_COOLDOWN_SECONDS = 300.0
 _SUMMARY_BATCH_MIN_TURNS = 8
 _SUMMARY_BATCH_MIN_TOKENS = 1_500
 _SUMMARY_IDLE_DELAY_SECONDS = 12.0
+_SUMMARY_DB_FETCH_LIMIT = 256
+_SUMMARY_REQUEST_OVERHEAD_TOKENS = 2_048
 _session_history_boundary: OrderedDict[str, int] = OrderedDict()
 _summary_failure_state: OrderedDict[str, tuple[int, float]] = OrderedDict()
 
@@ -85,6 +97,7 @@ class AstrHistoryPayload:
 
     messages: list[LLMMessage]
     chatroom_lines: list[str]
+    recent_reactions: tuple[RecentReactionFact, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -128,7 +141,6 @@ _summary_schedule_tasks: dict[str, asyncio.Task[None]] = {}
 _summary_retired_tasks: set[asyncio.Task[None]] = set()
 _summary_epochs: OrderedDict[str, object] = OrderedDict()
 _summary_active_request: asyncio.Task[None] | None = None
-_history_foreground_requests = 0
 
 
 async def build_astr_history_payload(
@@ -157,6 +169,7 @@ async def build_astr_history_payload(
     live_chatroom_tokens = sum(
         estimate_text_tokens(line) for line in live_chatroom_lines
     )
+    recent_reactions: list[RecentReactionFact] = []
     dialog_messages = await _build_turn_managed_dialog_messages(
         session_id=session_id,
         group_id=group_id,
@@ -165,6 +178,7 @@ async def build_astr_history_payload(
             dialog_token_budget,
             max(_HISTORY_TOTAL_TOKEN_BUDGET - live_chatroom_tokens, 0),
         ),
+        recent_reactions_out=recent_reactions,
     )
     dialog_tokens = sum(_message_token_cost(message) for message in dialog_messages)
     chatroom_lines = live_chatroom_lines
@@ -181,7 +195,11 @@ async def build_astr_history_payload(
             chatroom_limit=chatroom_limit,
             token_budget=chatroom_token_budget,
         )
-    return AstrHistoryPayload(messages=dialog_messages, chatroom_lines=chatroom_lines)
+    return AstrHistoryPayload(
+        messages=dialog_messages,
+        chatroom_lines=chatroom_lines,
+        recent_reactions=tuple(recent_reactions),
+    )
 
 
 async def _build_turn_managed_dialog_messages(
@@ -190,6 +208,7 @@ async def _build_turn_managed_dialog_messages(
     group_id: str | None,
     dialog_limit: int,
     token_budget: int = _DIALOG_HISTORY_TOKEN_BUDGET,
+    recent_reactions_out: list[RecentReactionFact] | None = None,
 ) -> list[LLMMessage]:
     limit = max(int(dialog_limit or 0), 0)
     if limit <= 0:
@@ -198,6 +217,8 @@ async def _build_turn_managed_dialog_messages(
     high_count = limit + _HISTORY_COUNT_SLACK
     fetch_limit = high_count + _SUMMARY_MAX_LINES
     dialogs = await ChatInterChatHistory.get_recent_dialogs(session_id, fetch_limit)
+    if recent_reactions_out is not None:
+        recent_reactions_out.extend(_extract_recent_reactions(dialogs))
     turns: list[_HistoryTurn] = []
     for dialog in dialogs:
         timeline_messages = await _timeline_to_history_messages(
@@ -284,6 +305,64 @@ async def _build_turn_managed_dialog_messages(
     for turn in visible_turns:
         messages.extend(turn.messages)
     return messages
+
+
+def _extract_recent_reactions(
+    dialogs: Iterable[object],
+    *,
+    assistant_turn_limit: int = 8,
+    reaction_limit: int = 3,
+) -> tuple[RecentReactionFact, ...]:
+    """Project successful reaction receipts from already-loaded dialog history."""
+
+    result: list[RecentReactionFact] = []
+    assistant_turns = 0
+    for dialog in reversed(list(dialogs)):
+        try:
+            timeline = list(dialog.get_timeline() or [])
+        except Exception:
+            continue
+        assistant_items = [
+            item
+            for item in timeline
+            if isinstance(item, dict)
+            and str(item.get("role", "") or "") == "assistant"
+            and str(item.get("kind", "") or "") in {"final_output", "reaction_output"}
+            and _timeline_assistant_history_enabled(item, legacy_default=False)
+        ]
+        if not assistant_items:
+            continue
+        assistant_turns += 1
+        for item in reversed(assistant_items):
+            if str(item.get("kind", "") or "") != "reaction_output":
+                continue
+            metadata = item.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            reaction_id = normalize_message_text(
+                str(metadata.get("reaction_id", "") or "")
+            )
+            mode = normalize_message_text(str(metadata.get("mode", "") or ""))
+            if not reaction_id or mode not in {"append", "only"}:
+                continue
+            result.append(
+                RecentReactionFact(
+                    reaction_id=reaction_id,
+                    category=normalize_message_text(
+                        str(metadata.get("category", "") or "")
+                    )[:80],
+                    search_intent=normalize_message_text(
+                        str(metadata.get("search_intent", "") or "")
+                    )[:160],
+                    mode=mode,
+                    turns_ago=assistant_turns,
+                )
+            )
+            if len(result) >= max(int(reaction_limit), 0):
+                return tuple(result)
+        if assistant_turns >= max(int(assistant_turn_limit), 0):
+            break
+    return tuple(result)
 
 
 def _summary_epoch(session_id: str) -> object:
@@ -602,6 +681,80 @@ def _history_summary_job_is_ready(job: _HistorySummaryJob) -> bool:
     )
 
 
+async def _summary_batch_token_budget(previous_summary: str) -> int:
+    configured = get_agent_context_window_tokens("plugin")
+    try:
+        candidates = await resolve_host_model_candidates(
+            get_agent_model("plugin"),
+            task="chat",
+        )
+    except Exception:
+        candidates = ()
+    window = min(
+        (candidate.context_window(configured) for candidate in candidates),
+        default=configured,
+    )
+    return max(
+        window
+        - _SUMMARY_OUTPUT_TOKENS
+        - _SUMMARY_REQUEST_OVERHEAD_TOKENS
+        - estimate_text_tokens(previous_summary),
+        0,
+    )
+
+
+async def _load_durable_history_summary_job(
+    fallback_job: _HistorySummaryJob,
+) -> _HistorySummaryJob | None:
+    state = _load_cumulative_summary(fallback_job.session_id)
+    try:
+        dialogs = await ChatInterChatHistory.get_dialogs_after(
+            fallback_job.session_id,
+            state.through_dialog_id,
+            _SUMMARY_DB_FETCH_LIMIT,
+        )
+    except Exception:
+        return None
+    if not dialogs:
+        return None
+    token_budget = await _summary_batch_token_budget(state.summary)
+    if token_budget <= 0:
+        return None
+    turns: list[_HistoryTurn] = []
+    used_tokens = 0
+    for dialog in dialogs:
+        messages = await _timeline_to_history_messages(
+            dialog,
+            group_id=(
+                str(dialog.group_id)
+                if getattr(dialog, "group_id", None) is not None
+                else None
+            ),
+        )
+        if not messages:
+            continue
+        turn = _HistoryTurn(
+            dialog_id=int(getattr(dialog, "id", 0) or 0),
+            messages=tuple(messages),
+            token_cost=sum(_message_token_cost(message) for message in messages),
+        )
+        if turns and used_tokens + turn.token_cost > token_budget:
+            break
+        if turn.token_cost > token_budget:
+            return None
+        turns.append(turn)
+        used_tokens += turn.token_cost
+    if not turns:
+        return None
+    return _HistorySummaryJob(
+        session_id=fallback_job.session_id,
+        previous_summary=state.summary,
+        turns=tuple(turns),
+        through_dialog_id=turns[-1].dialog_id,
+        epoch=fallback_job.epoch,
+    )
+
+
 def start_history_summary_job(session_id: str) -> asyncio.Task[None] | None:
     session_id = str(session_id or "")
     if not session_id:
@@ -617,7 +770,7 @@ def start_history_summary_job(session_id: str) -> asyncio.Task[None] | None:
         job is None
         or not _history_summary_job_is_ready(job)
         or not _history_summary_available(session_id)
-        or _history_foreground_requests > 0
+        or foreground_llm_active()
     ):
         return None
     if _summary_epochs.get(session_id) is not job.epoch:
@@ -637,8 +790,8 @@ async def _schedule_history_summary_job(session_id: str, epoch: object) -> None:
     try:
         await asyncio.sleep(_SUMMARY_IDLE_DELAY_SECONDS)
         while True:
-            if _history_foreground_requests > 0:
-                return
+            if foreground_llm_active():
+                await wait_for_foreground_llm_idle()
             active = _summary_active_request
             if active is None or active.done():
                 break
@@ -647,8 +800,8 @@ async def _schedule_history_summary_job(session_id: str, epoch: object) -> None:
             except asyncio.CancelledError:
                 if current_task is not None and current_task.cancelling():
                     raise
-        if _history_foreground_requests > 0:
-            return
+        if foreground_llm_active():
+            await wait_for_foreground_llm_idle()
         job = _summary_pending_jobs.get(session_id)
         if (
             job is None
@@ -658,6 +811,12 @@ async def _schedule_history_summary_job(session_id: str, epoch: object) -> None:
             or not _history_summary_available(session_id)
         ):
             return
+        durable_job = await _load_durable_history_summary_job(job)
+        if durable_job is None or not _history_summary_job_is_ready(durable_job):
+            return
+        if foreground_llm_active():
+            return
+        job = durable_job
         if _summary_schedule_tasks.get(session_id) is current_task:
             _summary_schedule_tasks.pop(session_id, None)
         if current_task is not None:
@@ -691,29 +850,23 @@ def cancel_history_summary_schedule(session_id: str) -> None:
 
 
 def history_foreground_arrived(session_id: str) -> None:
-    del session_id
-    for scheduled_session_id in tuple(_summary_schedule_tasks):
-        cancel_history_summary_schedule(scheduled_session_id)
+    cancel_history_summary_schedule(session_id)
 
 
 def schedule_pending_history_summary_jobs() -> None:
-    if _history_foreground_requests > 0:
+    if foreground_llm_active():
         return
     for session_id in tuple(_summary_pending_jobs):
         start_history_summary_job(session_id)
 
 
 def begin_history_foreground_request() -> None:
-    global _history_foreground_requests
-    _history_foreground_requests += 1
-    for session_id in tuple(_summary_schedule_tasks):
-        cancel_history_summary_schedule(session_id)
+    begin_foreground_llm_activity()
 
 
 def end_history_foreground_request() -> None:
-    global _history_foreground_requests
-    _history_foreground_requests = max(_history_foreground_requests - 1, 0)
-    if _history_foreground_requests > 0:
+    end_foreground_llm_activity()
+    if foreground_llm_active():
         return
     schedule_pending_history_summary_jobs()
 
@@ -768,6 +921,11 @@ async def _run_history_summary_job(job: _HistorySummaryJob) -> None:
         if saved:
             _clear_history_summary_failure(job.session_id)
             _rebase_pending_history_summary_job(job, updated_state)
+            await ChatInterChatHistory.prune_old_dialogs(
+                job.session_id,
+                get_chat_history_limit(),
+                through_dialog_id=updated_state.through_dialog_id,
+            )
         else:
             _record_history_summary_failure(job.session_id)
     except asyncio.CancelledError:
@@ -785,7 +943,7 @@ async def _run_history_summary_job(job: _HistorySummaryJob) -> None:
             _summary_active_request = None
         if (
             _summary_epochs.get(job.session_id) is job.epoch
-            and _history_foreground_requests == 0
+            and not foreground_llm_active()
         ):
             start_history_summary_job(job.session_id)
 
@@ -819,6 +977,12 @@ async def _timeline_to_history_messages(
     )
     legacy_assistant_history = not action_receipts and not any(
         str(item.get("kind", "") or "") == "fallback" for item in timeline
+    )
+    has_reaction_history = any(
+        str(item.get("role", "") or "") == "assistant"
+        and str(item.get("kind", "") or "") == "reaction_output"
+        and _timeline_assistant_history_enabled(item, legacy_default=False)
+        for item in timeline
     )
     user_contents: dict[int, str] = {}
     for index, item in enumerate(timeline):
@@ -857,8 +1021,9 @@ async def _timeline_to_history_messages(
         )
         if (
             role == "assistant"
-            and kind == "final_output"
+            and kind in {"final_output", "reaction_output"}
             and content
+            and not (has_reaction_history and kind == "final_output")
             and _timeline_assistant_history_enabled(
                 item,
                 legacy_default=legacy_assistant_history,
@@ -1022,7 +1187,6 @@ async def _summarize_history(
                 int(generation_config.max_tokens or _SUMMARY_OUTPUT_TOKENS),
                 _SUMMARY_OUTPUT_TOKENS,
             ),
-            "reasoning": ReasoningConfig(effort="NONE", show_thoughts=False),
         }
     )
     response = await ai.generate_internal(
@@ -1098,6 +1262,10 @@ def _load_cumulative_summary(session_id: str) -> _CumulativeHistorySummary:
             payload.get("staged_projection")
         ),
     )
+
+
+def get_durable_history_summary_cursor(session_id: str) -> int:
+    return _load_cumulative_summary(session_id).through_dialog_id
 
 
 def _save_cumulative_summary(state: _CumulativeHistorySummary) -> bool:
@@ -1299,7 +1467,7 @@ def migrate_history_policy_state(old_session_id: str, new_session_id: str) -> No
 
 
 async def shutdown_history_summary_tasks() -> None:
-    global _history_foreground_requests, _summary_active_request
+    global _summary_active_request
     session_ids = {
         *_summary_pending_jobs,
         *_summary_running_jobs,
@@ -1317,7 +1485,6 @@ async def shutdown_history_summary_tasks() -> None:
     _summary_schedule_tasks.clear()
     _summary_retired_tasks.clear()
     _summary_active_request = None
-    _history_foreground_requests = 0
 
 
 def _history_summary_available(session_id: str) -> bool:
@@ -1578,6 +1745,7 @@ __all__ = [
     "begin_history_foreground_request",
     "build_astr_history_payload",
     "end_history_foreground_request",
+    "get_durable_history_summary_cursor",
     "history_foreground_arrived",
     "schedule_pending_history_summary_jobs",
     "shutdown_history_summary_tasks",

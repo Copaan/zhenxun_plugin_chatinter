@@ -21,6 +21,7 @@ from typing import Any, cast
 import uuid
 from xml.sax.saxutils import escape
 
+from zhenxun.services.ai.core.exceptions import InvalidRequestException
 from zhenxun.services.ai.core.models import CancellationToken
 from zhenxun.services.ai.core.options import (
     ResponseFormat,
@@ -40,6 +41,7 @@ from ..config import (
     get_fallback_models,
     get_superuser_max_output_tokens,
 )
+from ..foreground_activity import foreground_llm_activity
 from ..host_llm import HostModelCandidate, resolve_host_model_candidates
 from ..llm_compat import (
     AI,
@@ -56,7 +58,7 @@ from ..provider_capability import (
     ProviderCapabilityAdapter,
     validate_tool_call_reasoning,
 )
-from ..provider_failover import request_with_failover
+from ..provider_failover import CandidatePromptNotFitError, request_with_failover
 from ..route_text import normalize_message_text, normalize_reply_text
 from ..token_compat import parse_usage_info, usage_reports_prompt_cache
 from ..web_access import (
@@ -67,20 +69,20 @@ from ..web_access import (
     tools_for_web_candidate,
 )
 from .approval_store import get_pending_approval
+from .compaction import (
+    compact_superuser_context,
+    summarize_with_candidates,
+)
 from .context import (
-    ContextCompressionResult,
-    build_semantic_compression_plan,
-    compact_messages,
-    compression_source_fingerprint,
     context_window_budget,
     estimate_agent_text_tokens,
     estimate_messages_tokens,
     estimate_prompt_tokens_with_baseline,
     is_context_summary,
-    protected_tail_token_budget,
     resolve_superuser_max_input_tokens,
     semantic_summary_json_schema,
     semantic_summary_output_tokens,
+    summary_request_output_tokens,
 )
 from .permission_policy import (
     get_default_permission_mode,
@@ -94,7 +96,6 @@ from .progress import AgentProgressReporter
 from .state import (
     AgentRunState,
     AgentRuntimeResult,
-    append_artifact_refs,
     is_runtime_control_message,
     repair_interrupted_tool_protocol,
     resolve_superuser_agent_run_budget,
@@ -122,7 +123,9 @@ from .trajectory import record_agent_trajectory
 
 _MAIN_STAGE = "main_request"
 _EMPTY_MODEL_REPLY = "Agent 未返回有效结果，请重试。"
-_MAX_CONSECUTIVE_COMPRESSION_FAILURES = 3
+_SEMANTIC_NATIVE_SCHEMA_BLOCK_SECONDS = 3600.0
+_SEMANTIC_NATIVE_SCHEMA_BLOCK_LIMIT = 128
+_semantic_native_schema_blocks: dict[str, float] = {}
 _ACTIVE_SESSION_EXECUTIONS: dict[str, asyncio.Task[Any]] = {}
 _SUPERUSER_AGENT_SYSTEM_PROMPT = "\n".join(
     (
@@ -325,7 +328,6 @@ class AgentRuntime:
         self._post_compression_request_pending = False
         self._web_citations: list[WebCitation] = []
         self._prompt_cache_keys: dict[tuple[str, str], str] = {}
-        self._last_compression_failure: dict[str, Any] = {}
         self._web_access_allowed = web_access_override is not False
         self._delegation_batches_succeeded = 0
         if "delegate_tasks" in state.tool_map:
@@ -689,15 +691,17 @@ class AgentRuntime:
         schema_chars, schema_tokens = await self._tool_schema_metrics(primary_tools)
         active_tool_schema_hash = await _tool_schema_hash(primary_tools)
         active_schema_tokens = schema_tokens
-        active_native_web_search_exposed = native_web_search_exposed(primary_tools)
-        primary_max_input_tokens = self._max_input_tokens()
-        output_reserve_tokens = _final_output_token_reserve(
+        primary_output_reserve_tokens = _final_output_token_reserve(
             self.generation_config,
             model_name=self._active_model_name or primary_model_name,
         )
+        active_output_reserve_tokens = primary_output_reserve_tokens
+        active_native_web_search_exposed = native_web_search_exposed(primary_tools)
+        primary_max_input_tokens = self._max_input_tokens()
         await self._compress_context_under_pressure(
             schema_tokens=schema_tokens,
-            output_reserve_tokens=output_reserve_tokens,
+            output_reserve_tokens=primary_output_reserve_tokens,
+            tools=tools,
         )
         self.state.append_model_request(
             selected_tool_count=len(primary_tools or {}),
@@ -707,6 +711,7 @@ class AgentRuntime:
 
         async def _do_request(model: str | None) -> LLMResponse:
             nonlocal active_native_web_search_exposed
+            nonlocal active_output_reserve_tokens
             nonlocal active_schema_tokens, active_tool_schema_hash
             candidate_name = model or primary_model_name
             self._active_model_name = candidate_name
@@ -739,6 +744,11 @@ class AgentRuntime:
             )
             self.provider_adapter = candidate_adapter
             candidate_max_input_tokens = self._max_input_tokens()
+            candidate_output_reserve_tokens = _final_output_token_reserve(
+                self.generation_config,
+                model_name=candidate_name,
+            )
+            active_output_reserve_tokens = candidate_output_reserve_tokens
             if (
                 normalize_message_text(str(candidate_name or ""))
                 != normalize_message_text(str(primary_model_name or ""))
@@ -746,16 +756,31 @@ class AgentRuntime:
             ):
                 await self._compress_context_under_pressure(
                     schema_tokens=candidate_schema_tokens,
-                    output_reserve_tokens=output_reserve_tokens,
-                    recheck=(candidate_max_input_tokens < primary_max_input_tokens),
+                    output_reserve_tokens=candidate_output_reserve_tokens,
+                    recheck=(
+                        candidate_max_input_tokens < primary_max_input_tokens
+                        or candidate_schema_tokens > schema_tokens
+                        or candidate_output_reserve_tokens
+                        > primary_output_reserve_tokens
+                    ),
+                    tools=tools,
                 )
 
             visible_messages = _model_visible_superuser_messages(self.state.messages)
+            candidate_budget = self._context_budget(
+                schema_tokens=candidate_schema_tokens,
+                output_reserve_tokens=candidate_output_reserve_tokens,
+            )
+            if candidate_budget.prompt_tokens >= candidate_budget.blocking_limit:
+                raise CandidatePromptNotFitError(
+                    "prompt does not fit the current candidate after compaction"
+                )
             request = candidate_adapter.prepare_model_request(
                 messages=visible_messages,
                 tools=candidate_tools,
                 tool_choice=candidate_tool_choice,
                 generation_config=self.generation_config,
+                reasoning_transport_policy="capability_gated",
             )
             prompt_cache_key = None
             profile = getattr(candidate_adapter, "profile", None)
@@ -790,20 +815,22 @@ class AgentRuntime:
             await self._compress_context_under_pressure(
                 force=True,
                 schema_tokens=active_schema_tokens,
-                output_reserve_tokens=output_reserve_tokens,
+                output_reserve_tokens=active_output_reserve_tokens,
+                tools=tools,
             )
 
-        request_task = asyncio.create_task(
-            request_with_failover(
-                primary_model=primary_model_name,
-                fallback_models=fallback_model_names,
-                request_fn=_do_request,
-                compress_fn=_compress_after_overflow,
-                trace_id=self.state.trace_id,
-                transient_retries=0,
+        async with foreground_llm_activity():
+            request_task = asyncio.create_task(
+                request_with_failover(
+                    primary_model=primary_model_name,
+                    fallback_models=fallback_model_names,
+                    request_fn=_do_request,
+                    compress_fn=_compress_after_overflow,
+                    trace_id=self.state.trace_id,
+                    transient_retries=0,
+                )
             )
-        )
-        outcome = await self._await_with_abort(request_task)
+            outcome = await self._await_with_abort(request_task)
         self._active_model_name = outcome.used_model or primary_model_name
         self._active_model_candidate = self._candidate_for_model(
             self._active_model_name
@@ -936,10 +963,11 @@ class AgentRuntime:
         *,
         model_name: str | None,
         tools: dict[str, ToolExecutable] | None,
+        namespace: str = "main",
     ) -> str:
         model_key = normalize_message_text(str(model_name or "default")).casefold()
         schema_hash = await _tool_schema_hash(tools)
-        cache_key = (model_key, schema_hash)
+        cache_key = (model_key, schema_hash, namespace)
         cache = getattr(self, "_prompt_cache_keys", None)
         if cache is None:
             cache = {}
@@ -955,6 +983,7 @@ class AgentRuntime:
             ),
             model_name=model_key,
             tool_schema_hash=schema_hash,
+            namespace=namespace,
         )
         cache[cache_key] = value
         return value
@@ -1271,6 +1300,7 @@ class AgentRuntime:
         native_search_exposed: bool = False,
         web_search_used: bool = False,
         web_citation_count: int = 0,
+        visible_messages: list[LLMMessage] | None = None,
     ) -> None:
         usage = parse_usage_info(getattr(response, "usage_info", None))
         cached_prompt_tokens = max(
@@ -1316,6 +1346,7 @@ class AgentRuntime:
             web_citation_count=web_citation_count,
             cache_phase=cache_phase,
             usage=usage,
+            visible_messages=visible_messages,
         )
         if update_context:
             self._awaiting_real_usage_after_compression = False
@@ -1444,6 +1475,7 @@ class AgentRuntime:
         recheck: bool = False,
         schema_tokens: int = 0,
         output_reserve_tokens: int = 0,
+        tools: dict[str, ToolExecutable] | None = None,
     ) -> None:
         budget = self._context_budget(
             schema_tokens=schema_tokens,
@@ -1457,251 +1489,238 @@ class AgentRuntime:
             return
         if not force and budget.prompt_tokens < budget.compact_threshold:
             return
-
-        allow_tool_prune = not getattr(self, "_tool_prune_attempted", False)
-        remaining_attempts = max(
-            _MAX_CONSECUTIVE_COMPRESSION_FAILURES
-            - self.state.compression_failure_count,
-            0,
+        hard_required = force or budget.prompt_tokens >= budget.blocking_limit
+        trigger = "provider_overflow" if force else "soft_pressure"
+        configured_window = get_agent_context_window_tokens("superuser")
+        summary_max_input_tokens = max(
+            (
+                candidate.context_window(configured_window)
+                for candidate in getattr(self, "_model_candidates", ())
+            ),
+            default=self._max_input_tokens(),
         )
-        self._last_compression_failure = {}
-        result = await compact_messages(
-            self.state.messages,
-            trace_id=self.state.trace_id,
+        execution = await compact_superuser_context(
+            self.state,
             max_input_tokens=self._max_input_tokens(),
-            summarize=self._summarize_context,
             schema_tokens=schema_tokens,
             output_reserve_tokens=output_reserve_tokens,
-            force=force,
-            blocked_source_fingerprint=self._blocked_compression_source(
-                tail_token_budget=protected_tail_token_budget(budget.blocking_limit)
-            ),
-            on_failure=self._record_semantic_compression_failure,
-            propagate_errors=(_AgentRunCancelled,),
-            max_attempts=min(2, remaining_attempts),
-            prune_tool_results=allow_tool_prune,
             prompt_tokens_before=budget.prompt_tokens,
+            summarize=self._summarize_context,
+            persist=lambda stage, metadata: self._persist_state(stage, **metadata),
+            visible_messages=_model_visible_superuser_messages,
+            trigger=trigger,
+            hard_required=hard_required,
+            prune_tool_results=not getattr(self, "_tool_prune_attempted", False),
+            summary_max_input_tokens=max(
+                summary_max_input_tokens,
+                self._max_input_tokens(),
+            ),
+            propagate_errors=(_AgentRunCancelled,),
         )
-        append_artifact_refs(self.state.artifact_refs, result.artifact_ids)
-        if allow_tool_prune:
-            self._tool_prune_attempted = True
-        if result.summarized_messages:
-            self._apply_semantic_compression_result(result, tighter=False)
-            post_compression_budget = self._context_budget(
-                schema_tokens=schema_tokens,
-                output_reserve_tokens=output_reserve_tokens,
-            )
-            if (
-                post_compression_budget.prompt_tokens
-                >= post_compression_budget.blocking_limit
-            ):
-                self._last_compression_failure = {}
-                tighter_result = await compact_messages(
-                    self.state.messages,
-                    trace_id=self.state.trace_id,
-                    max_input_tokens=self._max_input_tokens(),
-                    summarize=self._summarize_context,
-                    schema_tokens=schema_tokens,
-                    output_reserve_tokens=output_reserve_tokens,
-                    force=True,
-                    blocked_source_fingerprint=self._blocked_compression_source(
-                        tail_token_budget=protected_tail_token_budget(
-                            post_compression_budget.compact_threshold
-                        )
-                    ),
-                    on_failure=self._record_semantic_compression_failure,
-                    propagate_errors=(_AgentRunCancelled,),
-                    max_attempts=min(
-                        2,
-                        max(
-                            _MAX_CONSECUTIVE_COMPRESSION_FAILURES
-                            - self.state.compression_failure_count,
-                            0,
-                        ),
-                    ),
-                    prune_tool_results=False,
-                    prompt_tokens_before=post_compression_budget.prompt_tokens,
-                    tighter=True,
-                )
-                append_artifact_refs(
-                    self.state.artifact_refs,
-                    tighter_result.artifact_ids,
-                )
-                if tighter_result.summarized_messages:
-                    self._apply_semantic_compression_result(
-                        tighter_result,
-                        tighter=True,
-                    )
-                post_compression_budget = self._context_budget(
-                    schema_tokens=schema_tokens,
-                    output_reserve_tokens=output_reserve_tokens,
-                )
-                if (
-                    post_compression_budget.prompt_tokens
-                    >= post_compression_budget.blocking_limit
-                ):
-                    reason = _compression_block_reason(
-                        getattr(tighter_result, "failure_reason", "")
-                        or self._last_compression_failure.get("error", ""),
-                        default="post_compression_still_over_limit",
-                    )
-                    raise _ContextWindowBlocked(
-                        reason,
-                        metadata=_context_block_budget_metadata(
-                            post_compression_budget
-                        ),
-                    )
+        if execution.persistence_failed:
+            if hard_required:
+                raise _ContextWindowBlocked("compression_persistence_failed")
+            return
+        if hard_required and execution.result.artifact_persistence_failed:
+            raise _ContextWindowBlocked("artifact_persistence_failed")
+        if execution.installed:
+            if execution.result.pruned_tool_results:
+                self._tool_prune_attempted = True
             self._awaiting_real_usage_after_compression = True
             self._post_compression_request_pending = True
-            return
 
-        pruned_context = result.changed
-        if pruned_context:
-            self.state.messages = result.messages
-            self.state.budget.current_context_tokens = result.after_tokens
-            self.state.budget.last_usage_message_count = len(result.messages)
-            self.state.budget.last_usage_schema_tokens = 0
-            self.state.append_metric(
-                role="system",
-                kind="context_tool_results_pruned",
-                metadata={
-                    "step": self.state.step,
-                    "before_tokens": result.before_tokens,
-                    "after_tokens": result.after_tokens,
-                    "pruned_tool_results": result.pruned_tool_results,
-                    "artifact_ids": result.artifact_ids,
-                },
-            )
-            self._persist_state(
-                "context_tool_results_pruned",
-                before_tokens=result.before_tokens,
-                after_tokens=result.after_tokens,
-                pruned_tool_results=result.pruned_tool_results,
-                artifact_ids=result.artifact_ids,
+        if force and not execution.installed:
+            if await self._later_candidate_can_fit(
+                schema_tokens=schema_tokens,
+                output_reserve_tokens=output_reserve_tokens,
+                tools=tools,
+            ):
+                return
+            result = execution.result
+            raise _ContextWindowBlocked(
+                _compression_block_reason(
+                    getattr(result, "failure_reason", ""),
+                    default="provider_overflow_unresolved",
+                )
             )
 
-        budget = self._context_budget(
+        post_budget = self._context_budget(
             schema_tokens=schema_tokens,
             output_reserve_tokens=output_reserve_tokens,
         )
-        if (force and not pruned_context) or (
-            budget.prompt_tokens >= budget.blocking_limit
-        ):
-            default_reason = (
-                "provider_overflow_unresolved"
-                if force and not pruned_context
-                else "no_compressible_history"
-            )
+        if post_budget.prompt_tokens >= post_budget.blocking_limit:
+            if await self._later_candidate_can_fit(
+                schema_tokens=schema_tokens,
+                output_reserve_tokens=output_reserve_tokens,
+                tools=tools,
+            ):
+                return
+            result = execution.result
             reason = _compression_block_reason(
                 getattr(result, "failure_reason", "")
-                or self._last_compression_failure.get("error", ""),
-                default=default_reason,
+                or (
+                    "provider_overflow_unresolved"
+                    if force
+                    else "minimum_context_exceeds_target"
+                ),
+                default="minimum_context_exceeds_target",
             )
             raise _ContextWindowBlocked(
                 reason,
-                metadata=_context_block_budget_metadata(budget),
+                metadata=_context_block_budget_metadata(post_budget),
             )
 
-    def _apply_semantic_compression_result(
+    async def _later_candidate_can_fit(
         self,
-        result: ContextCompressionResult,
         *,
-        tighter: bool,
-    ) -> None:
-        self.state.messages = result.messages
-        self.state.budget.current_context_tokens = result.after_tokens
-        self.state.budget.last_usage_message_count = len(result.messages)
-        self.state.budget.last_usage_schema_tokens = 0
-        self.state.compression_failure_fingerprint = ""
-        self.state.compression_failure_count = 0
-        metadata = {
-            "step": self.state.step,
-            "before_tokens": result.before_tokens,
-            "after_tokens": result.after_tokens,
-            "summarized_messages": result.summarized_messages,
-            "pruned_tool_results": result.pruned_tool_results,
-            "protected_messages": result.protected_messages,
-            "summary_savings_tokens": result.summary_savings_tokens,
-            "summary_savings_ratio": result.summary_savings_ratio,
-            "low_savings": result.low_savings,
-            "summary_input_dropped_rounds": result.summary_input_dropped_rounds,
-            "artifact_ids": result.artifact_ids,
-            "tighter": tighter,
-        }
-        self.state.append_metric(
-            role="system",
-            kind="semantic_context_compression",
-            content=result.summary,
-            metadata=metadata,
+        schema_tokens: int,
+        output_reserve_tokens: int,
+        tools: dict[str, ToolExecutable] | None = None,
+    ) -> bool:
+        candidates = tuple(getattr(self, "_model_candidates", ()))
+        active_name = normalize_message_text(
+            str(getattr(self, "_active_model_name", None) or self.model_name or "")
         )
-        self._persist_state("semantic_context_compressed", **metadata)
-
-    def _blocked_compression_source(self, *, tail_token_budget: int) -> str:
-        plan = build_semantic_compression_plan(
-            self.state.messages,
-            tail_token_budget=tail_token_budget,
-        )
-        if (
-            plan is not None
-            and self.state.compression_failure_count
-            >= _MAX_CONSECUTIVE_COMPRESSION_FAILURES
-        ):
-            return compression_source_fingerprint(plan.source)
-        return ""
-
-    def _record_semantic_compression_failure(
-        self,
-        source_fingerprint: str,
-        metadata: dict[str, Any],
-    ) -> None:
-        self._last_compression_failure = dict(metadata)
-        self.state.compression_failure_fingerprint = source_fingerprint
-        self.state.compression_failure_count += 1
-        self.state.append_metric(
-            role="system",
-            kind="semantic_compression_failed",
-            metadata={
-                "step": self.state.step,
-                "compression_failure_count": self.state.compression_failure_count,
-                **metadata,
-            },
-        )
-        self._persist_state(
-            "semantic_compression_failed",
-            compression_failure_count=self.state.compression_failure_count,
-            **metadata,
-        )
-
-    async def _summarize_context(self, messages: list[LLMMessage]) -> str:
-        estimated_input_tokens = _estimate_prompt_tokens(messages)
-        response = await self._request_semantic_summary(messages)
-        if getattr(response, "tool_calls", None):
-            raise ValueError("semantic_summary_returned_tool_calls")
-        self._record_model_usage(
-            response,
-            estimated_input_tokens=estimated_input_tokens,
-            schema_tokens=0,
-            update_context=False,
-            request_kind="summary",
-            model_name=getattr(self, "_active_model_name", None) or self.model_name,
-            tool_schema_hash="",
-            request_message_count=len(messages),
-            request_generation_config=_semantic_summary_generation_config(
-                self._max_input_tokens()
+        active_index = next(
+            (
+                index
+                for index, candidate in enumerate(candidates)
+                if normalize_message_text(candidate.name) == active_name
             ),
+            -1,
         )
-        return str(response.text or "")
+        prompt_tokens = _estimate_prompt_tokens(
+            _model_visible_superuser_messages(self.state.messages)
+        )
+        configured_window = get_agent_context_window_tokens("superuser")
+        for candidate in candidates[active_index + 1 :]:
+            candidate_schema_tokens = schema_tokens
+            if tools is not None:
+                candidate_adapter = self._provider_adapter_for_model(candidate.name)
+                candidate_source_tools = (
+                    tools_for_web_candidate(
+                        tools,
+                        candidate=candidate,
+                        scope="superuser",
+                    )
+                    if getattr(self, "_web_access_allowed", False)
+                    else tools
+                )
+                candidate_tools = candidate_adapter.prepare_tool_map_for_request(
+                    candidate_source_tools
+                )
+                _, candidate_schema_tokens = await self._tool_schema_metrics(
+                    candidate_tools
+                )
+            candidate_output_reserve_tokens = (
+                _final_output_token_reserve(
+                    self.generation_config,
+                    model_name=candidate.name,
+                )
+                if tools is not None
+                else output_reserve_tokens
+            )
+            budget = context_window_budget(
+                max_input_tokens=candidate.context_window(configured_window),
+                prompt_tokens=prompt_tokens,
+                schema_tokens=candidate_schema_tokens,
+                output_reserve_tokens=candidate_output_reserve_tokens,
+            )
+            if budget.prompt_tokens < budget.blocking_limit:
+                return True
+        return False
+
+    async def _summarize_context(
+        self,
+        messages: list[LLMMessage],
+    ):
+        candidates = tuple(getattr(self, "_model_candidates", ()))
+        if not candidates:
+            max_input_tokens = self._max_input_tokens()
+            summary_token_target = summary_request_output_tokens(
+                messages,
+                max_input_tokens=max_input_tokens,
+            )
+            response = await self._request_semantic_summary(messages)
+            if getattr(response, "tool_calls", None):
+                raise ValueError("semantic_summary_returned_tool_calls")
+            self._record_summary_response_usage(
+                response,
+                messages=messages,
+                model_name=getattr(self, "_active_model_name", None) or self.model_name,
+                max_input_tokens=max_input_tokens,
+                summary_token_target=summary_token_target,
+            )
+            return str(response.text or "")
+        return await summarize_with_candidates(
+            messages,
+            candidates=candidates,
+            preferred_name=(
+                getattr(self, "_active_model_name", None) or self.model_name
+            ),
+            configured_context_tokens=get_agent_context_window_tokens("superuser"),
+            invoke=self._invoke_summary_candidate,
+            propagate_errors=(_AgentRunCancelled,),
+        )
+
+    async def _invoke_summary_candidate(
+        self,
+        candidate: HostModelCandidate | None,
+        messages: list[LLMMessage],
+        max_input_tokens: int,
+        summary_token_target: int,
+    ) -> LLMResponse:
+        candidate_name = candidate.name if candidate is not None else (
+            getattr(self, "_active_model_name", None) or self.model_name
+        )
+        response = await self._request_summary_transport(
+            candidate,
+            messages,
+            max_input_tokens=max_input_tokens,
+            summary_token_target=summary_token_target,
+        )
+        self._record_summary_response_usage(
+            response,
+            messages=messages,
+            model_name=candidate_name,
+            max_input_tokens=max_input_tokens,
+            summary_token_target=summary_token_target,
+        )
+        return response
 
     async def _request_semantic_summary(
         self,
         messages: list[LLMMessage],
     ) -> LLMResponse:
-        candidate_name = getattr(self, "_active_model_name", None) or self.model_name
-        candidate = self._candidate_for_model(candidate_name)
+        max_input_tokens = self._max_input_tokens()
+        return await self._request_summary_transport(
+            self._candidate_for_model(
+                getattr(self, "_active_model_name", None) or self.model_name
+            ),
+            messages,
+            max_input_tokens=max_input_tokens,
+            summary_token_target=summary_request_output_tokens(
+                messages,
+                max_input_tokens=max_input_tokens,
+            ),
+        )
+
+    async def _request_summary_transport(
+        self,
+        candidate: HostModelCandidate | None,
+        messages: list[LLMMessage],
+        *,
+        max_input_tokens: int,
+        summary_token_target: int,
+    ) -> LLMResponse:
+        candidate_name = candidate.name if candidate is not None else (
+            getattr(self, "_active_model_name", None) or self.model_name
+        )
         cancellation_token = CancellationToken()
         prompt_cache_key = await self._prompt_cache_key_for_candidate(
             model_name=candidate_name,
             tools={},
+            namespace="summary",
         )
 
         async def _invoke() -> LLMResponse:
@@ -1712,9 +1731,10 @@ class AgentRuntime:
                     messages=messages,
                     model_name=candidate_name,
                     candidate=candidate,
-                    max_input_tokens=self._max_input_tokens(),
+                    max_input_tokens=max_input_tokens,
                     timeout=self.timeout,
                     prompt_cache_key=prompt_cache_key,
+                    summary_token_target=summary_token_target,
                     cancellation_token=cancellation_token,
                 )
             except asyncio.CancelledError:
@@ -1726,6 +1746,35 @@ class AgentRuntime:
 
         request_task = asyncio.create_task(_invoke())
         return await self._await_with_abort(request_task)
+
+    def _record_summary_response_usage(
+        self,
+        response: LLMResponse,
+        *,
+        messages: list[LLMMessage],
+        model_name: str | None,
+        max_input_tokens: int,
+        summary_token_target: int,
+    ) -> None:
+        self._record_model_usage(
+            response,
+            estimated_input_tokens=_estimate_prompt_tokens(messages),
+            schema_tokens=0,
+            update_context=False,
+            request_kind="summary",
+            model_name=model_name,
+            tool_schema_hash="",
+            request_message_count=len(messages),
+            request_generation_config=_semantic_summary_generation_config(
+                max_input_tokens,
+                summary_token_target=summary_token_target,
+                native_structured_output=(
+                    getattr(response, "chatinter_summary_strategy", "native")
+                    == "native"
+                ),
+            ),
+            visible_messages=messages,
+        )
 
     def _context_budget(
         self,
@@ -1839,34 +1888,12 @@ def _compression_block_reason(value: Any, *, default: str) -> str:
     text = str(value or "").strip().casefold()
     stable_reasons = {
         "artifact_persistence_failed",
-        "compressed_prompt_over_target",
-        "compression_attempts_exhausted",
-        "compression_circuit_open",
-        "ineffective_semantic_summary",
-        "invalid_structured_summary",
-        "no_compressible_history",
-        "post_compression_still_over_limit",
-        "protected_context_exceeds_target",
+        "compression_persistence_failed",
+        "minimum_context_exceeds_target",
         "provider_overflow_unresolved",
-        "summary_repair_request_too_large",
-        "summary_request_failed",
-        "summary_request_too_large",
     }
     if text in stable_reasons:
         return text
-    if any(
-        marker in text
-        for marker in (
-            "connection",
-            "rate limit",
-            "timeout",
-            "timed out",
-            "upstream",
-        )
-    ):
-        return "summary_provider_failed"
-    if text:
-        return "summary_generation_failed"
     return default
 
 
@@ -1883,35 +1910,14 @@ def _context_block_budget_metadata(budget: Any) -> dict[str, int]:
 
 
 def _context_window_blocked_reply(reason: str) -> str:
-    if reason in {"summary_provider_failed", "summary_request_failed"}:
-        return "自动压缩暂时失败，原上下文已保留。请稍后重新发送当前任务。"
-    if reason == "artifact_persistence_failed":
-        return "自动压缩因上下文存储失败而停止，原上下文已保留。请检查存储状态后重试。"
-    if reason in {
-        "compression_attempts_exhausted",
-        "invalid_structured_summary",
-        "summary_generation_failed",
-        "summary_repair_request_too_large",
-        "summary_request_too_large",
-    }:
+    if reason in {"artifact_persistence_failed", "compression_persistence_failed"}:
         return (
-            "自动压缩未能生成有效摘要，原上下文已保留。"
-            "请稍后重试；若持续失败，请新增会话。"
-        )
-    if reason == "compression_circuit_open":
-        return "自动压缩连续失败已暂停，原上下文已保留。请新增会话后继续任务。"
-    if reason in {
-        "compressed_prompt_over_target",
-        "post_compression_still_over_limit",
-        "protected_context_exceeds_target",
-    }:
-        return (
-            "自动压缩已完成，但必须保留的当前上下文仍超过模型窗口。"
-            "请新增会话后继续任务。"
+            "Agent 上下文无法安全写入存储，压缩结果未安装。"
+            "请检查 ChatInter 数据目录的可写性和剩余空间。"
         )
     return (
-        "当前会话已没有可安全压缩的旧内容，原上下文已保留。"
-        "请新增会话后重新发送任务，或确认无需保留后使用 /清除上下文。"
+        "固定系统上下文、工具定义和归档后的当前请求仍超过所有候选模型窗口。"
+        "请缩短本次输入或配置更大上下文窗口的模型。"
     )
 
 
@@ -2721,44 +2727,121 @@ async def request_superuser_semantic_summary(
     max_input_tokens: int,
     timeout: float,
     prompt_cache_key: str,
+    summary_token_target: int | None = None,
     cancellation_token: CancellationToken | None = None,
 ) -> LLMResponse:
-    generation_config = _semantic_summary_generation_config(max_input_tokens)
     adapter = _adapter_for_candidate(model_name, candidate)
-    prepared = adapter.prepare_model_request(
-        messages=messages,
-        tools=None,
-        tool_choice=None,
-        generation_config=generation_config,
-    )
     profile = getattr(adapter, "profile", None)
     cache_key = (
         prompt_cache_key
         if bool(getattr(profile, "supports_prompt_cache_key", False))
         else None
     )
-    return await ai.generate_internal(
-        prepared.messages,
-        model=model_name,
-        config=prepared.generation_config,
-        tools=None,
-        tool_choice=None,
-        timeout=timeout,
-        prompt_cache_key=cache_key,
-        cancellation_token=cancellation_token,
+
+    async def generate(*, native_structured_output: bool) -> LLMResponse:
+        generation_config = _semantic_summary_generation_config(
+            max_input_tokens,
+            summary_token_target=summary_token_target,
+            native_structured_output=native_structured_output,
+        )
+        prepared = adapter.prepare_model_request(
+            messages=messages,
+            tools=None,
+            tool_choice=None,
+            generation_config=generation_config,
+            reasoning_transport_policy="capability_gated",
+        )
+        async with foreground_llm_activity():
+            return await ai.generate_internal(
+                prepared.messages,
+                model=model_name,
+                config=prepared.generation_config,
+                tools=None,
+                tool_choice=None,
+                timeout=timeout,
+                prompt_cache_key=cache_key,
+                cancellation_token=cancellation_token,
+            )
+
+    protocol_scope = _semantic_summary_protocol_scope(model_name, candidate)
+    blocked_until = _semantic_native_schema_blocks.get(protocol_scope, 0.0)
+    if blocked_until > time.monotonic():
+        response = await generate(native_structured_output=False)
+        setattr(response, "chatinter_summary_strategy", "prompt_json")
+        return response
+    _semantic_native_schema_blocks.pop(protocol_scope, None)
+    try:
+        response = await generate(native_structured_output=True)
+        setattr(response, "chatinter_summary_strategy", "native")
+        return response
+    except InvalidRequestException as exc:
+        if not _structured_output_is_unsupported(exc):
+            raise
+    _semantic_native_schema_blocks[protocol_scope] = (
+        time.monotonic() + _SEMANTIC_NATIVE_SCHEMA_BLOCK_SECONDS
     )
+    while len(_semantic_native_schema_blocks) > _SEMANTIC_NATIVE_SCHEMA_BLOCK_LIMIT:
+        _semantic_native_schema_blocks.pop(next(iter(_semantic_native_schema_blocks)))
+    response = await generate(native_structured_output=False)
+    setattr(response, "chatinter_summary_strategy", "prompt_json")
+    return response
 
 
-def _semantic_summary_generation_config(max_input_tokens: int) -> Any:
+def _semantic_summary_generation_config(
+    max_input_tokens: int,
+    *,
+    summary_token_target: int | None = None,
+    native_structured_output: bool = True,
+) -> Any:
+    output_tokens = semantic_summary_output_tokens(max_input_tokens)
+    if summary_token_target is not None:
+        output_tokens = min(output_tokens, max(int(summary_token_target or 0), 1))
     config = build_agent_generation_config(
         "superuser",
-        max_output_tokens=semantic_summary_output_tokens(max_input_tokens),
+        max_output_tokens=output_tokens,
     )
-    config.response_format = ResponseFormat.JSON
-    config.response_schema = semantic_summary_json_schema()
-    config.response_mime_type = "application/json"
-    config.structured_output_strategy = StructuredOutputStrategy.NATIVE
+    if native_structured_output:
+        config.response_format = ResponseFormat.JSON
+        config.response_schema = semantic_summary_json_schema()
+        config.response_mime_type = "application/json"
+        config.structured_output_strategy = StructuredOutputStrategy.NATIVE
     return config
+
+
+def _structured_output_is_unsupported(exc: InvalidRequestException) -> bool:
+    details = getattr(exc, "details", None)
+    text = " ".join(
+        (
+            str(getattr(exc, "message", "") or ""),
+            json.dumps(details, ensure_ascii=True, default=str)
+            if isinstance(details, dict)
+            else str(details or ""),
+        )
+    ).casefold()
+    mentions_format = any(
+        marker in text
+        for marker in ("response_format", "json_schema", "structured output")
+    )
+    unavailable = any(
+        marker in text
+        for marker in (
+            "unavailable",
+            "unsupported",
+            "not support",
+            "not available",
+        )
+    )
+    return mentions_format and unavailable
+
+
+def _semantic_summary_protocol_scope(
+    model_name: str | None,
+    candidate: HostModelCandidate | None,
+) -> str:
+    return _short_hash(
+        f"{normalize_message_text(str(model_name or '')).casefold()}\x00"
+        f"{str(getattr(candidate, 'api_type', '') or '').casefold()}"
+    )
 
 
 async def _superuser_prompt_cache_key(
@@ -2766,12 +2849,14 @@ async def _superuser_prompt_cache_key(
     run_id: str,
     model_name: str = "",
     tool_schema_hash: str = "",
+    namespace: str = "main",
 ) -> str:
     payload = json.dumps(
         {
             "model": normalize_message_text(model_name).casefold(),
             "run_id": str(run_id or "global"),
             "schema": normalize_message_text(tool_schema_hash),
+            "namespace": normalize_message_text(namespace).casefold(),
         },
         ensure_ascii=True,
         separators=(",", ":"),

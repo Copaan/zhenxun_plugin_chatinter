@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
+import re
 from typing import Literal
 
 from .llm_compat import ToolResult
@@ -55,6 +55,12 @@ def classify_plugin_result(result: ToolResult) -> PluginOutcome:
         )
     if missing:
         return PluginOutcome("not_executed", reason="missing_input")
+
+    failure_stage = normalize_message_text(
+        str(output.get("failure_stage", "") or "")
+    ).casefold()
+    if failure_stage == "native_reroute":
+        return PluginOutcome("not_executed", reason="native_reroute")
 
     if output.get("plugin_execution") is False:
         return PluginOutcome("not_executed", reason=status or "not_executed")
@@ -173,6 +179,8 @@ def plugin_failure_layer(
         "unavailable_in_context",
     }:
         return "selection"
+    if "native_reroute" in reasons:
+        return "execution"
     return "execution"
 
 

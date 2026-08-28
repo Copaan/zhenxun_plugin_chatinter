@@ -129,7 +129,11 @@ class TurnQueue:
         dropped_turn: QueuedTurn | None = None
         rejected_turn: QueuedTurn | None = None
         try:
-            if not allow_handled_event and is_already_handled(event):
+            handled_session_key = conversation_session_key(session)
+            if not allow_handled_event and is_already_handled(
+                event,
+                session_key=handled_session_key,
+            ):
                 logger.debug("ChatInter TurnQueue 跳过重复消息")
                 return False
 
@@ -189,7 +193,7 @@ class TurnQueue:
                     if dropped_turn is not None:
                         _rollback_turn_group_context(dropped_turn)
                     if mark_event_handled:
-                        mark_as_handled(event)
+                        mark_as_handled(event, session_key=handled_session_key)
                     state.wake_event.set()
                     try:
                         self._ensure_worker_locked(
@@ -565,7 +569,7 @@ def _rollback_turn_group_context(turn: QueuedTurn) -> None:
 async def _notify_turn_terminal(turn: QueuedTurn, *, reason: str) -> None:
     text = _QUEUE_REPLACED_MESSAGE if reason == "replaced" else _QUEUE_REJECTED_MESSAGE
     for item in turn.messages:
-        mark_as_handled(item.event)
+        mark_as_handled(item.event, session_key=item.conversation_key)
         set_event_signal(item.event, "_chatinter_queue_terminal", reason)
         try:
             await item.bot.send(item.event, text)

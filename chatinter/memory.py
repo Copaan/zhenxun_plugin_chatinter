@@ -46,6 +46,7 @@ from .llm_compat import LLMMessage
 from .memory_recall_context import MemoryRecallContext
 from .models.chat_history import ChatInterChatHistory
 from .prompt_text import build_chat_base_prompt, build_global_attitude_prompt
+from .reaction_models import RecentReactionFact
 from .utils.cache import get_user_impression_with_cache
 from .utils.multimodal import MAX_CHAT_IMAGE_PARTS
 from .utils.unimsg_utils import (
@@ -103,6 +104,29 @@ _MEMORY_REWRITE_FOLLOWUP_MARKERS = (
     "然后呢",
     "知道吗",
 )
+
+
+def _render_recent_reactions_context(
+    facts: tuple[RecentReactionFact, ...],
+) -> tuple[str, ...]:
+    if not facts:
+        return ()
+    lines = ["<recent_reactions>"]
+    for fact in facts:
+        attributes = [
+            f'turns_ago="{max(int(fact.turns_ago), 1)}"',
+            f'id="{_xml_escape(fact.reaction_id, quote=True)}"',
+            f'mode="{_xml_escape(fact.mode, quote=True)}"',
+        ]
+        if fact.category:
+            attributes.append(f'category="{_xml_escape(fact.category, quote=True)}"')
+        if fact.search_intent:
+            attributes.append(f'intent="{_xml_escape(fact.search_intent, quote=True)}"')
+        lines.append(f"<reaction {' '.join(attributes)}/>")
+    lines.append("</recent_reactions>")
+    return tuple(lines)
+
+
 _CONTEXT_TOTAL_TOKEN_BUDGET = 3000
 _FORWARD_PLACEHOLDER_PATTERN = re.compile(
     r"^(?:[\(\[]?[^\]:\)]*[\)\]]?\s*:\s*)?"
@@ -666,6 +690,7 @@ class ChatMemory:
         legacy_session_id: str | None = None,
         reply_context: "ReplyContext | None" = None,
         context_sections_out: list[ChatContextSection] | None = None,
+        recent_reactions_out: list[RecentReactionFact] | None = None,
     ) -> tuple[str, str, list[Image], list[LLMMessage]]:
         """构建完整的上下文（System + Context + Current + History Messages）
 
@@ -749,6 +774,16 @@ class ChatMemory:
             chatroom_limit=history_limit,
         )
         history_messages = list(history_payload.messages)
+        recent_reactions = tuple(getattr(history_payload, "recent_reactions", ()) or ())
+        if recent_reactions_out is not None:
+            recent_reactions_out.clear()
+            recent_reactions_out.extend(recent_reactions)
+        if inject_chat_memory and recent_reactions:
+            self._append_context_section(
+                context_sections,
+                "recent_reactions",
+                _render_recent_reactions_context(recent_reactions),
+            )
         chatroom_context_lines: list[str] = []
         append_chatroom_history_context(
             chatroom_context_lines,

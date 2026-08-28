@@ -622,6 +622,10 @@ def invoke_prefix_variants(text: str) -> tuple[str, ...]:
 
 
 def _invoke_prefixes() -> tuple[str, ...]:
+    return (*_configured_bot_names(), *_GENERIC_INVOKE_PREFIXES)
+
+
+def _configured_bot_names() -> tuple[str, ...]:
     names: set[str] = set()
     try:
         import nonebot
@@ -642,8 +646,34 @@ def _invoke_prefixes() -> tuple[str, ...]:
             names.add(self_nickname)
     except (RuntimeError, ValueError):
         pass
-    configured_prefixes = tuple(sorted(names, key=lambda item: (-len(item), item)))
-    return (*configured_prefixes, *_GENERIC_INVOKE_PREFIXES)
+    return tuple(sorted(names, key=lambda item: (-len(item), item)))
+
+
+def strip_bot_name_prefix(text: str) -> str:
+    """Remove configured bot names without consuming semantic request words."""
+
+    stripped = normalize_message_text(text)
+    while stripped:
+        matched = next(
+            (
+                name
+                for name in _configured_bot_names()
+                if stripped.casefold().startswith(name.casefold())
+                and not (
+                    name[-1:].isascii()
+                    and name[-1:].isalnum()
+                    and len(stripped) > len(name)
+                    and stripped[len(name)].isascii()
+                    and stripped[len(name)].isalnum()
+                )
+            ),
+            None,
+        )
+        if matched is None:
+            break
+        stripped = normalize_message_text(stripped[len(matched) :])
+        stripped = stripped.lstrip(" ,，.。!！?？:：;；、")
+    return stripped
 
 
 def strip_invoke_prefix(text: str) -> str:

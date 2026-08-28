@@ -12,7 +12,6 @@ def build_dialogue_state_prompt(
         return ""
     _ = current_message_text
     parts: list[str] = []
-    # 话题延续提示
     if state.continuity in {"same_topic", "followup"}:
         topic_hint = normalize_message_text(state.topic_hint)[:60]
         if topic_hint:

@@ -10,6 +10,7 @@ import re
 from typing import Any
 import unicodedata
 
+from .candidate_exposure import CandidateExposureKey, CandidateExposureLedger
 from .command_index import CommandCandidate, _schema_from_tool_snapshot
 from .llm_compat import ToolDefinition, ToolExecutable, ToolResult
 from .models.pydantic_models import CommandToolSnapshot, PluginKnowledgeBase
@@ -17,10 +18,14 @@ from .native_command_tools import NativeCommandToolBinding
 from .native_executor import NativeCommandExecutionContext
 from .plugin_skill_index import PluginSkill
 from .route_text import normalize_message_text
+from .sparse_retrieval import fuse_sparse_rankings, normalize_retrieval_queries
 from .task_frame import (
     PAYLOAD_HINT_FIELD,
     TARGET_HINT_FIELD,
     TARGET_REF_FIELD,
+    TARGET_REF_SCHEMA_DESCRIPTION,
+    TARGET_REFS_FIELD,
+    TARGET_REFS_SCHEMA_DESCRIPTION,
     TASK_TEXT_FIELD,
 )
 from .token_compat import estimate_text_tokens
@@ -34,28 +39,21 @@ _ALIASES_TEXT_LIMIT = 480
 _PRECAUTIONS_TEXT_LIMIT = 720
 _CAPABILITY_VALUES_TEXT_LIMIT = 360
 _SEMANTIC_CONTRACTS_TEXT_LIMIT = 1600
-_TASK_MODE_FIELD = "task_mode"
-_TASK_MODES = {"action", "query", "help"}
-# 词法零召回后由 embedding 通道收窄的候选上限；再由既有 token/字符预算裁剪。
-_VECTOR_RECALL_TOP_N = 8
+_RETRIEVAL_QUERIES_FIELD = "retrieval_queries"
 
 
 @dataclass(frozen=True)
 class _SelectionPlan:
-    """`_selection_result` 的中间结果：候选集合与降级标记。
-
-    拆出这一层是为了让同步渲染路径与 async 向量通道路径共享同一份候选计算，
-    从而不必把 `CommandToolRetriever.retrieve` 改成 async。
-    """
-
     snapshots: list[CommandToolSnapshot]
     reason: str
     full_listing_fallback: bool
     recall: str = ""
+    query_count: int = 0
 
 
 class PluginSkillDispatchTool:
     chatinter_plugin_tool_kind = "skill_dispatch"
+    chatinter_ignore_unknown_top_level_arguments = True
 
     def __init__(
         self,
@@ -66,12 +64,16 @@ class PluginSkillDispatchTool:
         knowledge_base: PluginKnowledgeBase,
         session_id: str | None,
         command_context: NativeCommandExecutionContext,
-        task_modes: dict[str, str] | None = None,
+        exposure_ledger: CandidateExposureLedger | None = None,
+        revision: str = "",
         ambiguity_token_budget: int | None = None,
         result_char_budget: int | None = None,
+        tool_name: str | None = None,
     ) -> None:
         self.skill = skill
-        self.name = skill_dispatch_tool_name(skill.plugin_module)
+        self.name = normalize_message_text(tool_name or "") or skill_dispatch_tool_name(
+            skill.plugin_module
+        )
         self._skill_command_keys = frozenset(
             _command_key(command_id) for command_id in skill.command_ids
         )
@@ -100,7 +102,12 @@ class PluginSkillDispatchTool:
         self._result_char_budget = (
             max(int(result_char_budget), 1) if result_char_budget is not None else None
         )
-        self._task_modes = task_modes if task_modes is not None else {}
+        self._exposure_ledger = exposure_ledger or CandidateExposureLedger()
+        self._exposure_key = CandidateExposureKey.build(
+            source="local",
+            skill=skill.skill_id,
+            revision=revision,
+        )
         self._retriever = CommandToolRetriever(
             _plugin_knowledge_base(skill, knowledge_base),
             session_id=session_id,
@@ -119,13 +126,13 @@ class PluginSkillDispatchTool:
                         "minLength": 1,
                         "description": "当前工具调用对应的用户原话或任务片段",
                     },
-                    _TASK_MODE_FIELD: {
-                        "type": "string",
-                        "enum": ["action", "query", "help"],
+                    _RETRIEVAL_QUERIES_FIELD: {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1, "maxLength": 256},
+                        "maxItems": 6,
                         "description": (
-                            "用户原始目标：action=执行、生成、发送或变换；"
-                            "query=查询状态、记录或搜索内容；help=查看能力、列表或用法。"
-                            "不得根据候选工具改变原始目标"
+                            "可选的本插件内检索改写。填写保持用户原意的能力名、"
+                            "操作名或领域表达；仅用于查找候选，不会作为命令执行"
                         ),
                     },
                     "command_id": {
@@ -137,11 +144,15 @@ class PluginSkillDispatchTool:
                     },
                     TARGET_REF_FIELD: {
                         "type": ["string", "null"],
-                        "description": (
-                            "可选的受限操作目标。仅在当前请求明确承接对话关系时，"
-                            "填写 <relevant_people> 中已有的 target_ref；"
-                            "不得填写昵称或用户 ID，否则填写 null"
-                        ),
+                        "description": TARGET_REF_SCHEMA_DESCRIPTION,
+                    },
+                    TARGET_REFS_FIELD: {
+                        "type": ["array", "null"],
+                        "items": {"type": "string", "minLength": 1},
+                        "minItems": 2,
+                        "maxItems": 4,
+                        "uniqueItems": True,
+                        "description": TARGET_REFS_SCHEMA_DESCRIPTION,
                     },
                     "slots": {
                         "type": "object",
@@ -149,7 +160,7 @@ class PluginSkillDispatchTool:
                         "additionalProperties": True,
                     },
                 },
-                "required": [TASK_TEXT_FIELD, _TASK_MODE_FIELD],
+                "required": [TASK_TEXT_FIELD],
                 "additionalProperties": False,
             },
         )
@@ -163,79 +174,36 @@ class PluginSkillDispatchTool:
                 error="task_text 不能为空",
                 reason="missing_task_text",
             )
-        task_mode_requested = normalize_message_text(
-            str(kwargs.get(_TASK_MODE_FIELD, "") or "")
-        ).casefold()
-        task_mode = self._task_mode(task_text, task_mode_requested)
-        if task_mode is None:
-            return self._not_executed(
-                "invalid_tool_arguments",
-                error="task_mode 必须是 action、query 或 help",
-                reason="invalid_task_mode",
-            )
-        if (
-            task_mode_requested in _TASK_MODES
-            and task_mode
-            and task_mode_requested != task_mode
-        ):
-            # 同一 task_text 的 task_mode 以首次声明为准（用户原始目标不变）；
-            # 换 mode 属于迁就候选的改写，按原 mode 返回候选并转普通聊天。
-            return self._selection_result(
-                task_text=task_text,
-                task_mode=task_mode,
-                reason="task_mode_mismatch",
-                response_policy="chat_without_clarification",
-            )
-
         command_id = normalize_message_text(str(kwargs.get("command_id", "") or ""))
-        # 防御模型把 JSON null 序列化成字符串字面量（如 "null"/"None"）而不是真正
-        # 的 JSON null：这类字面量应视为“未提供 command_id”，走 selection 分支
-        # 由 Skill 内部检索，而不是被当成真实 command_id 去查找并误判为越权命令。
+        # JSON null 的常见字符串形式等同于未提供 command_id，由 Skill 负责检索。
         if command_id.casefold() in {"null", "none", "nil", "undefined", ""}:
             command_id = ""
         if command_id:
             return await self._dispatch_command(
                 command_id=command_id,
                 task_text=task_text,
-                task_mode=task_mode,
                 kwargs=kwargs,
             )
 
-        return await self._selection_result_with_vector(
+        return self._selection_result(
             task_text=task_text,
-            task_mode=task_mode,
+            retrieval_queries=kwargs.get(_RETRIEVAL_QUERIES_FIELD),
+            defer_candidate_exposure=bool(kwargs.get("_defer_candidate_exposure")),
         )
-
-    def _task_mode(self, task_text: str, requested: str) -> str | None:
-        key = normalize_message_text(task_text).casefold()
-        existing = self._task_modes.get(key)
-        mode = requested.casefold()
-        if mode in _TASK_MODES:
-            # 首次声明的 mode 是该任务的用户原始目标，之后保持粘性。
-            if existing and existing != mode:
-                return existing
-            self._task_modes[key] = mode
-            return mode
-        # 无合法显式值时复用缓存
-        if existing:
-            return existing
-        if not mode:
-            return ""
-        return None
 
     def _selection_result(
         self,
         *,
         task_text: str,
-        task_mode: str = "",
+        retrieval_queries: object = None,
         requested_command_id: str = "",
         reason: str = "",
         response_policy: str = "",
-        _max_candidates: int | None = None,
+        defer_candidate_exposure: bool = False,
     ) -> ToolResult:
         prepared = self._prepare_selection(
             task_text=task_text,
-            task_mode=task_mode,
+            retrieval_queries=retrieval_queries,
             requested_command_id=requested_command_id,
             reason=reason,
         )
@@ -245,140 +213,65 @@ class PluginSkillDispatchTool:
             prepared,
             requested_command_id=requested_command_id,
             response_policy=response_policy,
-            _max_candidates=_max_candidates,
+            defer_candidate_exposure=defer_candidate_exposure,
         )
-
-    async def _selection_result_with_vector(
-        self,
-        *,
-        task_text: str,
-        task_mode: str = "",
-        requested_command_id: str = "",
-        reason: str = "",
-        response_policy: str = "",
-        _max_candidates: int | None = None,
-    ) -> ToolResult:
-        """零词法召回时先走 embedding 第二通道，再渲染候选卡。
-
-        向量通道不可用/未命中阈值时，行为与同步 ``_selection_result`` 完全一致
-        （全量降级列表 + ``recall=skill_full_listing``）。
-        """
-
-        prepared = self._prepare_selection(
-            task_text=task_text,
-            task_mode=task_mode,
-            requested_command_id=requested_command_id,
-            reason=reason,
-        )
-        if isinstance(prepared, ToolResult):
-            return prepared
-        if prepared.full_listing_fallback:
-            ranked = await self._vector_ranked_snapshots(task_text, prepared.snapshots)
-            if ranked:
-                prepared = _SelectionPlan(
-                    snapshots=ranked,
-                    reason=prepared.reason,
-                    full_listing_fallback=True,
-                    recall="skill_vector",
-                )
-        return self._render_selection(
-            prepared,
-            requested_command_id=requested_command_id,
-            response_policy=response_policy,
-            _max_candidates=_max_candidates,
-        )
-
-    async def _vector_ranked_snapshots(
-        self,
-        task_text: str,
-        snapshots: Sequence[CommandToolSnapshot],
-    ) -> list[CommandToolSnapshot]:
-        try:
-            from .command_vector_recall import CommandVectorRecall
-
-            ranked = await CommandVectorRecall.rank(
-                self.skill.plugin_module,
-                snapshots,
-                task_text,
-                limit=_VECTOR_RECALL_TOP_N,
-            )
-        except Exception:
-            return []
-        if not ranked:
-            return []
-        by_id = {
-            str(snapshot.command_id): snapshot
-            for snapshot in snapshots
-            if snapshot.command_id
-        }
-        ordered: list[CommandToolSnapshot] = []
-        for command_id, _score in ranked:
-            snapshot = by_id.get(command_id)
-            if snapshot is not None:
-                ordered.append(snapshot)
-        return ordered
 
     def _prepare_selection(
         self,
         *,
         task_text: str,
-        task_mode: str,
+        retrieval_queries: object,
         requested_command_id: str,
         reason: str,
     ) -> _SelectionPlan | ToolResult:
-        requested = self._requested_identity_snapshots(requested_command_id)
-        retrieval = self._retriever.retrieve(
-            task_text,
-            limit=None,
-            context=self._skill_retrieval_context(),
+        query_rewrites = list(
+            retrieval_queries
+            if isinstance(retrieval_queries, list | tuple)
+            else ()
         )
-        direct = self._retrieved_snapshots(retrieval.candidates)
-        family = self._action_family_snapshots(task_text)
-        contextual = self._contextual_snapshots()
-        all_snapshots = _merge_snapshot_sources(
-            requested,
-            family,
-            direct,
-            contextual,
-        )
-        if task_mode:
-            snapshots = [
-                snapshot
-                for snapshot in all_snapshots
-                if _snapshot_task_mode(snapshot) == task_mode
-            ]
-        else:
-            snapshots = all_snapshots
+        requested_key = _command_key(requested_command_id)
+        if requested_key in self._available_by_key:
+            query_rewrites.append(self._available_by_key[requested_key].command_id)
+        queries = normalize_retrieval_queries(task_text, query_rewrites)
+        rankings: list[list[str]] = []
+        exact_ids: set[str] = set()
+        for query in queries:
+            retrieval = self._retriever.retrieve(
+                query,
+                limit=max(
+                    int(
+                        getattr(
+                            self._retriever,
+                            "total_commands",
+                            len(self._available_by_key),
+                        )
+                    ),
+                    1,
+                ),
+                context={
+                    "exhaustive_sparse": True,
+                    "pure_sparse": True,
+                },
+            )
+            rankings.append(
+                [candidate.schema.command_id for candidate in retrieval.candidates]
+            )
+            exact_ids.update(
+                candidate.schema.command_id
+                for candidate in retrieval.candidates
+                if candidate.exact_protected
+            )
+        fused = fuse_sparse_rankings(queries, rankings, exact_ids=exact_ids)
+        direct = [
+            snapshot
+            for command_id in fused.ranked_ids
+            if (snapshot := self._available_by_key.get(_command_key(command_id)))
+            is not None
+        ]
+        snapshots = direct
         full_listing_fallback = False
         if not snapshots:
-            if task_mode:
-                fallback = all_snapshots[:5]
-                fallback_cards = [
-                    {
-                        "command_id": s.command_id,
-                        "head": s.head,
-                        "task_mode": _snapshot_task_mode(s),
-                    }
-                    for s in fallback
-                    if s.command_id
-                ]
-                return self._not_executed(
-                    "selection_required",
-                    candidates=[],
-                    candidate_count=0,
-                    displayed_candidate_count=0,
-                    omitted_candidate_count=0,
-                    truncated=False,
-                    task_mode=task_mode,
-                    response_policy="chat_without_clarification",
-                    reason=reason or "no_task_mode_compatible_command",
-                    **({"fallback_commands": fallback_cards} if fallback_cards else {}),
-                )
-            # 零召回（检索/家族/上下文/请求命中均为空）。若该 skill 仍有可用命令，
-            # 降级返回全部可用命令作为候选，而不是直接让模型放弃——检索是静态
-            # BM25，召回失败不代表 skill 内真的没有匹配的命令（例如“啃他”查询
-            # 未命中，但“纳西妲啃”这个命令确实在该 skill 里）。真正没有可用命令
-            # 时才回落到 not_found，让模型自然聊天。
+            # 静态 BM25 零召回不能证明 Skill 没有适用命令；可用命令全集仍作为候选。
             fallback_snapshots = sorted(
                 self._available_by_key.values(),
                 key=_snapshot_stable_key,
@@ -406,7 +299,14 @@ class PluginSkillDispatchTool:
             snapshots=list(snapshots),
             reason=reason,
             full_listing_fallback=full_listing_fallback,
-            recall="skill_full_listing" if full_listing_fallback else "",
+            recall=(
+                "skill_full_listing"
+                if full_listing_fallback
+                else "skill_sparse_multi_query"
+                if len(queries) > 1
+                else "skill_sparse"
+            ),
+            query_count=len(queries),
         )
 
     def _render_selection(
@@ -415,26 +315,17 @@ class PluginSkillDispatchTool:
         *,
         requested_command_id: str,
         response_policy: str,
-        _max_candidates: int | None,
+        defer_candidate_exposure: bool,
     ) -> ToolResult:
         snapshots = plan.snapshots
         requested_command_id = _clip_text(requested_command_id, 256)
         reason = _clip_text(plan.reason, 128)
-        if _max_candidates is not None:
-            snapshots = snapshots[:_max_candidates]
-        cards = _project_ambiguous_cards(
-            snapshots,
-            token_budget=self._ambiguity_token_budget,
-            char_budget=self._result_char_budget,
-            requested_command_id=requested_command_id,
-            reason=reason,
-        )
         payload: dict[str, Any] = {
-            "candidates": cards,
+            "candidates": [],
             "candidate_count": len(snapshots),
-            "displayed_candidate_count": len(cards),
-            "omitted_candidate_count": max(len(snapshots) - len(cards), 0),
-            "truncated": len(cards) < len(snapshots),
+            "displayed_candidate_count": 0,
+            "omitted_candidate_count": len(snapshots),
+            "truncated": bool(snapshots),
         }
         if requested_command_id:
             payload["requested_command_id"] = requested_command_id
@@ -442,45 +333,121 @@ class PluginSkillDispatchTool:
             payload["reason"] = reason
         if response_policy:
             payload["response_policy"] = response_policy
-        if plan.recall == "skill_vector":
-            # 词法零召回后由 embedding 第二通道按语义相似度排序并收窄的候选。
-            payload["recall"] = "skill_vector"
-            payload["note"] = (
-                "本次词法检索在该插件内未命中候选，以下是按语义相似度排序的候选"
-                "（可能因长度预算被截断）。请从中判断是否有与用户请求语义匹配的"
-                "命令；如果都不匹配，请不要调用命令，直接按普通聊天回复。"
-            )
-        elif plan.full_listing_fallback:
-            # 明确标记这是零召回后的全量降级列表，并提示模型：候选是该插件
-            # 全部可用命令（可能被预算截断），需自行判断语义是否匹配，不匹配
-            # 就直接按普通聊天回复，不要强行选一个命令执行。
+        if plan.full_listing_fallback:
             payload["recall"] = "skill_full_listing"
             payload["note"] = (
-                "本次检索在该插件内未命中任何候选，以下是该插件全部可用命令"
-                "（可能因长度预算被截断）。请从中判断是否有与用户请求语义匹配的"
-                "命令；如果都不匹配，请不要调用命令，直接按普通聊天回复。"
+                "本次稀疏检索未命中，以下是该插件内完整可用命令列表。"
+                "仅在存在明确匹配项时调用，否则按普通聊天回复。"
             )
+        elif plan.recall:
+            payload["recall"] = plan.recall
+            payload["note"] = (
+                "以下是真实元数据的本地稀疏检索候选。请确认 command_id 与用户目标"
+                "一致后再调用；若都不匹配，按普通聊天回复。"
+            )
+
+        # Candidate projection already accounts for its compact selection envelope.
+        # Reserve only the additional bytes/tokens used by the real Skill result.
+        empty_output = {
+            "status": "selection_required",
+            "plugin_execution": False,
+            "executed": False,
+            "skill_id": self.skill.skill_id,
+            "plugin_module": self.skill.plugin_module,
+            **payload,
+        }
+        empty_serialized = json.dumps(
+            empty_output,
+            ensure_ascii=False,
+            default=str,
+        )
+        compact_empty_tokens = _selection_payload_tokens(
+            [],
+            requested_command_id=requested_command_id,
+            reason=reason,
+            truncated=True,
+        )
+        compact_empty_chars = _selection_payload_chars(
+            [],
+            requested_command_id=requested_command_id,
+            reason=reason,
+            truncated=True,
+        )
+        projection_token_budget = (
+            max(
+                self._ambiguity_token_budget
+                - max(
+                    estimate_text_tokens(empty_serialized) - compact_empty_tokens,
+                    0,
+                ),
+                1,
+            )
+            if self._ambiguity_token_budget is not None
+            else None
+        )
+        projection_char_budget = (
+            max(
+                self._result_char_budget
+                - max(len(empty_serialized) - compact_empty_chars, 0),
+                1,
+            )
+            if self._result_char_budget is not None
+            else None
+        )
+        cards = _project_ambiguous_cards(
+            snapshots,
+            token_budget=projection_token_budget,
+            char_budget=projection_char_budget,
+            requested_command_id=requested_command_id,
+            reason=reason,
+        )
+        if plan.full_listing_fallback and len(cards) < len(snapshots):
+            cards = []
+        payload["candidates"] = cards
+        payload["displayed_candidate_count"] = len(cards)
+        payload["omitted_candidate_count"] = max(len(snapshots) - len(cards), 0)
+        payload["truncated"] = len(cards) < len(snapshots)
+        if plan.full_listing_fallback:
+            if cards:
+                payload["recall"] = "skill_full_listing"
+            else:
+                payload["recall"] = "skill_no_recall"
+                payload["note"] = (
+                    "本次稀疏检索未命中，且完整命令列表超出结果预算，因此没有返回"
+                    "有偏的部分列表。可使用更准确的检索改写再次调用，或按普通聊天回复。"
+                )
         while cards and not self._selection_output_fits(payload):
             cards.pop()
             payload["displayed_candidate_count"] = len(cards)
             payload["omitted_candidate_count"] = len(snapshots) - len(cards)
             payload["truncated"] = True
+        if not defer_candidate_exposure:
+            exposed_ids = [card.get("command_id") for card in cards]
+            self.expose_candidates(
+                exposed_ids,
+                source=str(payload.get("recall") or plan.recall or "skill_no_recall"),
+                pending=True,
+            )
+            self._exposure_ledger.record_discovery(
+                self._exposure_key,
+                source=str(payload.get("recall") or plan.recall or "skill_no_recall"),
+                query_count=plan.query_count,
+                candidate_count=len(snapshots),
+                displayed_count=len(cards),
+                omitted_count=max(len(snapshots) - len(cards), 0),
+            )
         return self._not_executed("selection_required", **payload)
 
-    def _skill_retrieval_context(self) -> dict[str, Any]:
-        raw_context = getattr(self._command_context, "retrieval_context", None)
-        context = dict(raw_context) if isinstance(raw_context, dict) else {}
-        context["skill_scoped"] = True
-        return context
-
     def _selection_output_fits(self, payload: dict[str, Any]) -> bool:
-        output = _selection_payload(
-            payload["candidates"],
-            requested_command_id=str(payload.get("requested_command_id") or ""),
-            reason=str(payload.get("reason") or ""),
-            truncated=bool(payload.get("truncated")),
-        )
-        serialized = _compact_json(output)
+        output = {
+            "status": "selection_required",
+            "plugin_execution": False,
+            "executed": False,
+            "skill_id": self.skill.skill_id,
+            "plugin_module": self.skill.plugin_module,
+            **payload,
+        }
+        serialized = json.dumps(output, ensure_ascii=False, default=str)
         return (
             self._ambiguity_token_budget is None
             or estimate_text_tokens(serialized) <= self._ambiguity_token_budget
@@ -489,90 +456,23 @@ class PluginSkillDispatchTool:
             or len(serialized) <= self._result_char_budget
         )
 
-    def _requested_identity_snapshots(
-        self,
-        requested_command_id: str,
-    ) -> list[CommandToolSnapshot]:
-        identity = _local_command_identity(requested_command_id)
-        if not identity:
-            return []
-        return sorted(
-            [
-                snapshot
-                for snapshot in self._available_by_key.values()
-                if any(
-                    identity in candidate_identity
-                    for value in (snapshot.head, *snapshot.aliases)
-                    if (candidate_identity := _command_identity(value))
-                )
-            ],
-            key=_snapshot_stable_key,
-        )
-
-    def _action_family_snapshots(
-        self,
-        task_text: str,
-    ) -> list[CommandToolSnapshot]:
-        task_identity = _command_identity(task_text)
-        if not task_identity:
-            return []
-        grouped: dict[
-            tuple[str, str, tuple[str, bool, str]],
-            dict[str, CommandToolSnapshot],
-        ] = {}
-        for snapshot in self._available_by_key.values():
-            if not _is_action_family_member(snapshot):
-                continue
-            if not _snapshot_context_compatible(
-                snapshot,
-                self._skill_retrieval_context(),
-            ):
-                continue
-            key = _command_key(snapshot.command_id)
-            for value in (snapshot.head, *snapshot.aliases):
-                identity = _command_identity(value)
-                for position, fragment in _stable_identity_fragments(identity):
-                    if fragment in task_identity:
-                        group_key = (
-                            position,
-                            fragment,
-                            _action_family_contract(snapshot),
-                        )
-                        grouped.setdefault(group_key, {})[key] = snapshot
-        families = [
-            (position, fragment, snapshots)
-            for (position, fragment, _contract), snapshots in grouped.items()
-            if len(snapshots) >= 2
-        ]
-        if not families:
-            return []
-        families.sort(
-            key=lambda item: (
-                -len(item[1]),
-                task_identity.index(item[1]),
-                item[0],
-                item[1],
-            )
-        )
-        _position, _fragment, family = families[0]
-        return sorted(family.values(), key=_snapshot_stable_key)
-
     async def _dispatch_command(
         self,
         *,
         command_id: str,
         task_text: str,
-        task_mode: str,
         kwargs: dict[str, Any],
     ) -> ToolResult:
         key = _command_key(command_id)
         if key not in self._skill_command_keys and key not in self._known_by_key:
             return self._selection_result(
                 task_text=task_text,
-                task_mode=task_mode,
+                retrieval_queries=kwargs.get(_RETRIEVAL_QUERIES_FIELD),
                 requested_command_id=command_id,
                 reason="command_out_of_skill",
-                _max_candidates=3,
+                defer_candidate_exposure=bool(
+                    kwargs.get("_defer_candidate_exposure")
+                ),
             )
         known = self._known_by_key.get(key)
         if known is None:
@@ -590,21 +490,83 @@ class PluginSkillDispatchTool:
                 error="当前会话条件不满足，或该命令在当前场景不可用",
                 command_schema=project_command_card(known),
             )
-        if task_mode and _snapshot_task_mode(snapshot) != task_mode:
-            correct_mode = _snapshot_task_mode(snapshot)
-            # 降级为警告：用正确的 mode 过滤候选，返回候选卡让模型自行修正
-            # 不再强制 chat_without_clarification，避免命令填对了也被终局拦截
+        if not self._exposure_ledger.is_exposed(
+            self._exposure_key,
+            snapshot.command_id,
+        ):
+            self._exposure_ledger.record_execution(
+                self._exposure_key,
+                snapshot.command_id,
+                valid=False,
+                reason="candidate_identity_not_exposed",
+            )
             return self._selection_result(
                 task_text=task_text,
-                task_mode=correct_mode,
+                retrieval_queries=kwargs.get(_RETRIEVAL_QUERIES_FIELD),
                 requested_command_id=command_id,
-                reason=(
-                    f"task_mode_mismatch: 命令 {command_id} 属于 {correct_mode}，"
-                    f"请将 task_mode 改为 {correct_mode} 后重新调用"
+                reason="candidate_identity_not_exposed",
+                defer_candidate_exposure=bool(
+                    kwargs.get("_defer_candidate_exposure")
                 ),
-                _max_candidates=3,
             )
+        self._exposure_ledger.record_execution(
+            self._exposure_key,
+            snapshot.command_id,
+            valid=True,
+            reason="candidate_exposed",
+        )
         return await self._execute_snapshot(snapshot, kwargs=kwargs)
+
+    @property
+    def exposure_key(self) -> CandidateExposureKey:
+        return self._exposure_key
+
+    def owns_candidate_identity(self, identity: object) -> bool:
+        return _command_key(identity) in self._available_by_key
+
+    def is_candidate_exposed(self, identity: object) -> bool:
+        return self._exposure_ledger.is_exposed(self._exposure_key, identity)
+
+    def expose_candidates(
+        self,
+        identities: Iterable[object],
+        *,
+        source: str,
+        pending: bool,
+        exact_identity: bool = False,
+        strict_identity_mode: str = "",
+    ) -> tuple[str, ...]:
+        valid = (
+            self._available_by_key[_command_key(identity)].command_id
+            for identity in identities
+            if _command_key(identity) in self._available_by_key
+        )
+        return self._exposure_ledger.expose(
+            self._exposure_key,
+            valid,
+            discovery_source=source,
+            exact_identity=exact_identity,
+            pending=pending,
+            strict_identity_mode=strict_identity_mode,
+        )
+
+    def record_discovery(
+        self,
+        *,
+        source: str,
+        query_count: int,
+        candidate_count: int,
+        displayed_count: int,
+        omitted_count: int,
+    ) -> None:
+        self._exposure_ledger.record_discovery(
+            self._exposure_key,
+            source=source,
+            query_count=query_count,
+            candidate_count=candidate_count,
+            displayed_count=displayed_count,
+            omitted_count=omitted_count,
+        )
 
     async def _execute_snapshot(
         self,
@@ -654,24 +616,6 @@ class PluginSkillDispatchTool:
             is_retryable=result.is_retryable,
         )
 
-    def _retrieved_snapshots(
-        self,
-        candidates: Iterable[CommandCandidate],
-    ) -> list[CommandToolSnapshot]:
-        snapshots: list[CommandToolSnapshot] = []
-        seen: set[str] = set()
-        for candidate in candidates:
-            key = _command_key(candidate.schema.command_id)
-            snapshot = self._known_by_key.get(key)
-            if snapshot is None or key in seen:
-                continue
-            seen.add(key)
-            snapshots.append(snapshot)
-        return snapshots
-
-    def _contextual_snapshots(self) -> list[CommandToolSnapshot]:
-        return self._retrieved_snapshots(self._command_context.candidates)
-
     def _not_executed(self, status: str, **payload: Any) -> ToolResult:
         output = {
             "status": status,
@@ -688,111 +632,9 @@ class PluginSkillDispatchTool:
         )
 
 
-def _merge_snapshot_sources(
-    *sources: Iterable[CommandToolSnapshot],
-) -> list[CommandToolSnapshot]:
-    merged: list[CommandToolSnapshot] = []
-    seen: set[str] = set()
-    for source in sources:
-        for snapshot in source:
-            key = _command_key(snapshot.command_id)
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            merged.append(snapshot)
-    return merged
-
-
 def _snapshot_stable_key(snapshot: CommandToolSnapshot) -> tuple[str, str]:
     command_id = normalize_message_text(snapshot.command_id)
     return command_id.casefold(), command_id
-
-
-def _stable_identity_fragments(identity: str) -> Iterable[tuple[str, str]]:
-    if len(identity) < 2:
-        return ()
-    fragments: list[tuple[str, str]] = []
-    for length in range(1, len(identity)):
-        for position, fragment in (
-            ("prefix", identity[:length]),
-            ("suffix", identity[-length:]),
-        ):
-            if len(fragment) == 1 and not _is_single_cjk(fragment):
-                continue
-            fragments.append((position, fragment))
-    return tuple(dict.fromkeys(fragments))
-
-
-def _is_single_cjk(value: str) -> bool:
-    return len(value) == 1 and "\u4e00" <= value <= "\u9fff"
-
-
-def _is_action_family_member(snapshot: CommandToolSnapshot) -> bool:
-    return snapshot.command_role in {"execute", "template", "random"}
-
-
-def _snapshot_task_mode(snapshot: CommandToolSnapshot) -> str:
-    if snapshot.command_role in {"helper", "usage", "catalog"}:
-        return "help"
-    intents = set(snapshot.intent_types or [])
-    if intents & {"generate", "random", "transform", "mutate", "send", "play"}:
-        return "action"
-    if snapshot.side_effect == "query" or intents & {"query", "status"}:
-        return "query"
-    return "action"
-
-
-def _action_family_contract(snapshot: CommandToolSnapshot) -> tuple[str, bool, str]:
-    return snapshot.output_mode, bool(snapshot.generative), snapshot.side_effect
-
-
-def _snapshot_context_compatible(
-    snapshot: CommandToolSnapshot,
-    context: dict[str, Any],
-) -> bool:
-    requires = snapshot.requires or {}
-    has_image = bool(context.get("has_image")) or _reply_image_count(context) > 0
-    has_reply = bool(context.get("has_reply"))
-    has_at = bool(context.get("has_at"))
-    has_verified_target = bool(context.get("has_verified_target"))
-    accepts_target = _snapshot_accepts_target(snapshot)
-    image_required = (
-        bool(requires.get("image"))
-        or snapshot.payload_policy == "image_only"
-        or any(slot.type == "image" and slot.required for slot in snapshot.slots)
-    )
-    if image_required and not (
-        has_image or ((has_at or has_verified_target) and accepts_target)
-    ):
-        return False
-    if requires.get("reply") and not has_reply:
-        return False
-    if snapshot.target_requirement != "required":
-        return True
-    sources = set(snapshot.target_sources or [])
-    accepts_at = accepts_target
-    accepts_reply = "reply" in sources
-    return bool(
-        (has_at and accepts_at)
-        or (has_verified_target and accepts_at)
-        or (has_reply and accepts_reply)
-    )
-
-
-def _snapshot_accepts_target(snapshot: CommandToolSnapshot) -> bool:
-    sources = set(snapshot.target_sources or [])
-    return bool(
-        sources & {"at", "nickname", "reply"}
-        or snapshot.allow_at
-        or (snapshot.requires or {}).get("at")
-    )
-
-
-def _reply_image_count(context: dict[str, Any]) -> int:
-    try:
-        return max(int(context.get("reply_image_count", 0) or 0), 0)
-    except (TypeError, ValueError):
-        return 0
 
 
 def skill_dispatch_tool_name(plugin_module: str) -> str:
@@ -817,7 +659,8 @@ def build_plugin_skill_dispatch_tools(
     knowledge_base: PluginKnowledgeBase,
     session_id: str | None,
     command_context: NativeCommandExecutionContext,
-    task_modes: dict[str, str] | None = None,
+    exposure_ledger: CandidateExposureLedger | None = None,
+    revision: str = "",
     ambiguity_token_budget: int | None = None,
     result_char_budget: int | None = None,
 ) -> dict[str, ToolExecutable]:
@@ -837,7 +680,8 @@ def build_plugin_skill_dispatch_tools(
             knowledge_base=knowledge_base,
             session_id=session_id,
             command_context=command_context,
-            task_modes=task_modes,
+            exposure_ledger=exposure_ledger,
+            revision=revision,
             ambiguity_token_budget=ambiguity_token_budget,
             result_char_budget=result_char_budget,
         )
@@ -917,6 +761,9 @@ def _build_raw_slots(kwargs: dict[str, Any]) -> dict[str, Any]:
         value = str(kwargs.get(field, "") or "")
         if value:
             raw_slots[field] = value
+    target_refs = kwargs.get(TARGET_REFS_FIELD)
+    if isinstance(target_refs, list | tuple):
+        raw_slots[TARGET_REFS_FIELD] = list(target_refs)
     return raw_slots
 
 
@@ -1207,18 +1054,9 @@ def _tool_description(skill: PluginSkill) -> str:
             item_limit=240,
             total_limit=_PRECAUTIONS_TEXT_LIMIT,
         ),
+        "command_count": max(int(skill.command_count), 0),
         "input_types": _bounded_values(
             skill.input_types,
-            item_limit=80,
-            total_limit=_CAPABILITY_VALUES_TEXT_LIMIT,
-        ),
-        "output_modes": _bounded_values(
-            skill.output_modes,
-            item_limit=80,
-            total_limit=_CAPABILITY_VALUES_TEXT_LIMIT,
-        ),
-        "side_effects": _bounded_values(
-            skill.side_effects,
             item_limit=80,
             total_limit=_CAPABILITY_VALUES_TEXT_LIMIT,
         ),
@@ -1322,15 +1160,6 @@ def _single_line(value: object) -> str:
 
 def _command_key(command_id: object) -> str:
     return normalize_message_text(str(command_id or "")).casefold()
-
-
-def _local_command_identity(command_id: object) -> str:
-    command_key = _command_key(command_id)
-    return _command_identity(command_key.rsplit(".", 1)[-1])
-
-
-def _command_identity(value: object) -> str:
-    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", _command_key(value))
 
 
 __all__ = [

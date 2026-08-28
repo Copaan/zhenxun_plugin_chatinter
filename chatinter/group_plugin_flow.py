@@ -263,6 +263,9 @@ async def _execute_native_tool_route(
         task_message=task_message,
         ambient_message=current_message,
         target_hint=task_frame.target_hint if task_frame is not None else "",
+        trusted_target_ids=(
+            task_frame.trusted_target_ids if task_frame is not None else ()
+        ),
         mention_profiles=mention_profiles,
         use_ambient_target_context=bool(
             task_frame is not None and not task_frame.effective_text
@@ -431,6 +434,9 @@ async def _execute_native_tool_route(
     )
     payload["plugin_execution"] = bool(reroute_result.execution_started)
     payload["executed"] = bool(observed_success)
+    if not observed_success:
+        payload["failure_stage"] = "native_reroute"
+        payload["native_reroute_reason"] = observation.reason
     if target_resolution.resolved_target_ids:
         payload["resolved_target"] = [
             {"user_id": user_id}
